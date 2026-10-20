@@ -4738,6 +4738,7 @@ dependencies = [
  "hmac 0.12.1",
  "k256",
  "lazy_static",
+ "libc",
  "openidconnect",
  "p256",
  "rand 0.8.6",

@@ -78,6 +78,10 @@ webauthn-rs-proto = "=0.6.1-dev"
 unicode-normalization = "0.1"
 unicode-security = "0.1"
 hmac = "0.12"
+# `siwx-signer` only: `prctl(PR_SET_DUMPABLE, 0)` at start, so the process that
+# holds the private key cannot be ptrace-attached or core-dumped. Already in the
+# lock through tokio and others; no new crate.
+libc = "0.2"
 
 [dev-dependencies]
 # `figment::Jail` for the config-loading tests in src/config.rs: a temporary

@@ -78,7 +78,8 @@ pub async fn redis() -> Option<RedisClient> {
 /// in it, say). Each such test takes its own number; taken so far: 4 to 7 and
 /// 12 to 15 (guest route tests, `env(Some(n))`/`env_in(Some(n))` and the reaper),
 /// 2 and 8 (the orphan scan), 9 (the outbox), 10 (back-channel logout), 11
-/// (static-client isolation). Free: 1 and 3.
+/// (static-client isolation), 3 (back-channel logout through the socket signer).
+/// Free: 1.
 pub async fn redis_db(db: u8) -> Option<RedisClient> {
     connect(redis_db_url(db)).await
 }
@@ -246,6 +247,79 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuffer {
 
     fn make_writer(&'a self) -> Self::Writer {
         self.clone()
+    }
+}
+
+/// The uid of this process: the peer uid a test signer must allow.
+pub fn current_uid() -> u32 {
+    // SAFETY: `getuid` takes no arguments, reads no memory and cannot fail.
+    unsafe { libc::getuid() }
+}
+
+/// A fresh, empty directory for one test's socket and key files, under the
+/// system temporary directory. Removed by [`TestSigner`] on drop; a test that
+/// uses it directly removes it itself.
+pub fn temp_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "siwx-signer-{tag}-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir(&dir).expect("a fresh temporary directory");
+    dir
+}
+
+/// An in-process `siwx-signer` service on a socket in its own temporary
+/// directory. Its options default to the ones a test needs: this process's uid
+/// is the allowed peer, and the issuer is `Config::default().base_url`.
+pub struct TestSigner {
+    pub dir: std::path::PathBuf,
+    pub socket: std::path::PathBuf,
+    pub kid: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// The issuer a test signer expects: siwx-oidc's default `base_url`.
+pub const TEST_SIGNER_ISSUER: &str = "http://127.0.0.1:8000";
+
+impl TestSigner {
+    /// The default test options (see the type doc).
+    pub fn options() -> crate::signing::server::ServiceOptions {
+        let mut options = crate::signing::server::ServiceOptions::new(TEST_SIGNER_ISSUER);
+        options.allowed_uid = current_uid();
+        options
+    }
+
+    /// Start a service for `key` with `options`, on the current runtime.
+    pub fn start(
+        key: crate::signing::EcdsaSigningKey,
+        options: crate::signing::server::ServiceOptions,
+    ) -> Self {
+        let dir = temp_dir("test");
+        let socket = dir.join("signer.sock");
+        let service = crate::signing::server::SignerService::new(key, options)
+            .expect("the test signer options are valid");
+        let kid = service.kid().to_string();
+        let listener = crate::signing::server::bind(&socket).expect("the test socket binds");
+        let task = tokio::spawn(std::sync::Arc::new(service).serve(listener));
+        Self {
+            dir,
+            socket,
+            kid,
+            task,
+        }
+    }
+
+    /// Stop the service and remove its socket: the signer is down.
+    pub fn stop(&self) {
+        self.task.abort();
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+impl Drop for TestSigner {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 

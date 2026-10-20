@@ -19,15 +19,10 @@ use openidconnect::{
     url::Url,
     AccessToken, AdditionalClaims, Audience, AuthUrl, ClientConfigUrl, ClientId, ClientSecret,
     EmptyAdditionalProviderMetadata, EmptyExtraTokenFields, EndUserName, EndUserUsername, IdToken,
-    IdTokenClaims, IdTokenFields, IssuerUrl, JsonWebKeyId, JsonWebKeySetUrl, LocalizedClaim, Nonce,
-    OpPolicyUrl, OpTosUrl, PrivateSigningKey, RedirectUrl, RefreshToken, RegistrationAccessToken,
-    RegistrationUrl, RequestUrl, ResponseTypes, Scope, SigningError, StandardClaims,
-    StandardTokenResponse, SubjectIdentifier, TokenUrl, UserInfoClaims, UserInfoJsonWebToken,
-    UserInfoUrl,
-};
-use p256::{
-    ecdsa::{signature::Signer, Signature, SigningKey},
-    pkcs8::DecodePrivateKey,
+    IdTokenClaims, IdTokenFields, IssuerUrl, JsonWebKeySetUrl, LocalizedClaim, Nonce, OpPolicyUrl,
+    OpTosUrl, RedirectUrl, RefreshToken, RegistrationAccessToken, RegistrationUrl, RequestUrl,
+    ResponseTypes, Scope, StandardClaims, StandardTokenResponse, SubjectIdentifier, TokenUrl,
+    UserInfoClaims, UserInfoJsonWebToken, UserInfoUrl,
 };
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::{Deserialize, Serialize};
@@ -111,210 +106,25 @@ pub const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:devic
 /// is implemented on `RedisClient` itself, outside the `DBClient` trait.
 type DBClientType = RedisClient;
 
-// -- ES256 key wrapper implementing openidconnect's PrivateSigningKey ------
+use siwx_oidc::signing::{fingerprint_of_public, sign_jwt, verification_jwk, Purpose, SignError};
+pub use siwx_oidc::signing::{EcdsaSigningKey, ProviderSigner};
 
-/// The provider's ES256 signing key, carrying the two facts that anything
-/// *durable* signed by it needs to know: **which** key it is (`kid`), and
-/// whether it will still exist after the next restart (`ephemeral`).
+/// A failed signature at a request (the token endpoint, signed userinfo).
 ///
-/// # `kid` identifies the KEY, not the slot
-///
-/// This wrapper used to take a caller-supplied `kid`, and both construction
-/// sites in `axum_lib::main` passed the literal `"key1"` — the operator's
-/// configured key and the randomly generated fallback were stamped with the
-/// SAME identifier. `"key1"` is a *slot* name, not a *key* name, and the
-/// distinction stops being cosmetic the moment we sign something that outlives
-/// the process.
-///
-/// DID assertions (`crate::did_assertion`) are written into a user's Synapse
-/// profile and stay there indefinitely. Under a constant `kid`, a restart that
-/// mints a fresh ephemeral key yields **a different key under the same `kid`**,
-/// so every previously stored assertion fails verification as
-/// `bad signature` — the single worst diagnostic available, because to a
-/// verifier "bad signature" reads as *forgery*, and to an operator it offers
-/// nothing to grep for. Deriving `kid` from the public key turns exactly that
-/// event into `kid "3f2a…" is not present in the JWKS`: honest, self-describing,
-/// and immediately actionable ("the key rotated; set SIWEOIDC_SIGNING_KEY_PEM").
-///
-/// This is hypothesis H4 of the attested-DID design ("`kid` must identify the
-/// key, not the slot"), pinned by
-/// `oidc::tests::h4_two_generated_keys_get_different_kids` and
-/// `oidc::tests::h4_the_same_pem_yields_the_same_kid_across_constructions`.
-///
-/// **Do not reintroduce a caller-supplied `kid`.** The constructors deliberately
-/// accept no `kid` argument, so a slot name cannot be stamped onto a key again;
-/// that absence IS the fix. Likewise, do not "simplify" `kid` back to an
-/// `Option<JsonWebKeyId>`: a JWKS entry without a `kid` forces every verifier to
-/// trial-verify against every key, which erases the unknown-kid diagnostic this
-/// type exists to produce.
-#[derive(Clone)]
-pub struct EcdsaSigningKey {
-    key: SigningKey,
-    /// Always present and always derived from `key` — never configured.
-    /// See the type-level doc.
-    kid: JsonWebKeyId,
-    /// `true` when the key was generated at startup and therefore dies with the
-    /// process. Read by `did_assertion::mint_did_assertion`, which refuses to
-    /// mint a durable, off-server artifact with a key it knows is temporary.
-    ephemeral: bool,
-}
-
-impl EcdsaSigningKey {
-    /// Load the operator's durable key (`SIWEOIDC_SIGNING_KEY_PEM`).
-    ///
-    /// The resulting key is marked NON-ephemeral, which is what unlocks DID
-    /// assertion minting. That marking is a claim about *operator intent*
-    /// (a PEM was configured, so the same key is expected across restarts), not
-    /// a proof — nothing here can verify the operator will keep passing the same
-    /// PEM. The key-derived `kid` is the safety net for when they do not.
-    pub fn from_pem(pem: &str) -> Result<Self> {
-        let key = SigningKey::from_pkcs8_pem(pem)
-            .map_err(|e| anyhow!("Invalid ECDSA private key PEM: {}", e))?;
-        Ok(Self::with_derived_kid(key, false))
-    }
-
-    /// Generate a throwaway key for a deployment with no configured PEM.
-    ///
-    /// Marked ephemeral: tokens signed by it stop verifying at the next restart
-    /// (which is merely annoying — clients re-authenticate), and DID assertions
-    /// are suppressed entirely (which is the point — see `did_assertion`).
-    pub fn generate() -> Self {
-        Self::with_derived_kid(SigningKey::random(&mut rand::thread_rng()), true)
-    }
-
-    /// The single place a `kid` is computed. Both constructors funnel through
-    /// here precisely so the "derive it, never accept it" rule cannot be
-    /// violated by adding a third constructor that forgets.
-    fn with_derived_kid(key: SigningKey, ephemeral: bool) -> Self {
-        let kid = JsonWebKeyId::new(Self::fingerprint_of(&key));
-        Self {
-            key,
-            kid,
-            ephemeral,
+/// A backend fault (the signer down, slow, or answering with a refusal, a
+/// foreign `kid` or a signature that does not verify) is a retryable 503: no
+/// token is issued and nothing is answered that was not signed. An assembly
+/// fault (openidconnect could not build the token) stays the 500 it always was.
+/// The log names the purpose and the failure, never the bytes to be signed.
+fn signing_failed(purpose: Purpose) -> impl Fn(SignError) -> CustomError {
+    move |e| {
+        warn!(purpose = %purpose, error = %e, "signing failed");
+        if e.is_backend() {
+            CustomError::ServiceUnavailable("The signing service is unavailable.".to_string())
+        } else {
+            CustomError::Other(anyhow!("Error signing response."))
         }
     }
-
-    /// First 16 hex chars of SHA-256 over the SEC1 **uncompressed** public key.
-    ///
-    /// 64 bits of a cryptographic hash: not collision-resistant in the
-    /// adversarial sense, and it does not need to be. `kid` is a *lookup hint*
-    /// into a JWKS this provider publishes — a collision would only ever pick
-    /// the wrong key of our own, and the signature check then fails. It is not a
-    /// security boundary; the signature is.
-    fn fingerprint_of(key: &SigningKey) -> String {
-        fingerprint_of_public(key.verifying_key())
-    }
-
-    /// Non-sensitive identifier for the signing key: the first 16 hex chars of a
-    /// SHA-256 over the SEC1-encoded *public* key. Safe to log — it reveals no
-    /// private material but lets operators correlate which ephemeral key is live.
-    ///
-    /// Identical by construction to `kid()`; kept as a distinct name because the
-    /// startup log lines read as "fingerprint" and the JWS header reads as
-    /// "kid", and conflating the two names in either place would obscure one of
-    /// them.
-    pub fn public_key_fingerprint(&self) -> String {
-        Self::fingerprint_of(&self.key)
-    }
-
-    /// The `kid` published in the JWKS and stamped into every JWS header this
-    /// key produces. Derived from the public key; see the type-level doc.
-    pub fn kid(&self) -> &str {
-        self.kid.as_str()
-    }
-
-    /// `true` when this key was generated at startup and will not survive the
-    /// process.
-    ///
-    /// The one caller that matters is `did_assertion::mint_did_assertion`:
-    /// writing a durable assertion into a user's Synapse profile with a key we
-    /// KNOW is about to disappear is writing garbage into someone else's
-    /// database. Invariant 5 of the plan: never write a durable assertion with
-    /// an ephemeral key.
-    pub fn is_ephemeral(&self) -> bool {
-        self.ephemeral
-    }
-
-    /// Raw ES256 signature over `message`: **r‖s, exactly 64 bytes, never DER**.
-    ///
-    /// RFC 7515 §3.1 / RFC 7518 §3.4 mandate the fixed-width concatenation; the
-    /// `ecdsa` crate's `Signature::to_bytes()` is already that encoding, while
-    /// its `to_der()` is the 70–72 byte X.509 form that every JWS verifier
-    /// rejects. Do not "helpfully" switch to DER: the failure is silent at mint
-    /// time and only surfaces as an unverifiable proof in a stranger's profile.
-    /// `did_assertion::tests::signature_is_64_raw_bytes_never_der` asserts the
-    /// length explicitly for exactly this reason.
-    pub fn sign_es256(&self, message: &[u8]) -> Vec<u8> {
-        let sig: Signature = self.key.sign(message);
-        sig.to_bytes().to_vec()
-    }
-}
-
-impl PrivateSigningKey for EcdsaSigningKey {
-    type VerificationKey = CoreJsonWebKey;
-
-    fn sign(
-        &self,
-        _signature_alg: &<CoreJsonWebKey as openidconnect::JsonWebKey>::SigningAlgorithm,
-        message: &[u8],
-    ) -> Result<Vec<u8>, SigningError> {
-        // JWS ES256 requires the raw r||s encoding (64 bytes), not DER.
-        // Delegated so the ID-token path and the DID-assertion path can never
-        // drift onto different signature encodings.
-        Ok(self.sign_es256(message))
-    }
-
-    fn as_verification_key(&self) -> CoreJsonWebKey {
-        verification_jwk(self.key.verifying_key(), self.kid.as_str())
-    }
-}
-
-/// The `kid` for a P-256 **public** key: first 16 hex chars of SHA-256 over the
-/// SEC1 uncompressed encoding.
-///
-/// Split out of `EcdsaSigningKey::fingerprint_of` (which now delegates here) so
-/// that a RETIRED key — of which we hold only the public half — derives a `kid`
-/// **byte-identically** to the one it had while it was live. That identity is
-/// the entire mechanism: a durably-stored DID assertion carries the `kid` its
-/// signer had at mint time, and a verifier resolves it against the JWKS by that
-/// string. Two derivations that agree "in principle" but differ in one byte
-/// would leave every retired proof unverifiable while looking correct. Do not
-/// give the retired path its own copy of this.
-fn fingerprint_of_public(key: &p256::ecdsa::VerifyingKey) -> String {
-    use sha2::{Digest, Sha256};
-    let pubkey = key.to_encoded_point(false);
-    let digest = Sha256::digest(pubkey.as_bytes());
-    let hex = hex::encode(digest);
-    hex[..16].to_string()
-}
-
-/// The one place a published verification JWK is constructed, for the live key
-/// and for retired keys alike.
-///
-/// Single-sourced for the same reason as [`fingerprint_of_public`]: a retired
-/// key must be indistinguishable, to a verifier, from what the live key
-/// published before rotation. `use`/`alg`/`crv` all matter to a strict verifier.
-fn verification_jwk(verifying_key: &p256::ecdsa::VerifyingKey, kid: &str) -> CoreJsonWebKey {
-    let point = verifying_key.to_encoded_point(false);
-    let x = URL_SAFE_NO_PAD.encode(point.x().unwrap());
-    let y = URL_SAFE_NO_PAD.encode(point.y().unwrap());
-
-    let mut jwk_value = serde_json::json!({
-        "kty": "EC",
-        "crv": "P-256",
-        "x": x,
-        "y": y,
-        "use": "sig",
-        "alg": "ES256",
-    });
-    // Always present: a JWKS entry with no `kid` forces verifiers to
-    // trial-verify against every published key, which destroys the
-    // "unknown kid" diagnostic that the key-derived `kid` exists to give
-    // (see the `EcdsaSigningKey` doc, H4). It also stops mattering as a
-    // nicety the moment more than one key is published, which is exactly
-    // what retired keys do.
-    jwk_value["kid"] = serde_json::Value::String(kid.to_string());
-    serde_json::from_value(jwk_value).expect("Failed to construct EC JWK")
 }
 
 // -- ID tokens ---------------------------------------------------------------
@@ -595,9 +405,8 @@ pub fn parse_retired_verification_keys(pem_bundle: &str) -> Result<Vec<CoreJsonW
 ///
 /// `retired` are JWKs — public material with no signing capability by
 /// construction. There is no code path by which a retired key can sign
-/// anything; the live [`EcdsaSigningKey`] is the only thing
-/// [`PrivateSigningKey`] is implemented for. Publishing a key is *permission to
-/// verify*, never permission to issue.
+/// anything; only the live signer ([`ProviderSigner`]) signs. Publishing a key
+/// is *permission to verify*, never permission to issue.
 ///
 /// # Order and de-duplication
 ///
@@ -620,12 +429,12 @@ pub fn parse_retired_verification_keys(pem_bundle: &str) -> Result<Vec<CoreJsonW
 /// and accept that its proofs die; re-assertion happens on the next sign-in.
 /// Do not document this feature as "rotation is now safe".
 pub fn jwks(
-    signing_key: &EcdsaSigningKey,
+    signing_key: &dyn ProviderSigner,
     retired: &[CoreJsonWebKey],
 ) -> Result<CoreJsonWebKeySet, CustomError> {
     use openidconnect::JsonWebKey;
 
-    let live = signing_key.as_verification_key();
+    let live = signing_key.verification_jwk();
     let live_kid = live.key_id().map(|k| k.as_str().to_string());
     let mut seen: Vec<String> = live_kid.into_iter().collect();
     let mut keys = vec![live];
@@ -1092,7 +901,7 @@ pub struct ClientCredentials {
 pub async fn token(
     form: TokenForm,
     credentials: ClientCredentials,
-    signing_key: &EcdsaSigningKey,
+    signing_key: &dyn ProviderSigner,
     config: &crate::config::Config,
     db_client: &DBClientType,
     synapse_client: Option<&SynapseClient>,
@@ -1412,7 +1221,7 @@ fn device_code_error(error: &str, description: &str) -> CustomError {
 
 async fn token_device_code(
     form: TokenForm,
-    signing_key: &EcdsaSigningKey,
+    signing_key: &dyn ProviderSigner,
     config: &crate::config::Config,
     db_client: &DBClientType,
     synapse_client: Option<&SynapseClient>,
@@ -1744,14 +1553,19 @@ async fn token_device_code(
                 },
             );
 
-            let id_token = SiwxIdToken::new(
-                core_id_token,
-                signing_key,
-                CoreJwsSigningAlgorithm::EcdsaP256Sha256,
-                Some(&AccessToken::new(access_token.clone())),
-                None,
-            )
-            .map_err(|e| anyhow!("{}", e))?;
+            // A signing failure answers 503 before the device code is deleted.
+            let id_token_access = AccessToken::new(access_token.clone());
+            let id_token = sign_jwt(signing_key, Purpose::IdToken, |key| {
+                SiwxIdToken::new(
+                    core_id_token,
+                    key,
+                    CoreJwsSigningAlgorithm::EcdsaP256Sha256,
+                    Some(&id_token_access),
+                    None,
+                )
+            })
+            .await
+            .map_err(signing_failed(Purpose::IdToken))?;
 
             // Cleanup
             let _ = db_client.delete_device_code(&device_ref).await;
@@ -1961,7 +1775,7 @@ fn exchange_issuance(
 async fn token_authorization_code(
     form: TokenForm,
     credentials: ClientCredentials,
-    signing_key: &EcdsaSigningKey,
+    signing_key: &dyn ProviderSigner,
     config: &crate::config::Config,
     db_client: &DBClientType,
 ) -> Result<SiwxTokenResponse, CustomError> {
@@ -2124,14 +1938,17 @@ async fn token_authorization_code(
     .set_nonce(code_entry.nonce)
     .set_auth_time(Some(code_entry.auth_time));
 
-    let id_token = SiwxIdToken::new(
-        core_id_token,
-        signing_key,
-        CoreJwsSigningAlgorithm::EcdsaP256Sha256,
-        Some(&access_token),
-        None,
-    )
-    .map_err(|e| anyhow!("{}", e))?;
+    let id_token = sign_jwt(signing_key, Purpose::IdToken, |key| {
+        SiwxIdToken::new(
+            core_id_token,
+            key,
+            CoreJwsSigningAlgorithm::EcdsaP256Sha256,
+            Some(&access_token),
+            None,
+        )
+    })
+    .await
+    .map_err(signing_failed(Purpose::IdToken))?;
 
     let expires_in_secs = ACCESS_TOKEN_TTL;
 
@@ -3211,13 +3028,30 @@ pub async fn provision_synapse_account(
         );
     } else if let (Some(publication), Some(server_name)) = (did_publication, server_name) {
         let mxid = crate::synapse_client::matrix_user_id(localpart, server_name);
-        let value = crate::did_assertion::did_profile_value(
+        // A proof that cannot be signed fails the write, never the sign-in:
+        // writing `{did}` without a proof would replace a good proof with none,
+        // and the field is re-asserted at the next sign-in anyway.
+        let value = match crate::did_assertion::did_profile_value(
             publication.key,
             publication.issuer,
             did,
             &mxid,
             Utc::now().timestamp(),
-        );
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(e) => {
+                warn!(
+                    did = %did,
+                    %mxid,
+                    error = %e,
+                    "attested DID field NOT written: the proof could not be signed. The field \
+                     keeps its current value and is re-asserted at the next sign-in"
+                );
+                return;
+            }
+        };
         match synapse
             .publish_did_field(localpart, server_name, &value)
             .await
@@ -4205,7 +4039,7 @@ pub enum HintError {
 /// §2 lets an RP send an expired ID token, which still names the session.
 pub fn verify_id_token_hint(
     hint: &str,
-    signing_key: &EcdsaSigningKey,
+    signing_key: &dyn ProviderSigner,
     retired: &[CoreJsonWebKey],
     issuer: &IssuerUrl,
 ) -> Result<HintClaims, HintError> {
@@ -4228,7 +4062,7 @@ pub fn verify_id_token_hint(
         return Err(HintError::Algorithm);
     }
     let kid = header["kid"].as_str().ok_or(HintError::UnknownKid)?;
-    let live = signing_key.as_verification_key();
+    let live = signing_key.verification_jwk();
     let key = std::iter::once(&live)
         .chain(retired.iter())
         .find(|k| k.key_id().map(|id| id.as_str()) == Some(kid))
@@ -4293,7 +4127,7 @@ pub(crate) fn store_unavailable(e: anyhow::Error) -> CustomError {
 /// ended `oidc` grant is enqueued by the deletion script itself (`drop_grant`).
 pub async fn end_session(
     params: EndSessionParams,
-    signing_key: &EcdsaSigningKey,
+    signing_key: &dyn ProviderSigner,
     retired: &[CoreJsonWebKey],
     config: &crate::config::Config,
     db_client: &DBClientType,
@@ -4668,7 +4502,7 @@ fn mxid_claim(config: &crate::config::Config, localpart: &str) -> Option<String>
 /// address claim is `io.inblock.mailbox`.
 pub async fn userinfo(
     config: &crate::config::Config,
-    signing_key: &EcdsaSigningKey,
+    signing_key: &dyn ProviderSigner,
     bearer: Option<Bearer>,
     payload: UserInfoPayload,
     db_client: &DBClientType,
@@ -4717,8 +4551,11 @@ pub async fn userinfo(
     match client_entry.metadata.userinfo_signed_response_alg() {
         None => Ok(UserInfoResponse::Json(response)),
         Some(alg) => Ok(UserInfoResponse::Jwt(
-            SiwxUserInfoJsonWebToken::new(response, signing_key, alg.clone())
-                .map_err(|_| anyhow!("Error signing response."))?,
+            sign_jwt(signing_key, Purpose::Userinfo, |key| {
+                SiwxUserInfoJsonWebToken::new(response, key, alg.clone())
+            })
+            .await
+            .map_err(signing_failed(Purpose::Userinfo))?,
         )),
     }
 }
@@ -4732,6 +4569,7 @@ mod tests {
     use super::*;
     use aqua_auth::{address_from_verifying_key, eip55_checksum};
     use headers::{HeaderMap, HeaderMapExt, HeaderValue};
+    use openidconnect::PrivateSigningKey;
     use sha3::{Digest, Keccak256};
     use test_log::test;
 
@@ -7176,6 +7014,130 @@ mod provision_synapse_device_tests {
         handle.abort();
     }
 
+    /// The publication of `publication_is_wired_into_the_shared_signin_path`,
+    /// signed by the `socket` backend: the proof that lands in the profile was
+    /// made by the signer process and verifies against its key.
+    #[tokio::test]
+    async fn a_socket_signed_proof_is_published_on_sign_in() {
+        let (synapse, calls, handle) = spawn(
+            /* localpart_free */ false,
+            (axum::http::StatusCode::OK, serde_json::json!({})),
+        )
+        .await;
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            handle.abort();
+            return;
+        };
+        let synapse = synapse.with_admin_mint(redis, "siwx-admin".to_string(), 300);
+        let mut options = siwx_oidc::test_support::TestSigner::options();
+        options.issuer = "https://issuer.example/".to_string();
+        let key = EcdsaSigningKey::generate();
+        let service = siwx_oidc::test_support::TestSigner::start(key.clone(), options);
+        let signer = siwx_oidc::signing::socket::SocketSigner::connect(
+            &service.socket,
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let publication = DidPublication {
+            key: &signer,
+            issuer: "https://issuer.example/",
+        };
+
+        provision_synapse_device(
+            DID,
+            &resolved_identity(),
+            Some(&synapse),
+            "Element Web",
+            Some("SIWX_test"),
+            Some(SERVER_NAME),
+            Some(&publication),
+        )
+        .await;
+
+        let calls = calls.lock().unwrap();
+        let published = calls
+            .get("publish_did_field")
+            .expect("the DID field is published");
+        assert_eq!(published.len(), 1);
+        let proof = published[0][crate::did_assertion::DID_PROFILE_FIELD]["proof"]
+            .as_str()
+            .expect("a socket-signed proof")
+            .to_string();
+        let (input, signature) = proof.rsplit_once('.').unwrap();
+        use p256::ecdsa::signature::Verifier;
+        ProviderSigner::verifying_key(&key)
+            .verify(
+                input.as_bytes(),
+                &p256::ecdsa::Signature::from_slice(&URL_SAFE_NO_PAD.decode(signature).unwrap())
+                    .unwrap(),
+            )
+            .expect("the proof is the signer's signature");
+        handle.abort();
+    }
+
+    /// Requirement 4 for the DID proof: the setup of
+    /// `a_socket_signed_proof_is_published_on_sign_in` with exactly one change,
+    /// the signer stopped. The write is skipped, never `{did}` without a proof
+    /// over a good one, and the rest of the sign-in's provisioning still runs.
+    #[tokio::test]
+    async fn with_the_signer_stopped_the_did_field_is_not_written() {
+        let (synapse, calls, handle) = spawn(
+            /* localpart_free */ false,
+            (axum::http::StatusCode::OK, serde_json::json!({})),
+        )
+        .await;
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            handle.abort();
+            return;
+        };
+        let synapse = synapse.with_admin_mint(redis, "siwx-admin".to_string(), 300);
+        let mut options = siwx_oidc::test_support::TestSigner::options();
+        options.issuer = "https://issuer.example/".to_string();
+        let service =
+            siwx_oidc::test_support::TestSigner::start(EcdsaSigningKey::generate(), options);
+        let signer = siwx_oidc::signing::socket::SocketSigner::connect(
+            &service.socket,
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        service.stop();
+        let publication = DidPublication {
+            key: &signer,
+            issuer: "https://issuer.example/",
+        };
+        let log = siwx_oidc::test_support::LogCapture::start();
+
+        provision_synapse_device(
+            DID,
+            &resolved_identity(),
+            Some(&synapse),
+            "Element Web",
+            Some("SIWX_test"),
+            Some(SERVER_NAME),
+            Some(&publication),
+        )
+        .await;
+
+        let calls = calls.lock().unwrap();
+        assert!(
+            !calls.contains_key("publish_did_field"),
+            "no write without a good proof: {:?}",
+            calls.get("publish_did_field")
+        );
+        assert!(
+            calls.contains_key("upsert_device"),
+            "the sign-in's provisioning still ran"
+        );
+        assert!(
+            log.output().contains("attested DID field NOT written"),
+            "the skipped write is logged: {}",
+            log.output()
+        );
+        handle.abort();
+    }
+
     /// **D4 (2026-09-10 audit): a GUESSED localpart is never asserted.**
     ///
     /// Identical setup to `publication_is_wired_into_the_shared_signin_path`
@@ -7680,6 +7642,9 @@ mod userinfo_mxid_claim_tests {
 
 #[cfg(test)]
 mod userinfo_mailbox_claim_tests;
+
+#[cfg(test)]
+mod signer_backend_tests;
 
 /// `sign_in` decides deactivation BEFORE it resolves the login localpart.
 ///
@@ -9036,6 +9001,86 @@ mod device_display_name_tests {
     /// The grant of an approved device code counts from the approval, the
     /// authentication, which the approval records on the entry from Redis
     /// `TIME`; not from the poll that redeems it (I6).
+    /// The device-code grant signs its ID token through the same path as the
+    /// code exchange: with the `socket` signer down it answers the retryable
+    /// 503 and no token, and the approved code is not deleted.
+    #[tokio::test]
+    async fn a_device_grant_with_the_signer_stopped_answers_503_and_no_token() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let (synapse, _hs, server) = spawn(&[]).await;
+        let nonce = Uuid::new_v4().simple().to_string();
+        let client_id = format!("device-signer-{nonce}");
+        db.set_client(client_id.clone(), client_entry(Some("Pocket Client")))
+            .await
+            .unwrap();
+        let device_code = format!("dvc_signer-{nonce}");
+        let approved_at = Utc::now().timestamp();
+        db.set_device_code(
+            &device_code,
+            &DeviceCodeEntry {
+                user_code_digest: siwx_oidc::db::tokens::digest(&format!("SG-{nonce}")),
+                legacy_user_code: None,
+                client_id: client_id.clone(),
+                scope: "openid".to_string(),
+                status: DeviceCodeStatus::Approved,
+                did: Some(DID.to_string()),
+                device_id: None,
+                last_poll: None,
+                created_at: approved_at,
+                auth_ms: Some(approved_at * 1000),
+                expected_mxid: None,
+            },
+            DEVICE_CODE_LIFETIME,
+        )
+        .await
+        .unwrap();
+        let config = Config {
+            mas_shared_secret: Some("secret".to_string()),
+            matrix_server_name: Some(SERVER_NAME.to_string()),
+            ..Config::default()
+        };
+        let signer_service = siwx_oidc::test_support::TestSigner::start(
+            EcdsaSigningKey::generate(),
+            siwx_oidc::test_support::TestSigner::options(),
+        );
+        let signer = siwx_oidc::signing::socket::SocketSigner::connect(
+            &signer_service.socket,
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        signer_service.stop();
+        let result = token(
+            TokenForm {
+                code: None,
+                client_id: Some(client_id),
+                client_secret: None,
+                grant_type: CoreGrantType::DeviceCode,
+                code_verifier: None,
+                refresh_token: None,
+                device_code: Some(device_code.clone()),
+            },
+            ClientCredentials::default(),
+            &signer,
+            &config,
+            &db,
+            Some(&synapse),
+        )
+        .await;
+        server.abort();
+        assert!(
+            matches!(result, Err(CustomError::ServiceUnavailable(_))),
+            "a stopped signer is the retryable 503, never a token: {:?}",
+            result.as_ref().err()
+        );
+        assert!(
+            db.get_device_code(&device_code).await.unwrap().is_some(),
+            "the approved code is not deleted by a signing failure"
+        );
+    }
+
     #[tokio::test]
     async fn a_device_grant_counts_its_lifetime_from_the_approval() {
         let Some(db) = siwx_oidc::test_support::redis().await else {
@@ -11375,7 +11420,7 @@ mod end_session_tests {
     use super::scope_grant_tests::id_token_claims;
     use super::*;
     use crate::config::Config;
-    use openidconnect::{OAuth2TokenResponse, PostLogoutRedirectUrl};
+    use openidconnect::{OAuth2TokenResponse, PostLogoutRedirectUrl, PrivateSigningKey};
 
     fn issuer() -> IssuerUrl {
         IssuerUrl::from_url(Config::default().base_url)
