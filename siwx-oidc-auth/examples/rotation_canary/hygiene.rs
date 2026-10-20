@@ -4,8 +4,9 @@
 //!
 //! The canary holds no credential it could print by accident: the access,
 //! refresh and ID tokens, the registration access token, the account-action
-//! nonce and the signature over it live in [`Secret`]. The authorization code,
-//! the PKCE verifier, the CAIP-122 nonce and the session cookie are created and
+//! nonce and the signature over it, and the session cookies of the replies it
+//! reads itself (the `/authorize` probe among them) live in [`Secret`]. The
+//! authorization code, the PKCE verifier and the CAIP-122 nonce are created and
 //! consumed inside `siwx_oidc_auth`'s code flow and never reach this program.
 
 use std::fmt;
@@ -31,7 +32,7 @@ thread_local! {
 }
 
 /// A credential: an access, refresh or ID token, a registration access token,
-/// a nonce or a signature over one. `Debug` and `Display` print `[redacted]`,
+/// a nonce or a signature over one, a session cookie. `Debug` and `Display` print `[redacted]`,
 /// so a stray `{:?}` of a struct that holds one cannot leak it. Creating one
 /// registers its value with the taint check.
 #[derive(Clone)]
@@ -163,8 +164,8 @@ pub fn take_capture() -> Vec<String> {
     CAPTURE.with(|c| c.borrow_mut().take().unwrap_or_default())
 }
 
-/// The longest value printed.
-const MAX_VALUE: usize = 120;
+/// The longest value printed (the wrapper that gates the output allows 200).
+pub const MAX_VALUE: usize = 120;
 
 fn allowed(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ',' | ':' | '/' | '@' | '<' | '>' | '-')

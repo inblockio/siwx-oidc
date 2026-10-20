@@ -118,6 +118,7 @@ reasons! {
     IdentityCompromised => "identity_compromised",
     TripwireUnavailable => "tripwire_unavailable",
     UnfinishedSignInDevice => "unfinished_sign_in_device",
+    DeviceSurvivedLogout => "device_survived_logout",
     LeftoverNotDeleted => "leftover_not_deleted",
     NoRefreshToken => "no_refresh_token",
     LogoutStatus => "logout_status",

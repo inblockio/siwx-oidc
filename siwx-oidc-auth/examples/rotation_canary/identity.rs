@@ -2,13 +2,15 @@
 //! `~/.aqua-secrets/rotation-canary/<env>/`: `key.pem` (the canary account's
 //! Ed25519 key, 0600), `client.json` (public: the registered client, the issuer
 //! it belongs to, the logout route, the account's MXID), `devices.json` (the
-//! devices the canary created and has not yet seen gone) and `.lock`.
+//! devices the canary created and has not yet seen gone, the ones it is
+//! finished with and when, the ones excused as unfinished sign-ins, and the
+//! markers of sign-ins it started) and `.lock`.
 //!
 //! The directory is 0700 and `key.pem` is created 0600 by the `open(2)` that
 //! creates it, so no byte of the key is ever in a file with wider modes. The
 //! key is never overwritten (`create_new`), copied or backed up by this code.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
@@ -192,24 +194,199 @@ pub fn write_client(dir: &Path, record: &ClientRecord) -> Result<(), Reason> {
 /// marker is written before the sign-in and dropped once the run knows its own
 /// device; one still there at the next run says "one device of this kind may
 /// be unrecorded".
+///
+/// A marker is a licence to excuse one device, so it does not last: see
+/// [`ATTEMPT_MAX_AGE_SECS`] and [`ATTEMPT_CAP`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attempt {
     pub id: String,
-    /// Unix seconds on this host's clock; informative only.
+    /// Unix seconds on this host's clock when the sign-in started.
     pub at: i64,
+}
+
+/// How long a marker can excuse a device: three days. A run that died leaves
+/// its marker for the next run, which is a person or a job a few hours to a
+/// weekend away (a Friday evening failure and a Monday run are about 64 hours
+/// apart). A marker older than that belongs to a run nobody is waiting for any
+/// more, and the longer it stays valid the longer it can cover a device
+/// somebody else made. An expired marker explains nothing: its device reads as
+/// a stranger and fires the tripwire, the safe direction.
+pub const ATTEMPT_MAX_AGE_SECS: i64 = 3 * 24 * 60 * 60;
+
+/// The most markers that count, and the most the ledger keeps (the oldest are
+/// dropped first). Each run that fails between its `/authorize` probe and its
+/// `whoami` leaves one, and an operator chasing a broken token endpoint may
+/// retry a dozen times, so the cap is above that. Without a cap the number of
+/// devices the canary excuses would grow with every failed run, and the
+/// tripwire would get looser the longer the deployment is unhealthy.
+pub const ATTEMPT_CAP: usize = 16;
+
+/// A marker dated this far ahead of this host's clock is still believed (the
+/// clock is not exact); one dated further ahead is not, so a clock set back
+/// cannot keep a marker alive past its age limit.
+const ATTEMPT_FUTURE_SLACK_SECS: i64 = 300;
+
+impl Attempt {
+    /// Whether the marker may still explain a device at `now` (unix seconds).
+    pub fn is_live(&self, now: i64) -> bool {
+        self.at <= now.saturating_add(ATTEMPT_FUTURE_SLACK_SECS)
+            && now.saturating_sub(self.at) <= ATTEMPT_MAX_AGE_SECS
+    }
+}
+
+/// How far a device's `last_seen_ts` may lie past the time the canary last used
+/// the device and still be the canary's own use. Both are the server's clock
+/// (the retire time is read from a server reply, see `flow::ServerClock`, never
+/// from this host's clock), so only the rounding of a whole-second `Date`, the
+/// time a reply takes and a skew between two servers of the deployment (the
+/// OIDC server and the homeserver; C3 tolerates `checks::MAX_SKEW_SECS`, 30 s,
+/// between a server and its own token) remain: twice that. A longer slack would
+/// let a stranger who signs in on a retired id right after the canary's logout,
+/// and uses it once, pass for the canary.
+pub const LAST_SEEN_SLACK_SECS: i64 = 60;
+
+/// The time recorded for a device whose logout time is unknown (a ledger written
+/// before the times were kept, a device the canary never used and deleted as an
+/// unfinished sign-in's, a run that read no server clock): earlier than any
+/// `last_seen_ts`, so such a device passes only while it has never been seen in
+/// use.
+pub const TIME_UNKNOWN: i64 = i64::MIN;
+
+/// The devices the canary has finished with: each id with the unix seconds, on
+/// the server's clock (not this host's: `last_seen_ts` is the server's too),
+/// taken after the canary's last request with the device's token, or
+/// [`TIME_UNKNOWN`]. A device on it that is still listed at a later run is the canary's own
+/// only if it carries the canary's display name and its `last_seen_ts` is no
+/// later than that time plus [`LAST_SEEN_SLACK_SECS`] (see
+/// `flow::Device::is_survivor`): siwx-oidc lets a client propose a device id and
+/// recreates a deleted one, so an id alone proves nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "LoggedOutRepr", into = "BTreeMap<String, i64>")]
+pub struct LoggedOut(BTreeMap<String, i64>);
+
+/// What `devices.json` may hold under `logged_out`: the map, or the bare list
+/// of ids of the version that did not keep the times.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LoggedOutRepr {
+    Timed(BTreeMap<String, i64>),
+    Bare(BTreeSet<String>),
+}
+
+impl From<LoggedOutRepr> for LoggedOut {
+    fn from(repr: LoggedOutRepr) -> Self {
+        LoggedOut(match repr {
+            LoggedOutRepr::Timed(map) => map,
+            LoggedOutRepr::Bare(ids) => ids.into_iter().map(|id| (id, TIME_UNKNOWN)).collect(),
+        })
+    }
+}
+
+impl From<LoggedOut> for BTreeMap<String, i64> {
+    fn from(logged_out: LoggedOut) -> Self {
+        logged_out.0
+    }
+}
+
+impl LoggedOut {
+    pub fn contains(&self, id: &str) -> bool {
+        self.0.contains_key(id)
+    }
+
+    /// The time recorded for `id`.
+    pub fn at(&self, id: &str) -> Option<i64> {
+        self.0.get(id).copied()
+    }
+
+    /// Record `id` as finished with at `at` (replacing an earlier time).
+    pub fn insert(&mut self, id: String, at: i64) {
+        self.0.insert(id, at);
+    }
+
+    /// Record `id` as finished with at a time nobody can vouch for
+    /// ([`TIME_UNKNOWN`]): it passes as the canary's own only while it has never
+    /// been seen in use.
+    pub fn insert_unknown(&mut self, id: String) {
+        self.0.insert(id, TIME_UNKNOWN);
+    }
+
+    pub fn remove(&mut self, id: &str) {
+        self.0.remove(id);
+    }
+
+    pub fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.0.retain(|id, _| keep(id));
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn ids(&self) -> BTreeSet<String> {
+        self.0.keys().cloned().collect()
+    }
 }
 
 /// `devices.json`: what the canary knows about the devices it made. Only this
 /// program writes the file, so a stranger's device is never in it. An
 /// unreadable ledger reads as empty: the tripwire gets stricter, never looser.
+///
+/// A device leaves every list only when a reading shows it gone, never on the
+/// strength of an answer: siwx-oidc deletes a Synapse device best-effort and
+/// answers 200 whether or not that worked.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ledger {
-    /// Devices created by a run of the canary and not yet seen gone.
+    /// Devices created by a run of the canary and not yet seen gone: this run's
+    /// own where the logout may leave it (`/oauth2/revoke`, an unproven logout)
+    /// and the device of a run that died after learning it. Tolerated at the
+    /// next run whatever they look like, and deleted.
     #[serde(default)]
     pub pending: BTreeSet<String>,
-    /// Sign-ins started and not finished.
+    /// Devices the canary is finished with, each at a server time or at a time
+    /// unknown: the ones whose logout a run proved (the refresh token was refused
+    /// after it) and the ones it deleted (the excused unfinished sign-ins at a
+    /// time unknown, as the canary never used them). The proof is about the
+    /// grant, not the device, so one of these may still be listed at the next
+    /// run. It is then reported under its own reason and deleted, not taken for
+    /// a stranger, provided it still looks like the canary's (see
+    /// [`LoggedOut`]); otherwise it fires the tripwire.
+    #[serde(default)]
+    pub logged_out: LoggedOut,
+    /// Devices a run excused as the leftover of an unfinished sign-in and could
+    /// not delete (the delete was refused, or the run could not tell which
+    /// device was its own), and the ones an older version of this program left
+    /// here. A run deletes the devices it excuses in that same run, so this list
+    /// is normally empty. The canary never used their tokens, so they stay
+    /// leftovers only while they are still never seen in use: one that has been
+    /// seen is not known to be ours (`last_seen_ts` is not a record of every
+    /// use, but a use it shows is one) and fires the tripwire.
+    #[serde(default)]
+    pub unfinished: BTreeSet<String>,
+    /// Sign-ins started and not finished, oldest first.
     #[serde(default)]
     pub attempts: Vec<Attempt>,
+}
+
+impl Ledger {
+    /// How many unfinished sign-ins of earlier runs (not `own`, this run's)
+    /// can still explain a device at `now`: the live markers, at most
+    /// [`ATTEMPT_CAP`].
+    pub fn live_attempts(&self, now: i64, own: &str) -> usize {
+        self.attempts
+            .iter()
+            .filter(|a| a.id != own && a.is_live(now))
+            .count()
+            .min(ATTEMPT_CAP)
+    }
+
+    /// Add a marker: the expired ones are dropped first and, when the cap would
+    /// be passed, the oldest live ones after them.
+    pub fn record_attempt(&mut self, attempt: Attempt, now: i64) {
+        self.attempts.retain(|a| a.is_live(now));
+        self.attempts.push(attempt);
+        let excess = self.attempts.len().saturating_sub(ATTEMPT_CAP);
+        self.attempts.drain(..excess);
+    }
 }
 
 pub fn read_ledger(dir: &Path) -> Ledger {
@@ -411,8 +588,12 @@ mod tests {
         let scratch = Scratch::new("ledger");
         let dir = ensure_dir(&scratch.0, "dev").unwrap();
         assert_eq!(read_ledger(&dir), Ledger::default());
+        let mut logged_out = LoggedOut::default();
+        logged_out.insert("SIWX_c".to_string(), 1_700_000_100);
         let ledger = Ledger {
             pending: BTreeSet::from(["SIWX_a".to_string(), "SIWX_b".to_string()]),
+            logged_out,
+            unfinished: BTreeSet::from(["SIWX_d".to_string()]),
             attempts: vec![Attempt {
                 id: "abc".to_string(),
                 at: 1_700_000_000,
@@ -447,6 +628,136 @@ mod tests {
         let ledger = read_ledger(&dir);
         assert_eq!(ledger.pending, BTreeSet::from(["SIWX_old".to_string()]));
         assert!(ledger.attempts.is_empty());
+        assert!(ledger.logged_out.is_empty());
+    }
+
+    #[test]
+    fn a_ledger_without_logged_out_devices_still_reads() {
+        let scratch = Scratch::new("ledger-v2");
+        let dir = ensure_dir(&scratch.0, "dev").unwrap();
+        fs::write(
+            dir.join(DEVICES_FILE),
+            br#"{"pending":[],"attempts":[{"id":"abc","at":1700000000}]}"#,
+        )
+        .unwrap();
+        let ledger = read_ledger(&dir);
+        assert_eq!(ledger.attempts.len(), 1);
+        assert!(ledger.logged_out.is_empty());
+    }
+
+    #[test]
+    fn the_logout_times_are_kept_and_a_list_of_ids_from_before_reads_as_time_unknown() {
+        let scratch = Scratch::new("ledger-times");
+        let dir = ensure_dir(&scratch.0, "dev").unwrap();
+        update_ledger(&dir, |l| {
+            l.logged_out.insert("SIWX_a".to_string(), 1_700_000_000)
+        })
+        .unwrap();
+        let text = fs::read_to_string(dir.join(DEVICES_FILE)).unwrap();
+        assert!(text.contains("\"SIWX_a\": 1700000000"), "{text}");
+        assert_eq!(
+            read_ledger(&dir).logged_out.at("SIWX_a"),
+            Some(1_700_000_000)
+        );
+        assert_eq!(read_ledger(&dir).logged_out.at("SIWX_b"), None);
+
+        // The version that kept a bare list: every id is there, at no known time.
+        fs::write(
+            dir.join(DEVICES_FILE),
+            br#"{"pending":[],"logged_out":["SIWX_old"],"attempts":[]}"#,
+        )
+        .unwrap();
+        let ledger = read_ledger(&dir);
+        assert!(ledger.logged_out.contains("SIWX_old"));
+        assert_eq!(ledger.logged_out.at("SIWX_old"), Some(i64::MIN));
+        assert!(ledger.unfinished.is_empty());
+        // It round-trips as a map.
+        write_ledger(&dir, &ledger).unwrap();
+        assert_eq!(read_ledger(&dir), ledger);
+    }
+
+    fn attempt(id: &str, at: i64) -> Attempt {
+        Attempt {
+            id: id.to_string(),
+            at,
+        }
+    }
+
+    const NOW: i64 = 1_800_000_000;
+
+    #[test]
+    fn a_marker_explains_a_device_only_for_three_days() {
+        assert!(attempt("a", NOW).is_live(NOW));
+        assert!(attempt("a", NOW - ATTEMPT_MAX_AGE_SECS).is_live(NOW));
+        assert!(!attempt("a", NOW - ATTEMPT_MAX_AGE_SECS - 1).is_live(NOW));
+        assert!(!attempt("a", 1).is_live(NOW), "a marker from 1970 is spent");
+    }
+
+    #[test]
+    fn a_marker_from_the_future_is_believed_a_little_and_not_for_ever() {
+        assert!(attempt("a", NOW + 60).is_live(NOW), "a clock a minute off");
+        assert!(
+            !attempt("a", NOW + 3_600).is_live(NOW),
+            "an hour ahead is not a clock error; a marker set that far ahead would never age"
+        );
+        assert!(!attempt("a", i64::MAX).is_live(NOW));
+        assert!(!attempt("a", i64::MIN).is_live(NOW));
+    }
+
+    #[test]
+    #[ignore = "known gap, tracked in #84 (item 2)"]
+    fn audit_a7_a_clock_set_back_does_not_keep_a_marker_alive_past_its_age_limit() {
+        // Recorded 3 days and 1 hour ago; this host's clock is now 2 hours slow.
+        let marker = attempt("a", NOW - ATTEMPT_MAX_AGE_SECS - 3_600);
+        assert!(!marker.is_live(NOW - 7_200), "expired by the true clock");
+    }
+
+    #[test]
+    fn only_live_markers_of_other_runs_count() {
+        let ledger = Ledger {
+            attempts: vec![
+                attempt("old", NOW - ATTEMPT_MAX_AGE_SECS - 10),
+                attempt("fresh", NOW - 10),
+                attempt("mine", NOW - 1),
+            ],
+            ..Ledger::default()
+        };
+        assert_eq!(ledger.live_attempts(NOW, "mine"), 1);
+        assert_eq!(ledger.live_attempts(NOW, "nobody"), 2);
+    }
+
+    #[test]
+    fn the_markers_that_count_are_capped_even_in_a_ledger_that_holds_more() {
+        let ledger = Ledger {
+            attempts: (0..ATTEMPT_CAP + 5)
+                .map(|n| attempt(&format!("m{n}"), NOW - 10))
+                .collect(),
+            ..Ledger::default()
+        };
+        assert_eq!(ledger.live_attempts(NOW, "mine"), ATTEMPT_CAP);
+    }
+
+    #[test]
+    fn recording_a_marker_drops_expired_ones_and_keeps_at_most_the_cap_newest() {
+        let mut ledger = Ledger {
+            attempts: vec![attempt("old", 1)],
+            ..Ledger::default()
+        };
+        ledger.record_attempt(attempt("a", NOW), NOW);
+        assert_eq!(ledger.attempts, vec![attempt("a", NOW)], "expired is gone");
+        for n in 0..ATTEMPT_CAP + 3 {
+            ledger.record_attempt(attempt(&format!("n{n}"), NOW), NOW);
+        }
+        assert_eq!(ledger.attempts.len(), ATTEMPT_CAP);
+        assert_eq!(
+            ledger.attempts.last().unwrap().id,
+            format!("n{}", ATTEMPT_CAP + 2),
+            "the newest is kept"
+        );
+        assert!(
+            ledger.attempts.iter().all(|a| a.id != "a" && a.id != "n0"),
+            "the oldest go first"
+        );
     }
 
     #[test]

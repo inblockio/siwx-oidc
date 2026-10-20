@@ -111,7 +111,7 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   `MIGRATION_TEST_REDIS_URL`; and the pure check `an_absent_strict_skips_variable_means_strict`
   in `e2e_account_lifecycle_live` and in `e2e_did_field_live` (1 each). In the headless
   client's crate it also runs the three pure checks of `siwx-oidc-auth/tests/live_upgrade.rs`'s
-  helpers and the 109 unit and hermetic tests of the rotation canary
+  helpers and the 148 unit and hermetic tests of the rotation canary
   (`siwx-oidc-auth/tests/rotation_canary_unit.rs`, which compiles the modules of
   `examples/rotation_canary.rs`; the hermetic ones talk to a fake server inside the test process).
 - **Redis-backed tests** get their Redis from `siwx_oidc::test_support` (`src/test_support.rs`):
