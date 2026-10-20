@@ -1001,14 +1001,14 @@ pub trait DBClient {
         &self,
         device_code: &str,
     ) -> Result<Option<(DeviceCodeRef, DeviceCodeEntry)>>;
-    /// Update the entry a lookup returned, where the lookup found it, with a
-    /// TTL in seconds (preserving the original TTL is the caller's
-    /// responsibility).
+    /// Update the entry a lookup returned, where the lookup found it. The code keeps
+    /// the expiry it was created with (RFC 8628 §3.2: `expires_in` is its lifetime),
+    /// however often it is polled, approved or denied, and a code that expired since
+    /// the lookup is not written again.
     async fn update_device_code(
         &self,
         device_code: &DeviceCodeRef,
         entry: &DeviceCodeEntry,
-        ttl: u64,
     ) -> Result<()>;
     /// Redis `TIME` in Unix milliseconds: the clock of every lifetime deadline
     /// (I6) and of the epochs (I9), so instances with skewed clocks agree.

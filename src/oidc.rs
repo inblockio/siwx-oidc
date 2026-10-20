@@ -1462,9 +1462,7 @@ async fn token_device_code(
     if let Some(last) = entry.last_poll {
         if now_ts - last < DEVICE_CODE_INTERVAL as i64 {
             entry.last_poll = Some(now_ts);
-            let _ = db_client
-                .update_device_code(&device_ref, &entry, DEVICE_CODE_LIFETIME)
-                .await;
+            let _ = db_client.update_device_code(&device_ref, &entry).await;
             return Err(device_code_error(
                 "slow_down",
                 "Polling too fast. Increase interval.",
@@ -1472,9 +1470,7 @@ async fn token_device_code(
         }
     }
     entry.last_poll = Some(now_ts);
-    let _ = db_client
-        .update_device_code(&device_ref, &entry, DEVICE_CODE_LIFETIME)
-        .await;
+    let _ = db_client.update_device_code(&device_ref, &entry).await;
 
     match entry.status {
         DeviceCodeStatus::Pending => Err(device_code_error(
@@ -1542,10 +1538,7 @@ async fn token_device_code(
                             "device_code grant: refused a deleted device id"
                         );
                         entry.status = DeviceCodeStatus::Denied;
-                        if let Err(e) = db_client
-                            .update_device_code(&device_ref, &entry, DEVICE_CODE_LIFETIME)
-                            .await
-                        {
+                        if let Err(e) = db_client.update_device_code(&device_ref, &entry).await {
                             // The code stays approved, and every later poll is refused
                             // here again while the marker lives: still never a token.
                             warn!(error = %e, "device_code grant: could not deny the refused code");
@@ -14330,9 +14323,7 @@ mod generic_client_tests {
         // The next poll (past the interval) gets access_denied, never a token.
         let (dref, mut entry) = db.get_device_code(&code).await.unwrap().unwrap();
         entry.last_poll = None;
-        db.update_device_code(&dref, &entry, DEVICE_CODE_LIFETIME)
-            .await
-            .unwrap();
+        db.update_device_code(&dref, &entry).await.unwrap();
         let second = token(
             TokenForm {
                 code: None,
@@ -14431,9 +14422,7 @@ mod generic_client_tests {
     ) -> Result<SiwxTokenResponse, CustomError> {
         let (dref, mut entry) = db.get_device_code(code).await.unwrap().unwrap();
         entry.last_poll = None;
-        db.update_device_code(&dref, &entry, DEVICE_CODE_LIFETIME)
-            .await
-            .unwrap();
+        db.update_device_code(&dref, &entry).await.unwrap();
         token(
             TokenForm {
                 code: None,

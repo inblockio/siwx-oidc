@@ -6,9 +6,9 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use bb8_redis::{
     bb8::{self, Pool},
-    redis::AsyncCommands,
-    RedisConnectionManager,
+    redis::{aio::MultiplexedConnection, AsyncCommands, AsyncConnectionConfig, RedisError},
 };
+use std::time::Duration;
 use tracing::{debug, warn};
 
 use crate::client_policy;
@@ -22,9 +22,58 @@ use super::*;
 // `ACCESS_TOKEN_TTL`, so the const assertion tying the two together can see both.
 // It reaches here via the `use super::*` above.
 
+/// How long a Redis command may take before the call fails.
+///
+/// The rotation script and the other grant scripts commit whether or not their caller
+/// waits for the answer, so a caller that gives up early reports a failure for a change
+/// that happened, and a stall fails every command in flight on the instance, not only
+/// the slow one. A healthy answer takes milliseconds; the bound only keeps a request from
+/// hanging on a connection that died without closing.
+pub(crate) const REDIS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The pool's connection manager. bb8-redis's own connects with the redis crate's default
+/// configuration, whose response timeout is 500 ms, and offers no way to change it.
+#[derive(Clone, Debug)]
+pub struct ConnectionManager {
+    client: bb8_redis::redis::Client,
+}
+
+impl ConnectionManager {
+    fn new(url: &str) -> Result<Self, RedisError> {
+        Ok(Self {
+            client: bb8_redis::redis::Client::open(url)?,
+        })
+    }
+}
+
+impl bb8::ManageConnection for ConnectionManager {
+    type Connection = MultiplexedConnection;
+    type Error = RedisError;
+
+    async fn connect(&self) -> Result<Self::Connection, Self::Error> {
+        let config =
+            AsyncConnectionConfig::new().set_response_timeout(Some(REDIS_RESPONSE_TIMEOUT));
+        self.client
+            .get_multiplexed_async_connection_with_config(&config)
+            .await
+    }
+
+    async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
+        let pong: String = bb8_redis::redis::cmd("PING").query_async(conn).await?;
+        match pong.as_str() {
+            "PONG" => Ok(()),
+            _ => Err((bb8_redis::redis::ErrorKind::Extension, "ping request").into()),
+        }
+    }
+
+    fn has_broken(&self, _: &mut Self::Connection) -> bool {
+        false
+    }
+}
+
 #[derive(Clone)]
 pub struct RedisClient {
-    pub(super) pool: Pool<RedisConnectionManager>,
+    pub(super) pool: Pool<ConnectionManager>,
     /// The operator's absolute-lifetime caps (I6); none by default. Set with
     /// [`RedisClient::with_grant_lifetime`].
     pub(super) lifetime: super::grant::GrantLifetime,
@@ -425,7 +474,7 @@ impl RedisClient {
     }
 
     pub async fn new(url: &Url) -> Result<Self> {
-        let manager = RedisConnectionManager::new(url.as_str())
+        let manager = ConnectionManager::new(url.as_str())
             .context("Could not build Redis connection manager")?;
         let pool = bb8::Pool::builder()
             .build(manager.clone())
@@ -1736,12 +1785,25 @@ impl DBClient for RedisClient {
         &self,
         device_code: &DeviceCodeRef,
         entry: &DeviceCodeEntry,
-        ttl: u64,
     ) -> Result<()> {
         let value = serde_json::to_string(entry)
             .map_err(|e| anyhow!("Failed to serialize DeviceCodeEntry: {}", e))?;
-        self.set_ex_raw(&stored_device_code_key(device_code), &value, ttl)
+        let mut conn = self
+            .pool
+            .get()
             .await
+            .map_err(|e| anyhow!("Redis pool: {}", e))?;
+        // XX: an entry that expired since the lookup stays gone (a plain SET would
+        // write it back with no expiry at all). KEEPTTL: the code keeps its lifetime.
+        let _: Option<String> = bb8_redis::redis::cmd("SET")
+            .arg(stored_device_code_key(device_code))
+            .arg(&value)
+            .arg("XX")
+            .arg("KEEPTTL")
+            .query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("Failed to update a device code: {}", e))?;
+        Ok(())
     }
 
     async fn plant_deleted_device_marker(
@@ -1913,34 +1975,83 @@ mod tests {
 
     /// A command the server answers after more than half a second still succeeds. The
     /// rotation script commits whether or not its caller waits for the answer, so a
-    /// caller that gives up early reports a failure for a rotation that happened. The
-    /// script below holds the server for 700 ms, as a loaded host or a stall would.
-    ///
-    /// Ignored: the hold stalls every other test on the same Redis. Run it alone:
-    /// `cargo test --lib a_redis_answer_slower -- --ignored`.
+    /// caller that gives up early reports a failure for a rotation that happened.
+    /// `CLIENT PAUSE` holds every client of the server for 700 ms, as a loaded host or
+    /// a stall would; the other tests on the same Redis wait too, within
+    /// [`super::REDIS_RESPONSE_TIMEOUT`].
     #[tokio::test]
-    #[ignore = "holds the shared test Redis for 700 ms; run alone"]
     async fn a_redis_answer_slower_than_half_a_second_is_awaited() {
         let Some(client) = crate::test_support::redis().await else {
             return;
         };
-        const HOLD_LUA: &str = r#"
-            local t = redis.call('TIME')
-            local start = tonumber(t[1]) * 1000000 + tonumber(t[2])
-            repeat
-                local n = redis.call('TIME')
-                local now = tonumber(n[1]) * 1000000 + tonumber(n[2])
-            until now - start >= tonumber(ARGV[1])
-            return 1
-        "#;
         let mut conn = client.pool.get().await.unwrap();
+        let raw =
+            bb8_redis::redis::Client::open(crate::test_support::redis_url().as_str()).unwrap();
+        let mut pauser = raw.get_multiplexed_async_connection().await.unwrap();
+        let _: () = bb8_redis::redis::cmd("CLIENT")
+            .arg("PAUSE")
+            .arg(700)
+            .arg("ALL")
+            .query_async(&mut pauser)
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
         let held: bb8_redis::redis::RedisResult<i64> = bb8_redis::redis::cmd("EVAL")
-            .arg(HOLD_LUA)
+            .arg("return 1")
             .arg(0)
-            .arg(700_000)
             .query_async(&mut *conn)
             .await;
-        assert_eq!(held.ok(), Some(1), "a 700 ms answer must not time out");
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(500),
+            "the pause must hold the command past half a second; it took {waited:?}"
+        );
+        assert_eq!(
+            held.as_ref().ok(),
+            Some(&1),
+            "a 700 ms answer must not time out: {held:?}"
+        );
+    }
+
+    /// An update keeps the lifetime the code was created with and never writes back a
+    /// code that expired since it was read: a plain `SET` would leave it with no expiry.
+    #[tokio::test]
+    async fn a_device_code_update_keeps_its_expiry_and_never_revives_an_expired_code() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let n = unique_nonce();
+        let device_code = format!("dvc_keep{n}");
+        let key = format!("device_code/{}", digest(&device_code));
+        let entry = DeviceCodeEntry::new(&format!("KEEP-{n}"), "c".into(), "openid".into(), 0);
+        client
+            .set_device_code(&device_code, &entry, 60)
+            .await
+            .unwrap();
+        let (r, mut found) = client.get_device_code(&device_code).await.unwrap().unwrap();
+
+        found.status = DeviceCodeStatus::Approved;
+        client.update_device_code(&r, &found).await.unwrap();
+        let left = client.ttl_raw(&key).await.unwrap();
+        assert!(
+            (1..=60).contains(&left),
+            "the update kept the expiry: {left} s"
+        );
+        let (_, stored) = client.get_device_code(&device_code).await.unwrap().unwrap();
+        assert_eq!(
+            stored.status,
+            DeviceCodeStatus::Approved,
+            "and wrote the entry"
+        );
+
+        client.del_raw(&key).await.unwrap();
+        client.update_device_code(&r, &found).await.unwrap();
+        assert_eq!(
+            client.ttl_raw(&key).await.unwrap(),
+            -2,
+            "a code that expired since its lookup stays gone"
+        );
     }
 
     fn token_meta(device_id: &str, username: &str) -> TokenMetadata {
@@ -2943,10 +3054,7 @@ mod tests {
         let (by_device, _) = client.get_device_code(&device_code).await.unwrap().unwrap();
         assert_eq!(by_user, by_device, "both lookups name the same entry");
         found.status = DeviceCodeStatus::Approved;
-        client
-            .update_device_code(&by_user, &found, 60)
-            .await
-            .unwrap();
+        client.update_device_code(&by_user, &found).await.unwrap();
         let (_, approved) = client.get_device_code(&device_code).await.unwrap().unwrap();
         assert_eq!(approved.status, DeviceCodeStatus::Approved);
         assert_eq!(approved.user_code_digest, digest(&user_code));
@@ -3037,7 +3145,7 @@ mod tests {
             .expect("a legacy user code is found");
         assert_eq!(entry.user_code_digest, digest(&user_code));
         entry.status = DeviceCodeStatus::Approved;
-        client.update_device_code(&r, &entry, 60).await.unwrap();
+        client.update_device_code(&r, &entry).await.unwrap();
         assert!(
             client
                 .get_raw(&format!("device_code/{}", digest(&device_code)))
