@@ -19,7 +19,7 @@ use std::time::Duration;
 use siwx_oidc_auth::{verify_did_assertion, SiwxKey, DID_PROFILE_FIELD};
 
 use crate::cli::{CheckConfig, Matrix};
-use crate::flow::{self, Probe, Tokens, RETRY_PAUSE};
+use crate::flow::{self, Probe, ServerClock, Tokens, RETRY_PAUSE};
 use crate::hygiene::{self, Secret};
 use crate::identity::{self, Attempt, ClientRecord, LogoutRoute};
 use crate::jose::{
@@ -67,8 +67,37 @@ impl Run {
     }
 }
 
+/// The most ids one printed list names. The output is gated line by line and
+/// value by value (at most `hygiene::MAX_VALUE` characters, which a value is cut
+/// to without a word), and a device id is whatever a stranger proposed, so a list
+/// names the first few whole ids and the field after it counts them all.
+const LIST_MAX_IDS: usize = 3;
+
+/// The first [`LIST_MAX_IDS`] ids, comma-separated, and fewer if the next one
+/// would not fit in a value. The first is always named (a value longer than the
+/// cap is cut by `hygiene::value`).
 fn list(items: &[String]) -> String {
-    items.join(",")
+    let mut out = String::new();
+    let mut used = 0;
+    for (n, item) in items.iter().take(LIST_MAX_IDS).enumerate() {
+        let width = item.chars().count();
+        if n > 0 && used + 1 + width > hygiene::MAX_VALUE {
+            break;
+        }
+        if n > 0 {
+            out.push(',');
+            used += 1;
+        }
+        out.push_str(item);
+        used += width;
+    }
+    out
+}
+
+/// A list field and the field that counts every id of it (named in `count`).
+fn push_ids(fields: &mut Fields, name: &'static str, count: &'static str, items: &[String]) {
+    fields.push((name, list(items)));
+    fields.push((count, items.len().to_string()));
 }
 
 /// A refusal before any check ran: one line, no summary.
@@ -85,6 +114,9 @@ struct Session {
     tokens: Tokens,
     /// The server's `Date` at this run's `/authorize` response.
     server_date: Option<i64>,
+    /// That `Date` and when it arrived: the server's clock, kept running on this
+    /// host's monotonic clock.
+    clock: Option<ServerClock>,
 }
 
 struct WhoAmI {
@@ -309,17 +341,25 @@ impl Cx {
             return run.fail(CHECK, Reason::JwksMalformed, vec![]);
         };
         let verdict = judge_jwks(&entries, &self.cfg.expect, &self.cfg.dropped);
-        let fields = vec![
-            (
-                "kids",
-                list(&entries.iter().map(|e| e.kid.clone()).collect::<Vec<_>>()),
-            ),
-            ("count", entries.len().to_string()),
-            ("missing", list(&verdict.missing)),
-            ("extra", list(&verdict.extra)),
-            ("dropped_present", list(&verdict.dropped_present)),
-            ("not_derived", list(&verdict.not_derived)),
-        ];
+        let mut fields: Fields = vec![(
+            "kids",
+            list(&entries.iter().map(|e| e.kid.clone()).collect::<Vec<_>>()),
+        )];
+        fields.push(("count", entries.len().to_string()));
+        push_ids(&mut fields, "missing", "missing_count", &verdict.missing);
+        push_ids(&mut fields, "extra", "extra_count", &verdict.extra);
+        push_ids(
+            &mut fields,
+            "dropped_present",
+            "dropped_present_count",
+            &verdict.dropped_present,
+        );
+        push_ids(
+            &mut fields,
+            "not_derived",
+            "not_derived_count",
+            &verdict.not_derived,
+        );
         self.jwks = Some(entries);
         match verdict.reason() {
             Reason::Ok => run.ok(CHECK, fields),
@@ -389,6 +429,7 @@ impl Cx {
                 return None;
             }
         };
+        let probed = std::time::Instant::now();
         // The server creates the Synapse device at `/sign_in`, before the code
         // is exchanged: if this run fails or is killed from here on, the ledger
         // says a device without an id here may exist. Without a Matrix side
@@ -410,8 +451,6 @@ impl Cx {
                 return None;
             }
         }
-        // Seconds on this host's monotonic clock since the server's `Date`.
-        let since_probe = std::time::Instant::now();
         let tokens =
             match flow::sign_in(&self.http, &issuer, &self.record.client_id, &self.key).await {
                 Ok(tokens) => tokens,
@@ -420,7 +459,8 @@ impl Cx {
                     return None;
                 }
             };
-        let elapsed = since_probe.elapsed().as_secs() as i64 + 1;
+        // Seconds on this host's monotonic clock since the server's `Date`.
+        let elapsed = probed.elapsed().as_secs() as i64 + 1;
         let did = self.key.did();
         let verified = (|| {
             let jwks = self.jwks.as_ref().ok_or(Reason::JwksUnavailable)?;
@@ -472,6 +512,7 @@ impl Cx {
         Some(Session {
             tokens,
             server_date,
+            clock: server_date.map(|date| ServerClock::new(date, probed)),
         })
     }
 
@@ -632,13 +673,20 @@ impl Cx {
         let judged = reading
             .as_ref()
             .map(|r| flow::judge(r, own_device, &ledger, earlier_attempts));
-        // Forget the canary's own leftovers and the devices that outlived a
-        // proven logout, but never touch anything while the tripwire is fired:
-        // the evidence stays.
+        // Forget the canary's own leftovers, the devices that outlived a proven
+        // logout and the devices a marker excused (the canary cannot vouch for
+        // those, and `last_seen_ts` does not record every use, so they do not
+        // wait for the next run), but never touch anything while the tripwire is
+        // fired: the evidence stays.
         let mut cleaned = BTreeSet::new();
         let mut stuck = Vec::new();
         if let Some(judged) = judged.as_ref().filter(|j| !j.fired) {
-            for id in judged.leftovers.iter().chain(&judged.survivors) {
+            for id in judged
+                .leftovers
+                .iter()
+                .chain(&judged.survivors)
+                .chain(judged.deletable_unfinished(own_device))
+            {
                 if flow::delete_device(&self.http, &matrix.homeserver, &session.tokens.access, id)
                     .await
                 {
@@ -658,8 +706,14 @@ impl Cx {
             &session.tokens,
         )
         .await;
-        // After the logout: no use of any device is later than this.
-        let now = chrono::Utc::now().timestamp();
+        // After the logout: no use of any device is later than this. The
+        // server's clock, as its latest reply told it, because `last_seen_ts`
+        // is the server's too and nothing bounds this host's clock against it.
+        let now = report
+            .clock
+            .or(reading.as_ref().and_then(|r| r.clock))
+            .or(session.clock)
+            .map(|clock| clock.now());
         let ledger_word = match (&reading, &judged) {
             (Some(r), Some(j)) => {
                 // A logout through `/logout` ends the grant and, best-effort,
@@ -722,21 +776,22 @@ impl Cx {
         if let Some(j) = &judged {
             let deleted = |ids: &[String]| ids.iter().filter(|id| cleaned.contains(*id)).count();
             if !j.leftovers.is_empty() {
-                fields.push(("leftovers", list(&j.leftovers)));
+                push_ids(&mut fields, "leftovers", "leftovers_count", &j.leftovers);
                 fields.push(("cleaned", deleted(&j.leftovers).to_string()));
             }
             if !j.survivors.is_empty() {
-                fields.push(("survivors", list(&j.survivors)));
+                push_ids(&mut fields, "survivors", "survivors_count", &j.survivors);
                 fields.push(("survivors_cleaned", deleted(&j.survivors).to_string()));
             }
             if !stuck.is_empty() {
-                fields.push(("stuck", list(&stuck)));
+                push_ids(&mut fields, "stuck", "stuck_count", &stuck);
             }
             if !j.unfinished.is_empty() {
-                fields.push(("unfinished", list(&j.unfinished)));
+                push_ids(&mut fields, "unfinished", "unfinished_count", &j.unfinished);
+                fields.push(("unfinished_cleaned", deleted(&j.unfinished).to_string()));
             }
             if !j.strangers.is_empty() {
-                fields.push(("strangers", list(&j.strangers)));
+                push_ids(&mut fields, "strangers", "strangers_count", &j.strangers);
             }
         }
         if let Some(cleanup) = report.cleanup {

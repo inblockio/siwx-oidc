@@ -235,20 +235,27 @@ impl Attempt {
 }
 
 /// How far a device's `last_seen_ts` may lie past the time the canary last used
-/// the device and still be the canary's own use: the server's clock against this
-/// host's (the skew C3 tolerates is `checks::MAX_SKEW_SECS`, 30 s), so twice
-/// that. A longer slack would let a stranger who signs in on a retired id
-/// right after the canary's logout, and uses it once, pass for the canary.
+/// the device and still be the canary's own use. Both are the server's clock
+/// (the retire time is read from a server reply, see `flow::ServerClock`, never
+/// from this host's clock), so only the rounding of a whole-second `Date`, the
+/// time a reply takes and a skew between two servers of the deployment (the
+/// OIDC server and the homeserver; C3 tolerates `checks::MAX_SKEW_SECS`, 30 s,
+/// between a server and its own token) remain: twice that. A longer slack would
+/// let a stranger who signs in on a retired id right after the canary's logout,
+/// and uses it once, pass for the canary.
 pub const LAST_SEEN_SLACK_SECS: i64 = 60;
 
 /// The time recorded for a device whose logout time is unknown (a ledger written
-/// before the times were kept): earlier than any `last_seen_ts`, so such a device
-/// passes only while it has never been seen in use.
-const TIME_UNKNOWN: i64 = i64::MIN;
+/// before the times were kept, a device the canary never used and deleted as an
+/// unfinished sign-in's, a run that read no server clock): earlier than any
+/// `last_seen_ts`, so such a device passes only while it has never been seen in
+/// use.
+pub const TIME_UNKNOWN: i64 = i64::MIN;
 
 /// The devices the canary has finished with: each id with the unix seconds, on
-/// this host's clock, taken after the canary's last request with the device's
-/// token. A device on it that is still listed at a later run is the canary's own
+/// the server's clock (not this host's: `last_seen_ts` is the server's too),
+/// taken after the canary's last request with the device's token, or
+/// [`TIME_UNKNOWN`]. A device on it that is still listed at a later run is the canary's own
 /// only if it carries the canary's display name and its `last_seen_ts` is no
 /// later than that time plus [`LAST_SEEN_SLACK_SECS`] (see
 /// `flow::Device::is_survivor`): siwx-oidc lets a client propose a device id and
@@ -296,6 +303,13 @@ impl LoggedOut {
         self.0.insert(id, at);
     }
 
+    /// Record `id` as finished with at a time nobody can vouch for
+    /// ([`TIME_UNKNOWN`]): it passes as the canary's own only while it has never
+    /// been seen in use.
+    pub fn insert_unknown(&mut self, id: String) {
+        self.0.insert(id, TIME_UNKNOWN);
+    }
+
     pub fn remove(&mut self, id: &str) {
         self.0.remove(id);
     }
@@ -328,18 +342,24 @@ pub struct Ledger {
     /// next run whatever they look like, and deleted.
     #[serde(default)]
     pub pending: BTreeSet<String>,
-    /// Devices the canary is finished with at a known time: the ones whose
-    /// logout a run proved (the refresh token was refused after it) and the ones
-    /// it deleted. The proof is about the grant, not the device, so one of these
-    /// may still be listed at the next run. It is then reported under its own
-    /// reason and deleted, not taken for a stranger, provided it still looks
-    /// like the canary's (see [`LoggedOut`]); otherwise it fires the tripwire.
+    /// Devices the canary is finished with, each at a server time or at a time
+    /// unknown: the ones whose logout a run proved (the refresh token was refused
+    /// after it) and the ones it deleted (the excused unfinished sign-ins at a
+    /// time unknown, as the canary never used them). The proof is about the
+    /// grant, not the device, so one of these may still be listed at the next
+    /// run. It is then reported under its own reason and deleted, not taken for
+    /// a stranger, provided it still looks like the canary's (see
+    /// [`LoggedOut`]); otherwise it fires the tripwire.
     #[serde(default)]
     pub logged_out: LoggedOut,
-    /// Devices a run excused as the leftover of an unfinished sign-in. The
-    /// canary never used their tokens, so they stay excused only while they are
-    /// still never seen in use: one that has been used since was used by
-    /// somebody else and fires the tripwire.
+    /// Devices a run excused as the leftover of an unfinished sign-in and could
+    /// not delete (the delete was refused, or the run could not tell which
+    /// device was its own), and the ones an older version of this program left
+    /// here. A run deletes the devices it excuses in that same run, so this list
+    /// is normally empty. The canary never used their tokens, so they stay
+    /// leftovers only while they are still never seen in use: one that has been
+    /// seen is not known to be ours (`last_seen_ts` is not a record of every
+    /// use, but a use it shows is one) and fires the tripwire.
     #[serde(default)]
     pub unfinished: BTreeSet<String>,
     /// Sign-ins started and not finished, oldest first.

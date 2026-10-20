@@ -204,11 +204,17 @@ pub async fn run(cfg: InitConfig, root: &Path) -> i32 {
         // and reports it under its own reason instead of firing the tripwire.
         if route == LogoutRoute::Matrix {
             if let Ok((_, Some(device))) = &outcome {
-                // After the logout: no use of the device is later than this.
-                let now = chrono::Utc::now().timestamp();
+                // After the logout: no use of the device is later than this, on
+                // the server's clock (the logout's own replies told it), which is
+                // the clock of the device's `last_seen_ts`. No clock read: the
+                // time is unknown.
+                let now = logout.clock.map(|clock| clock.now());
                 let _ = identity::update_ledger(&dir, |ledger| {
                     ledger.pending.remove(device);
-                    ledger.logged_out.insert(device.clone(), now);
+                    match now {
+                        Some(now) => ledger.logged_out.insert(device.clone(), now),
+                        None => ledger.logged_out.insert_unknown(device.clone()),
+                    }
                 });
             }
         }

@@ -448,21 +448,27 @@ at `/sign_in`, before the code exchange, so a sign-in that fails or is killed af
 device nobody recorded. The ledger holds four things. `pending`: the devices a run left behind (it
 died, or the logout went by `/oauth2/revoke`), which the next run tolerates and deletes
 (`leftover_not_deleted` if it cannot). `logged_out`: the devices the canary is finished with, each
-with the time of its last use (a proven logout, where the refresh token was refused, or a deletion),
-until a run sees them gone. The proof is about the grant and siwx-oidc deletes the Synapse device
+with the time of its last use on the server's clock, never this host's (`last_seen_ts` is the
+server's, and nothing bounds the one clock against the other), or a time unknown (a proven
+logout, where the refresh token was refused, or a deletion), until a run sees them gone. The proof is about the grant and siwx-oidc deletes the Synapse device
 best-effort (it answers 200 whether or not the device went), so one still listed at the next run is
 reported as `device_survived_logout` (exit 1) and deleted again, not taken for a stranger. It is the
 canary's own only if it carries the display name `rotation-canary` and its `last_seen_ts` is no
-later than the recorded time plus a minute: siwx-oidc recreates a deleted device id for a client
+later than the recorded time plus a minute (a device retired at a time unknown passes only while it
+has never been seen in use): siwx-oidc recreates a deleted device id for a client
 that proposes it, so an id alone proves nothing, and a device on that id with another name or used
 after the canary's last use fires the tripwire. A device leaves the ledger only when a reading shows
-it gone, never on an answer. `unfinished`: the devices a marker excused (below); they stay excused
-only while they have never been seen in use, because the canary never used their tokens. And an
-attempt marker written before each sign-in and dropped once the run knows its device. A device
-nobody recorded is explained by a marker only if it has an id the server minted (`SIWX_`), the
-display name `rotation-canary` (the registered client's name) and no `last_seen_ts` (never used); it
-is then reported as `unfinished_sign_in_device` (exit 1) and recorded as `unfinished`. When `whoami`
-fails, the one device a run cannot explain is its own and is recorded like a named one. Markers
+it gone, never on an answer. `unfinished`: devices a marker excused (below) that the run could not
+delete; normally empty. `last_seen_ts` is not a record of every use (Synapse skips some User-Agents
+and records one token's use at most every 120 s), so the canary cannot vouch for a device it
+excused: the run deletes it in the same run, reports it, and records it on `logged_out` at a time
+unknown. And an attempt marker written before each sign-in and dropped once the run knows its
+device. A device nobody recorded is explained by a marker only if it has an id the server minted
+(`SIWX_`), the display name `rotation-canary` (the registered client's name) and no `last_seen_ts`
+(never seen in use); it is then reported as `unfinished_sign_in_device` (exit 1). When `whoami`
+fails, the run's own device is the one unexplained device, or else the one device with a minted id,
+the canary's name and a use (its token listed the devices); it is recorded like a named one and the
+rest are judged against the markers. If that does not single it out, no excused device is deleted. Markers
 expire after three days and at most sixteen are kept. Any other device, a device without a live
 marker, or more devices than markers, fires the tripwire (exit 4); nothing is deleted, excused or
 recorded while it is fired.

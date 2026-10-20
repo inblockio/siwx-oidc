@@ -164,8 +164,8 @@ pub fn take_capture() -> Vec<String> {
     CAPTURE.with(|c| c.borrow_mut().take().unwrap_or_default())
 }
 
-/// The longest value printed.
-const MAX_VALUE: usize = 120;
+/// The longest value printed (the wrapper that gates the output allows 200).
+pub const MAX_VALUE: usize = 120;
 
 fn allowed(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ',' | ':' | '/' | '@' | '<' | '>' | '-')
