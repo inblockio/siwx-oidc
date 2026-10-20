@@ -114,7 +114,9 @@ its key does not derive to. Its start log then reads `signing backend=socket kid
 Rotation follows [configuration.md](configuration.md#key-rotation): point the signer at the new
 key file and put the old key's public half (`openssl pkey -in <old key> -pubout`) in siwx-oidc's
 `retired_signing_keys_pem` so DID assertions minted under it stay verifiable, unless the old key
-was abused.
+was abused. siwx-oidc reads the signer's public key once, at start: restart it after the signer
+moves to a new key. Until then every answer fails its `kid` check and is a 503, never a token
+under a key the JWKS does not publish.
 
 ## Protocol (version 1)
 
