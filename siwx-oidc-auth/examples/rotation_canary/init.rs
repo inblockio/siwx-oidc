@@ -198,11 +198,17 @@ pub async fn run(cfg: InitConfig, root: &Path) -> i32 {
         ("refresh", logout.refresh.to_string()),
     ];
     if logout.reason == Reason::Ok {
-        // A proven logout through `/logout` deleted the device: off the ledger.
+        // A proven logout through `/logout` ends the grant and deletes the
+        // device best-effort, so the device moves from `pending` to
+        // `logged_out`: the first `check` finds it gone, or finds it still there
+        // and reports it under its own reason instead of firing the tripwire.
         if route == LogoutRoute::Matrix {
             if let Ok((_, Some(device))) = &outcome {
+                // After the logout: no use of the device is later than this.
+                let now = chrono::Utc::now().timestamp();
                 let _ = identity::update_ledger(&dir, |ledger| {
                     ledger.pending.remove(device);
+                    ledger.logged_out.insert(device.clone(), now);
                 });
             }
         }

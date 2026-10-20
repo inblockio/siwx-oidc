@@ -15,7 +15,7 @@ use siwx_oidc_auth::{
 };
 
 use crate::hygiene::Secret;
-use crate::identity::LogoutRoute;
+use crate::identity::{Ledger, LogoutRoute, LAST_SEEN_SLACK_SECS};
 use crate::net::{self, send, Reply};
 use crate::report::Reason;
 
@@ -218,6 +218,10 @@ pub struct Device {
     /// Whether the device has ever been seen in use: `last_seen_ts` is present
     /// and not null (whatever its value, so an odd value reads as "seen").
     pub seen: bool,
+    /// `last_seen_ts` (milliseconds) when it is an integer. `None` for a device
+    /// never seen and for a value that is not an integer, which reads as "seen
+    /// at a time nobody can vouch for".
+    pub last_seen_ms: Option<i64>,
 }
 
 impl Device {
@@ -233,6 +237,29 @@ impl Device {
         self.id.starts_with(MINTED_DEVICE_PREFIX)
             && self.display_name.as_deref() == Some(DEVICE_NAME)
             && !self.seen
+    }
+
+    /// Whether the device was used later than `at` (unix seconds on this host's
+    /// clock, the time the canary last used it) plus [`LAST_SEEN_SLACK_SECS`]. A
+    /// `last_seen_ts` that is not a number counts as later.
+    pub fn used_after(&self, at: i64) -> bool {
+        self.seen
+            && match self.last_seen_ms {
+                Some(ms) => ms > at.saturating_add(LAST_SEEN_SLACK_SECS).saturating_mul(1000),
+                None => true,
+            }
+    }
+
+    /// Whether a device the canary retired at `at` and that is still listed can
+    /// be the canary's own: it carries the canary's display name and nobody used
+    /// it after the canary did. siwx-oidc lets a client propose a device id and
+    /// recreates a deleted one, so the id alone proves nothing; a device that
+    /// fails this was made or used by somebody else.
+    ///
+    /// A device of the canary that siwx-oidc failed to name fails it too: a
+    /// false alarm in a double fault, the safe direction.
+    pub fn is_survivor(&self, at: i64) -> bool {
+        self.display_name.as_deref() == Some(DEVICE_NAME) && !self.used_after(at)
     }
 }
 
@@ -296,6 +323,7 @@ fn parse_device(entry: &serde_json::Value) -> Option<Device> {
             .and_then(|n| n.as_str())
             .map(str::to_string),
         seen: entry.get("last_seen_ts").is_some_and(|t| !t.is_null()),
+        last_seen_ms: entry.get("last_seen_ts").and_then(|t| t.as_i64()),
     })
 }
 
@@ -303,12 +331,18 @@ fn parse_device(entry: &serde_json::Value) -> Option<Device> {
 /// and holds no device but this run's, with three exceptions that are named and
 /// never silent:
 ///
-/// - `leftovers`: devices an earlier run of the canary recorded (`tolerated`).
-/// - `survivors`: devices whose logout an earlier run proved (`logged_out`) and
-///   that are still listed. The proof was about the grant; the Synapse device is
-///   deleted by siwx-oidc best-effort, so it can outlive it. They are the
-///   canary's own and are not a stranger, but they are a fault of the server
-///   and get their own reason.
+/// - `leftovers`: devices an earlier run of the canary recorded (`pending`), and
+///   devices an earlier run excused as an unfinished sign-in (`unfinished`) that
+///   are still never seen in use. One of the second kind that has been used
+///   since is not a leftover: nobody on our side used it.
+/// - `survivors`: devices the canary retired at a known time (`logged_out`:
+///   the logout was proven, or the canary deleted them) that are still listed.
+///   The proof was about the grant, and siwx-oidc deletes the Synapse device
+///   best-effort, so one can outlive it. It is the canary's own, not a stranger,
+///   but a fault of the server with its own reason, only while it looks like the
+///   canary's ([`Device::is_survivor`]): siwx-oidc recreates a deleted id for a
+///   client that proposes it, so a device on a retired id that carries another
+///   name, or was used after the canary's last use, is a stranger's.
 /// - `unfinished`: devices nobody recorded that an unfinished sign-in of the
 ///   canary can explain. The server mints `SIWX_<uuid>` at `/sign_in`, before
 ///   the token exchange, so a sign-in that failed or was killed after it leaves
@@ -320,6 +354,10 @@ fn parse_device(entry: &serde_json::Value) -> Option<Device> {
 ///   all of them.
 ///
 /// Anything else unexplained is a stranger and fires the tripwire.
+///
+/// `own_guess` is set when `whoami` did not name this run's device and exactly
+/// one listed device is unexplained: the run's token was used to list, so that
+/// device is its own. The run records it like a device `whoami` named.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Judgement {
     pub fired: bool,
@@ -327,15 +365,10 @@ pub struct Judgement {
     pub unfinished: Vec<String>,
     pub leftovers: Vec<String>,
     pub survivors: Vec<String>,
+    pub own_guess: Option<String>,
 }
 
-pub fn judge(
-    reading: &Reading,
-    own: Option<&str>,
-    tolerated: &BTreeSet<String>,
-    logged_out: &BTreeSet<String>,
-    attempts: usize,
-) -> Judgement {
+pub fn judge(reading: &Reading, own: Option<&str>, ledger: &Ledger, attempts: usize) -> Judgement {
     let mut leftovers = Vec::new();
     let mut survivors = Vec::new();
     let mut others: Vec<&Device> = Vec::new();
@@ -344,9 +377,15 @@ pub fn judge(
         if Some(id) == own {
             continue;
         }
-        if tolerated.contains(id) {
+        if ledger.pending.contains(id)
+            || (ledger.unfinished.contains(id) && device.looks_unfinished())
+        {
             leftovers.push(device.id.clone());
-        } else if logged_out.contains(id) {
+        } else if ledger
+            .logged_out
+            .at(id)
+            .is_some_and(|at| device.is_survivor(at))
+        {
             survivors.push(device.id.clone());
         } else {
             others.push(device);
@@ -357,6 +396,7 @@ pub fn judge(
     // like the rest (a run's own device that does not is read as a stranger:
     // stricter, never looser).
     let unexplained = others.len().saturating_sub(usize::from(own.is_none()));
+    let own_guess = (own.is_none() && others.len() == 1).then(|| others[0].id.clone());
     let ids = |devices: &[&Device]| devices.iter().map(|d| d.id.clone()).collect::<Vec<_>>();
     let (strangers, unfinished) = if unexplained == 0 {
         (Vec::new(), Vec::new())
@@ -371,6 +411,77 @@ pub fn judge(
         unfinished,
         leftovers,
         survivors,
+        own_guess,
+    }
+}
+
+/// Everything the end of a run knows, for [`Closing::next`].
+pub struct Closing<'a> {
+    pub reading: &'a Reading,
+    pub judged: &'a Judgement,
+    /// The leftovers and survivors this run deleted (the homeserver answered 2xx).
+    pub cleaned: &'a BTreeSet<String>,
+    /// The device `whoami` named for this run.
+    pub own: Option<&'a str>,
+    /// The logout went through the homeserver's `/logout` and the run's refresh
+    /// token was refused afterwards.
+    pub logout_proven: bool,
+    pub attempt_id: &'a str,
+    /// Unix seconds on this host's clock, taken after the run's last request
+    /// with a token (the logout), so no use of any device is later.
+    pub now: i64,
+}
+
+impl Closing<'_> {
+    /// The ledger after the run:
+    ///
+    /// - A device leaves a list only when this run's reading shows it gone. An
+    ///   answer does not count: siwx-oidc answers a device delete with 200
+    ///   whether or not the device went.
+    /// - A device this run deleted goes on `logged_out` at `now` (a survivor
+    ///   keeps the time it has), and so does this run's own after a proven
+    ///   logout through `/logout`. A later run that still lists it reports it
+    ///   and deletes it again, and tells the canary's own device from a
+    ///   stranger's on the same id by its name and its `last_seen_ts`.
+    /// - This run's own device stays on `pending` where the logout may leave it
+    ///   (`/oauth2/revoke`, or a logout not proven).
+    /// - Devices excused as unfinished sign-ins go on `unfinished`, and the
+    ///   markers are spent. While the tripwire is fired nothing is excused,
+    ///   recorded or spent: the evidence stays as it was, and a kept marker
+    ///   cannot excuse a second device later.
+    pub fn next(&self, ledger: &Ledger) -> Ledger {
+        let mut next = ledger.clone();
+        let listed = |id: &str| self.reading.has(id);
+        next.pending.retain(|id| listed(id));
+        next.unfinished.retain(|id| listed(id));
+        next.logged_out.retain(listed);
+        for id in self.cleaned {
+            next.pending.remove(id);
+            next.unfinished.remove(id);
+            // A survivor keeps its time: the canary never used its token.
+            if !next.logged_out.contains(id) {
+                next.logged_out.insert(id.clone(), self.now);
+            }
+        }
+        let own = self.own.or(self.judged.own_guess.as_deref());
+        if let Some(own) = own {
+            next.unfinished.remove(own);
+            if self.logout_proven {
+                next.pending.remove(own);
+                next.logged_out.insert(own.to_string(), self.now);
+            } else {
+                next.pending.insert(own.to_string());
+            }
+        }
+        if !self.judged.fired {
+            next.unfinished
+                .extend(self.judged.unfinished.iter().cloned());
+            // The markers were weighed against what the account holds. This
+            // run's own stays only while no device could be its own.
+            let keep = own.is_none() && self.judged.unfinished.is_empty();
+            next.attempts.retain(|a| keep && a.id == self.attempt_id);
+        }
+        next
     }
 }
 
@@ -613,6 +724,7 @@ mod tests {
             id: id.to_string(),
             display_name: Some(DEVICE_NAME.to_string()),
             seen: false,
+            last_seen_ms: None,
         }
     }
 
@@ -623,8 +735,20 @@ mod tests {
         }
     }
 
-    fn ledger(ids: &[&str]) -> BTreeSet<String> {
-        ids.iter().map(|s| s.to_string()).collect()
+    /// The time the canary retired its `logged_out` devices at, in these tests.
+    const OUT_AT: i64 = 1_800_000_000;
+
+    /// A ledger with these `pending` and `logged_out` ids (the latter retired at
+    /// [`OUT_AT`]).
+    fn led(pending: &[&str], logged_out: &[&str]) -> Ledger {
+        let mut ledger = Ledger {
+            pending: pending.iter().map(|s| s.to_string()).collect(),
+            ..Ledger::default()
+        };
+        for id in logged_out {
+            ledger.logged_out.insert(id.to_string(), OUT_AT);
+        }
+        ledger
     }
 
     fn clean() -> Judgement {
@@ -634,6 +758,7 @@ mod tests {
             unfinished: vec![],
             leftovers: vec![],
             survivors: vec![],
+            own_guess: None,
         }
     }
 
@@ -642,8 +767,7 @@ mod tests {
         let j = judge(
             &reading(0, &["SIWX_now"]),
             Some("SIWX_now"),
-            &ledger(&[]),
-            &ledger(&[]),
+            &led(&[], &[]),
             0,
         );
         assert_eq!(j, clean());
@@ -654,8 +778,7 @@ mod tests {
         let j = judge(
             &reading(0, &["SIWX_now", "ATTACKER"]),
             Some("SIWX_now"),
-            &ledger(&["SIWX_old"]),
-            &ledger(&[]),
+            &led(&["SIWX_old"], &[]),
             0,
         );
         assert!(j.fired);
@@ -668,8 +791,7 @@ mod tests {
             judge(
                 &reading(1, &["SIWX_now"]),
                 Some("SIWX_now"),
-                &ledger(&[]),
-                &ledger(&[]),
+                &led(&[], &[]),
                 0
             )
             .fired
@@ -681,8 +803,7 @@ mod tests {
         let j = judge(
             &reading(0, &["SIWX_now", "SIWX_old"]),
             Some("SIWX_now"),
-            &ledger(&["SIWX_old"]),
-            &ledger(&[]),
+            &led(&["SIWX_old"], &[]),
             0,
         );
         assert_eq!(
@@ -696,23 +817,8 @@ mod tests {
 
     #[test]
     fn without_a_whoami_one_unexplained_device_is_this_runs_and_two_are_not() {
-        assert!(
-            !judge(
-                &reading(0, &["SIWX_x"]),
-                None,
-                &ledger(&[]),
-                &ledger(&[]),
-                0
-            )
-            .fired
-        );
-        let j = judge(
-            &reading(0, &["SIWX_x", "SIWX_y"]),
-            None,
-            &ledger(&[]),
-            &ledger(&[]),
-            0,
-        );
+        assert!(!judge(&reading(0, &["SIWX_x"]), None, &led(&[], &[]), 0).fired);
+        let j = judge(&reading(0, &["SIWX_x", "SIWX_y"]), None, &led(&[], &[]), 0);
         assert!(j.fired);
         assert_eq!(j.strangers.len(), 2);
     }
@@ -722,8 +828,7 @@ mod tests {
         let j = judge(
             &reading(0, &["SIWX_now", "SIWX_killed"]),
             Some("SIWX_now"),
-            &ledger(&[]),
-            &ledger(&[]),
+            &led(&[], &[]),
             1,
         );
         assert!(!j.fired, "it is explained, but under its own name");
@@ -736,8 +841,7 @@ mod tests {
         let j = judge(
             &reading(0, &["SIWX_now", "SIWX_killed"]),
             Some("SIWX_now"),
-            &ledger(&[]),
-            &ledger(&[]),
+            &led(&[], &[]),
             0,
         );
         assert!(j.fired);
@@ -749,8 +853,7 @@ mod tests {
         let j = judge(
             &reading(0, &["SIWX_now", "SIWX_a", "SIWX_b"]),
             Some("SIWX_now"),
-            &ledger(&[]),
-            &ledger(&[]),
+            &led(&[], &[]),
             1,
         );
         assert!(j.fired);
@@ -765,8 +868,7 @@ mod tests {
         let j = judge(
             &reading(0, &["SIWX_now", "ELEMENTXDEVICE"]),
             Some("SIWX_now"),
-            &ledger(&[]),
-            &ledger(&[]),
+            &led(&[], &[]),
             3,
         );
         assert!(j.fired);
@@ -778,8 +880,7 @@ mod tests {
         let j = judge(
             &reading(1, &["SIWX_now", "SIWX_killed"]),
             Some("SIWX_now"),
-            &ledger(&[]),
-            &ledger(&[]),
+            &led(&[], &[]),
             1,
         );
         assert!(j.fired);
@@ -849,8 +950,7 @@ mod tests {
             let j = judge(
                 &reading_of(0, vec![device("SIWX_now"), stranger]),
                 Some("SIWX_now"),
-                &ledger(&[]),
-                &ledger(&[]),
+                &led(&[], &[]),
                 1,
             );
             assert!(j.fired, "{what}");
@@ -864,8 +964,7 @@ mod tests {
         let j = judge(
             &reading(0, &["SIWX_now", "SIWX_killed"]),
             Some("SIWX_now"),
-            &ledger(&[]),
-            &ledger(&[]),
+            &led(&[], &[]),
             1,
         );
         assert!(!j.fired);
@@ -887,8 +986,7 @@ mod tests {
                 ],
             ),
             Some("SIWX_now"),
-            &ledger(&[]),
-            &ledger(&[]),
+            &led(&[], &[]),
             2,
         );
         assert!(j.fired);
@@ -908,40 +1006,31 @@ mod tests {
         let j = judge(
             &reading_of(0, vec![device("SIWX_a"), seen]),
             None,
-            &ledger(&[]),
-            &ledger(&[]),
+            &led(&[], &[]),
             1,
         );
         assert!(j.fired);
-        let j = judge(
-            &reading(0, &["SIWX_a", "SIWX_b"]),
-            None,
-            &ledger(&[]),
-            &ledger(&[]),
-            1,
-        );
+        let j = judge(&reading(0, &["SIWX_a", "SIWX_b"]), None, &led(&[], &[]), 1);
         assert!(!j.fired);
         assert_eq!(j.unfinished.len(), 2);
+    }
+
+    /// A device the canary retired at [`OUT_AT`] and that was last used `ago`
+    /// seconds before (negative: after) that time, as the homeserver lists it.
+    fn used(id: &str, ago: i64) -> Device {
+        Device {
+            seen: true,
+            last_seen_ms: Some((OUT_AT - ago) * 1000),
+            ..device(id)
+        }
     }
 
     #[test]
     fn a_device_whose_logout_was_proven_is_a_survivor_not_a_stranger() {
         let j = judge(
-            &reading_of(
-                0,
-                vec![
-                    device("SIWX_now"),
-                    // Used by the canary itself: seen, and still not a stranger.
-                    Device {
-                        seen: true,
-                        display_name: None,
-                        ..device("SIWX_before")
-                    },
-                ],
-            ),
+            &reading_of(0, vec![device("SIWX_now"), used("SIWX_before", 5)]),
             Some("SIWX_now"),
-            &ledger(&[]),
-            &ledger(&["SIWX_before"]),
+            &led(&[], &["SIWX_before"]),
             0,
         );
         assert_eq!(
@@ -951,6 +1040,279 @@ mod tests {
                 ..clean()
             }
         );
+        // Never seen in use, or seen within the clock slack past the time: the same.
+        for survivor in [
+            device("SIWX_before"),
+            used("SIWX_before", -(LAST_SEEN_SLACK_SECS)),
+        ] {
+            let j = judge(
+                &reading_of(0, vec![device("SIWX_now"), survivor]),
+                Some("SIWX_now"),
+                &led(&[], &["SIWX_before"]),
+                0,
+            );
+            assert!(!j.fired);
+            assert_eq!(j.survivors, vec!["SIWX_before".to_string()]);
+        }
+    }
+
+    #[test]
+    fn a_retired_id_that_somebody_else_made_or_used_is_a_stranger_not_a_survivor() {
+        // siwx-oidc recreates a deleted id for a client that proposes it.
+        let strangers = [
+            (
+                "used after the canary's last use",
+                used("SIWX_before", -(LAST_SEEN_SLACK_SECS + 1)),
+            ),
+            (
+                "another client's name",
+                Device {
+                    display_name: Some("Element Web".to_string()),
+                    ..device("SIWX_before")
+                },
+            ),
+            (
+                "no name",
+                Device {
+                    display_name: None,
+                    ..device("SIWX_before")
+                },
+            ),
+            (
+                "seen at a time nobody can read",
+                Device {
+                    seen: true,
+                    last_seen_ms: None,
+                    ..device("SIWX_before")
+                },
+            ),
+        ];
+        for (what, stranger) in strangers {
+            // With a live marker to hide behind, too: a retired id that fails the
+            // check is not a candidate for it either (it is seen, or not the
+            // canary's).
+            let j = judge(
+                &reading_of(0, vec![device("SIWX_now"), stranger]),
+                Some("SIWX_now"),
+                &led(&[], &["SIWX_before"]),
+                3,
+            );
+            assert!(j.fired, "{what}");
+            assert_eq!(j.strangers, vec!["SIWX_before".to_string()], "{what}");
+            assert!(j.survivors.is_empty() && j.unfinished.is_empty(), "{what}");
+        }
+    }
+
+    #[test]
+    fn a_device_retired_at_an_unknown_time_passes_only_while_it_was_never_used() {
+        let mut ledger = Ledger::default();
+        ledger
+            .logged_out
+            .insert("SIWX_before".to_string(), i64::MIN);
+        let judged = |listed: Device| {
+            judge(
+                &reading_of(0, vec![device("SIWX_now"), listed]),
+                Some("SIWX_now"),
+                &ledger,
+                0,
+            )
+        };
+        assert_eq!(judged(device("SIWX_before")).survivors.len(), 1);
+        assert!(judged(used("SIWX_before", 1_000_000)).fired);
+    }
+
+    #[test]
+    fn an_excused_unfinished_device_stays_excused_only_while_nobody_uses_it() {
+        let mut ledger = Ledger::default();
+        ledger.unfinished.insert("SIWX_dormant".to_string());
+        let j = judge(
+            &reading(0, &["SIWX_now", "SIWX_dormant"]),
+            Some("SIWX_now"),
+            &ledger,
+            0,
+        );
+        assert_eq!(
+            j,
+            Judgement {
+                leftovers: vec!["SIWX_dormant".to_string()],
+                ..clean()
+            }
+        );
+        // Used since: the canary never used its token, so somebody else did.
+        let j = judge(
+            &reading_of(0, vec![device("SIWX_now"), used("SIWX_dormant", 5)]),
+            Some("SIWX_now"),
+            &ledger,
+            5,
+        );
+        assert!(j.fired, "a marker does not excuse it either");
+        assert_eq!(j.strangers, vec!["SIWX_dormant".to_string()]);
+        assert!(j.leftovers.is_empty());
+    }
+
+    #[test]
+    fn without_a_whoami_the_one_unexplained_device_is_taken_for_this_runs() {
+        let j = judge(&reading(0, &["SIWX_x"]), None, &led(&[], &[]), 0);
+        assert_eq!(j.own_guess.as_deref(), Some("SIWX_x"));
+        // With a whoami, or with two to choose from, nothing is guessed.
+        let j = judge(&reading(0, &["SIWX_x"]), Some("SIWX_x"), &led(&[], &[]), 0);
+        assert_eq!(j.own_guess, None);
+        let j = judge(&reading(0, &["SIWX_x", "SIWX_y"]), None, &led(&[], &[]), 1);
+        assert_eq!(j.own_guess, None);
+        // A device the ledger knows is not a candidate.
+        let j = judge(
+            &reading(0, &["SIWX_x", "SIWX_old"]),
+            None,
+            &led(&["SIWX_old"], &[]),
+            0,
+        );
+        assert_eq!(j.own_guess.as_deref(), Some("SIWX_x"));
+    }
+
+    // -- the ledger after a run ----------------------------------------------
+
+    const NOW: i64 = OUT_AT + 600;
+
+    fn closing<'a>(
+        reading: &'a Reading,
+        judged: &'a Judgement,
+        cleaned: &'a BTreeSet<String>,
+        own: Option<&'a str>,
+        logout_proven: bool,
+    ) -> Closing<'a> {
+        Closing {
+            reading,
+            judged,
+            cleaned,
+            own,
+            logout_proven,
+            attempt_id: "this-run",
+            now: NOW,
+        }
+    }
+
+    fn set(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn marker(id: &str) -> crate::identity::Attempt {
+        crate::identity::Attempt {
+            id: id.to_string(),
+            at: NOW,
+        }
+    }
+
+    #[test]
+    fn a_device_leaves_the_ledger_only_when_the_reading_shows_it_gone() {
+        let mut ledger = led(
+            &["SIWX_p", "SIWX_p_cleaned", "SIWX_gone"],
+            &["SIWX_l", "SIWX_l_cleaned"],
+        );
+        ledger.unfinished = set(&["SIWX_u", "SIWX_u_gone"]);
+        let r = reading(
+            0,
+            &[
+                "SIWX_now",
+                "SIWX_p",
+                "SIWX_p_cleaned",
+                "SIWX_l",
+                "SIWX_l_cleaned",
+                "SIWX_u",
+            ],
+        );
+        let j = judge(&r, Some("SIWX_now"), &ledger, 0);
+        let cleaned = set(&["SIWX_p_cleaned", "SIWX_l_cleaned"]);
+        let next = closing(&r, &j, &cleaned, Some("SIWX_now"), true).next(&ledger);
+        assert_eq!(next.pending, set(&["SIWX_p"]));
+        assert_eq!(next.unfinished, set(&["SIWX_u"]));
+        assert_eq!(
+            next.logged_out.ids(),
+            set(&["SIWX_l", "SIWX_l_cleaned", "SIWX_p_cleaned", "SIWX_now"]),
+            "a delete the server answered 200 is not a delete"
+        );
+        assert_eq!(
+            next.logged_out.at("SIWX_l"),
+            Some(OUT_AT),
+            "a stuck one keeps its time"
+        );
+        assert_eq!(
+            next.logged_out.at("SIWX_l_cleaned"),
+            Some(OUT_AT),
+            "so does a survivor the run deleted: the canary never used its token"
+        );
+        assert_eq!(next.logged_out.at("SIWX_p_cleaned"), Some(NOW));
+        assert_eq!(next.logged_out.at("SIWX_now"), Some(NOW));
+    }
+
+    #[test]
+    fn a_deleted_leftover_waits_on_the_logged_out_list_not_the_pending_one() {
+        let ledger = led(&["SIWX_old"], &[]);
+        let r = reading(0, &["SIWX_now", "SIWX_old"]);
+        let j = judge(&r, Some("SIWX_now"), &ledger, 0);
+        let cleaned = set(&["SIWX_old"]);
+        let next = closing(&r, &j, &cleaned, Some("SIWX_now"), false).next(&ledger);
+        assert_eq!(next.logged_out.ids(), set(&["SIWX_old"]));
+        assert_eq!(
+            next.pending,
+            set(&["SIWX_now"]),
+            "this run's own stays where an unproven logout may leave it"
+        );
+    }
+
+    #[test]
+    fn excused_devices_are_recorded_as_unfinished_and_the_markers_are_spent() {
+        let ledger = Ledger {
+            attempts: vec![marker("earlier"), marker("this-run")],
+            ..Ledger::default()
+        };
+        let r = reading(0, &["SIWX_now", "SIWX_dormant"]);
+        let j = judge(&r, Some("SIWX_now"), &ledger, 1);
+        assert_eq!(j.unfinished, vec!["SIWX_dormant".to_string()]);
+        let next = closing(&r, &j, &BTreeSet::new(), Some("SIWX_now"), true).next(&ledger);
+        assert_eq!(next.unfinished, set(&["SIWX_dormant"]));
+        assert!(next.pending.is_empty());
+        assert!(next.attempts.is_empty());
+    }
+
+    #[test]
+    fn a_fired_tripwire_records_and_spends_nothing_it_excused() {
+        // A joined room fires it, and a marker would excuse the dormant device.
+        let ledger = Ledger {
+            attempts: vec![marker("earlier")],
+            ..Ledger::default()
+        };
+        let r = reading(1, &["SIWX_now", "SIWX_dormant"]);
+        let j = judge(&r, Some("SIWX_now"), &ledger, 1);
+        assert!(j.fired);
+        assert_eq!(j.unfinished, vec!["SIWX_dormant".to_string()]);
+        let next = closing(&r, &j, &BTreeSet::new(), Some("SIWX_now"), true).next(&ledger);
+        assert!(next.unfinished.is_empty() && next.pending.is_empty());
+        assert_eq!(
+            next.attempts, ledger.attempts,
+            "the marker stays as evidence"
+        );
+    }
+
+    #[test]
+    fn the_guessed_device_is_recorded_like_a_named_one_and_spends_this_runs_marker() {
+        let ledger = Ledger {
+            attempts: vec![marker("this-run")],
+            ..Ledger::default()
+        };
+        let r = reading(0, &["SIWX_x"]);
+        let j = judge(&r, None, &ledger, 0);
+        let none = BTreeSet::new();
+        let next = closing(&r, &j, &none, None, true).next(&ledger);
+        assert_eq!(next.logged_out.ids(), set(&["SIWX_x"]));
+        assert!(next.attempts.is_empty());
+        let next = closing(&r, &j, &none, None, false).next(&ledger);
+        assert_eq!(next.pending, set(&["SIWX_x"]));
+
+        // Nothing to guess (no device listed): the marker stays for a later run.
+        let r = reading(0, &[]);
+        let j = judge(&r, None, &ledger, 0);
+        let next = closing(&r, &j, &none, None, true).next(&ledger);
+        assert_eq!(next.attempts, ledger.attempts);
     }
 
     #[test]
@@ -958,8 +1320,7 @@ mod tests {
         let j = judge(
             &reading(0, &["SIWX_now", "SIWX_before", "ATTACKER"]),
             Some("SIWX_now"),
-            &ledger(&[]),
-            &ledger(&["SIWX_before"]),
+            &led(&[], &["SIWX_before"]),
             5,
         );
         assert!(j.fired);

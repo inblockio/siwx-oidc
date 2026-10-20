@@ -38,19 +38,25 @@
 //!   be refused for a year once it was signed out. The server mints
 //!   `SIWX_<uuid>` per run and the logout deletes it, best-effort: it answers
 //!   200 whether or not the device went. The ledger `devices.json`, which only
-//!   this program writes, therefore holds three things. The devices a run left
+//!   this program writes, therefore holds four things. The devices a run left
 //!   behind (it died, or the logout went by `/oauth2/revoke`): the next run
-//!   tolerates and deletes them. The devices whose logout a run proved (the
-//!   refresh token was refused), until a run sees them gone: one still listed
-//!   is reported as `device_survived_logout` and deleted, not taken for a
-//!   stranger. And a marker for each sign-in that was started and not
-//!   finished, because the server makes the device before the code exchange.
-//!   A device nobody recorded fires the tripwire, unless a live marker can
-//!   explain it, and a marker explains a device only if the device has a
-//!   minted `SIWX_` id, carries the canary's own display name and has never
-//!   been seen in use (no `last_seen_ts`). Markers expire after three days and
-//!   at most sixteen are kept (`identity::ATTEMPT_MAX_AGE_SECS`,
-//!   `identity::ATTEMPT_CAP`).
+//!   tolerates and deletes them. The devices the canary is finished with, each
+//!   with the time of its last use (a logout it proved, because the refresh
+//!   token was refused, or a deletion): one still listed at a later run is
+//!   reported as `device_survived_logout` and deleted again, not taken for a
+//!   stranger, but only while it has the canary's display name and was not used
+//!   after that time (siwx-oidc recreates a deleted id for a client that
+//!   proposes it, so an id proves nothing). A device leaves the ledger only
+//!   when a reading shows it gone, never on an answer. The devices a marker
+//!   excused, which stay excused only while nobody uses them. And a marker for
+//!   each sign-in that was started and not finished, because the server makes
+//!   the device before the code exchange. A device nobody recorded fires the
+//!   tripwire, unless a live marker can explain it, and a marker explains a
+//!   device only if the device has a minted `SIWX_` id, carries the canary's
+//!   own display name and has never been seen in use (no `last_seen_ts`).
+//!   Markers expire after three days and at most sixteen are kept
+//!   (`identity::ATTEMPT_MAX_AGE_SECS`, `identity::ATTEMPT_CAP`). While the
+//!   tripwire is fired nothing is excused, recorded or deleted.
 //! - Only `--baseline` (the run before a rotation) may register a new client
 //!   when the stored one is refused. A later run that cannot use it fails: that
 //!   is what an existing client's stored registration would see.

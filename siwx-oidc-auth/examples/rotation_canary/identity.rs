@@ -2,14 +2,15 @@
 //! `~/.aqua-secrets/rotation-canary/<env>/`: `key.pem` (the canary account's
 //! Ed25519 key, 0600), `client.json` (public: the registered client, the issuer
 //! it belongs to, the logout route, the account's MXID), `devices.json` (the
-//! devices the canary created and has not yet seen gone, the ones whose logout
-//! it proved, and its unfinished sign-ins) and `.lock`.
+//! devices the canary created and has not yet seen gone, the ones it is
+//! finished with and when, the ones excused as unfinished sign-ins, and the
+//! markers of sign-ins it started) and `.lock`.
 //!
 //! The directory is 0700 and `key.pem` is created 0600 by the `open(2)` that
 //! creates it, so no byte of the key is ever in a file with wider modes. The
 //! key is never overwritten (`create_new`), copied or backed up by this code.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
@@ -233,22 +234,114 @@ impl Attempt {
     }
 }
 
+/// How far a device's `last_seen_ts` may lie past the time the canary last used
+/// the device and still be the canary's own use: the server's clock against this
+/// host's (the skew C3 tolerates is `checks::MAX_SKEW_SECS`, 30 s), so twice
+/// that. A longer slack would let a stranger who signs in on a retired id
+/// right after the canary's logout, and uses it once, pass for the canary.
+pub const LAST_SEEN_SLACK_SECS: i64 = 60;
+
+/// The time recorded for a device whose logout time is unknown (a ledger written
+/// before the times were kept): earlier than any `last_seen_ts`, so such a device
+/// passes only while it has never been seen in use.
+const TIME_UNKNOWN: i64 = i64::MIN;
+
+/// The devices the canary has finished with: each id with the unix seconds, on
+/// this host's clock, taken after the canary's last request with the device's
+/// token. A device on it that is still listed at a later run is the canary's own
+/// only if it carries the canary's display name and its `last_seen_ts` is no
+/// later than that time plus [`LAST_SEEN_SLACK_SECS`] (see
+/// `flow::Device::is_survivor`): siwx-oidc lets a client propose a device id and
+/// recreates a deleted one, so an id alone proves nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "LoggedOutRepr", into = "BTreeMap<String, i64>")]
+pub struct LoggedOut(BTreeMap<String, i64>);
+
+/// What `devices.json` may hold under `logged_out`: the map, or the bare list
+/// of ids of the version that did not keep the times.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LoggedOutRepr {
+    Timed(BTreeMap<String, i64>),
+    Bare(BTreeSet<String>),
+}
+
+impl From<LoggedOutRepr> for LoggedOut {
+    fn from(repr: LoggedOutRepr) -> Self {
+        LoggedOut(match repr {
+            LoggedOutRepr::Timed(map) => map,
+            LoggedOutRepr::Bare(ids) => ids.into_iter().map(|id| (id, TIME_UNKNOWN)).collect(),
+        })
+    }
+}
+
+impl From<LoggedOut> for BTreeMap<String, i64> {
+    fn from(logged_out: LoggedOut) -> Self {
+        logged_out.0
+    }
+}
+
+impl LoggedOut {
+    pub fn contains(&self, id: &str) -> bool {
+        self.0.contains_key(id)
+    }
+
+    /// The time recorded for `id`.
+    pub fn at(&self, id: &str) -> Option<i64> {
+        self.0.get(id).copied()
+    }
+
+    /// Record `id` as finished with at `at` (replacing an earlier time).
+    pub fn insert(&mut self, id: String, at: i64) {
+        self.0.insert(id, at);
+    }
+
+    pub fn remove(&mut self, id: &str) {
+        self.0.remove(id);
+    }
+
+    pub fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.0.retain(|id, _| keep(id));
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn ids(&self) -> BTreeSet<String> {
+        self.0.keys().cloned().collect()
+    }
+}
+
 /// `devices.json`: what the canary knows about the devices it made. Only this
 /// program writes the file, so a stranger's device is never in it. An
 /// unreadable ledger reads as empty: the tripwire gets stricter, never looser.
+///
+/// A device leaves every list only when a reading shows it gone, never on the
+/// strength of an answer: siwx-oidc deletes a Synapse device best-effort and
+/// answers 200 whether or not that worked.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ledger {
-    /// Devices created by a run of the canary and not yet seen gone.
+    /// Devices created by a run of the canary and not yet seen gone: this run's
+    /// own where the logout may leave it (`/oauth2/revoke`, an unproven logout)
+    /// and the device of a run that died after learning it. Tolerated at the
+    /// next run whatever they look like, and deleted.
     #[serde(default)]
     pub pending: BTreeSet<String>,
-    /// Devices whose logout a run proved (the refresh token was refused after
-    /// it) and that no run has yet seen gone. The proof is about the grant, not
-    /// the device: siwx-oidc deletes the Synapse device on a logout best-effort
-    /// and answers 200 whether or not that worked, so one of these may still be
-    /// listed at the next run. It is then reported under its own reason and
-    /// deleted, not taken for a stranger. Dropped once a run sees it gone.
+    /// Devices the canary is finished with at a known time: the ones whose
+    /// logout a run proved (the refresh token was refused after it) and the ones
+    /// it deleted. The proof is about the grant, not the device, so one of these
+    /// may still be listed at the next run. It is then reported under its own
+    /// reason and deleted, not taken for a stranger, provided it still looks
+    /// like the canary's (see [`LoggedOut`]); otherwise it fires the tripwire.
     #[serde(default)]
-    pub logged_out: BTreeSet<String>,
+    pub logged_out: LoggedOut,
+    /// Devices a run excused as the leftover of an unfinished sign-in. The
+    /// canary never used their tokens, so they stay excused only while they are
+    /// still never seen in use: one that has been used since was used by
+    /// somebody else and fires the tripwire.
+    #[serde(default)]
+    pub unfinished: BTreeSet<String>,
     /// Sign-ins started and not finished, oldest first.
     #[serde(default)]
     pub attempts: Vec<Attempt>,
@@ -475,9 +568,12 @@ mod tests {
         let scratch = Scratch::new("ledger");
         let dir = ensure_dir(&scratch.0, "dev").unwrap();
         assert_eq!(read_ledger(&dir), Ledger::default());
+        let mut logged_out = LoggedOut::default();
+        logged_out.insert("SIWX_c".to_string(), 1_700_000_100);
         let ledger = Ledger {
             pending: BTreeSet::from(["SIWX_a".to_string(), "SIWX_b".to_string()]),
-            logged_out: BTreeSet::from(["SIWX_c".to_string()]),
+            logged_out,
+            unfinished: BTreeSet::from(["SIWX_d".to_string()]),
             attempts: vec![Attempt {
                 id: "abc".to_string(),
                 at: 1_700_000_000,
@@ -529,6 +625,37 @@ mod tests {
         assert!(ledger.logged_out.is_empty());
     }
 
+    #[test]
+    fn the_logout_times_are_kept_and_a_list_of_ids_from_before_reads_as_time_unknown() {
+        let scratch = Scratch::new("ledger-times");
+        let dir = ensure_dir(&scratch.0, "dev").unwrap();
+        update_ledger(&dir, |l| {
+            l.logged_out.insert("SIWX_a".to_string(), 1_700_000_000)
+        })
+        .unwrap();
+        let text = fs::read_to_string(dir.join(DEVICES_FILE)).unwrap();
+        assert!(text.contains("\"SIWX_a\": 1700000000"), "{text}");
+        assert_eq!(
+            read_ledger(&dir).logged_out.at("SIWX_a"),
+            Some(1_700_000_000)
+        );
+        assert_eq!(read_ledger(&dir).logged_out.at("SIWX_b"), None);
+
+        // The version that kept a bare list: every id is there, at no known time.
+        fs::write(
+            dir.join(DEVICES_FILE),
+            br#"{"pending":[],"logged_out":["SIWX_old"],"attempts":[]}"#,
+        )
+        .unwrap();
+        let ledger = read_ledger(&dir);
+        assert!(ledger.logged_out.contains("SIWX_old"));
+        assert_eq!(ledger.logged_out.at("SIWX_old"), Some(i64::MIN));
+        assert!(ledger.unfinished.is_empty());
+        // It round-trips as a map.
+        write_ledger(&dir, &ledger).unwrap();
+        assert_eq!(read_ledger(&dir), ledger);
+    }
+
     fn attempt(id: &str, at: i64) -> Attempt {
         Attempt {
             id: id.to_string(),
@@ -555,6 +682,14 @@ mod tests {
         );
         assert!(!attempt("a", i64::MAX).is_live(NOW));
         assert!(!attempt("a", i64::MIN).is_live(NOW));
+    }
+
+    #[test]
+    #[ignore = "known gap, tracked in #84 (item 2)"]
+    fn audit_a7_a_clock_set_back_does_not_keep_a_marker_alive_past_its_age_limit() {
+        // Recorded 3 days and 1 hour ago; this host's clock is now 2 hours slow.
+        let marker = attempt("a", NOW - ATTEMPT_MAX_AGE_SECS - 3_600);
+        assert!(!marker.is_live(NOW - 7_200), "expired by the true clock");
     }
 
     #[test]

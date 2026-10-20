@@ -629,15 +629,9 @@ impl Cx {
             ledger.live_attempts(chrono::Utc::now().timestamp(), &self.attempt_id);
         let reading =
             flow::read_account(&self.http, &matrix.homeserver, &session.tokens.access).await;
-        let judged = reading.as_ref().map(|r| {
-            flow::judge(
-                r,
-                own_device,
-                &ledger.pending,
-                &ledger.logged_out,
-                earlier_attempts,
-            )
-        });
+        let judged = reading
+            .as_ref()
+            .map(|r| flow::judge(r, own_device, &ledger, earlier_attempts));
         // Forget the canary's own leftovers and the devices that outlived a
         // proven logout, but never touch anything while the tripwire is fired:
         // the evidence stays.
@@ -664,6 +658,8 @@ impl Cx {
             &session.tokens,
         )
         .await;
+        // After the logout: no use of any device is later than this.
+        let now = chrono::Utc::now().timestamp();
         let ledger_word = match (&reading, &judged) {
             (Some(r), Some(j)) => {
                 // A logout through `/logout` ends the grant and, best-effort,
@@ -674,33 +670,16 @@ impl Cx {
                 // `/oauth2/revoke` the device may stay, so it stays on the
                 // ledger until a later run sees it gone.
                 let proven = report.reason == Reason::Ok && report.route == LogoutRoute::Matrix;
-                let mut next = ledger.clone();
-                next.pending.retain(|id| r.has(id) && !cleaned.contains(id));
-                next.logged_out
-                    .retain(|id| r.has(id) && !cleaned.contains(id));
-                // Devices of unfinished sign-ins are reported now and tolerated
-                // (and deleted) from the next run on.
-                next.pending.extend(j.unfinished.iter().cloned());
-                match own_device {
-                    Some(own) if proven => {
-                        next.pending.remove(own);
-                        next.logged_out.insert(own.to_string());
-                    }
-                    Some(own) => {
-                        next.pending.insert(own.to_string());
-                    }
-                    None => {}
+                let next = flow::Closing {
+                    reading: r,
+                    judged: j,
+                    cleaned: &cleaned,
+                    own: own_device,
+                    logout_proven: proven,
+                    attempt_id: &self.attempt_id,
+                    now,
                 }
-                if !j.fired {
-                    // The markers were weighed against what the account holds.
-                    // This run's own stays while its device id is unknown.
-                    let keep = if own_device.is_none() {
-                        Some(&self.attempt_id)
-                    } else {
-                        None
-                    };
-                    next.attempts.retain(|a| Some(&a.id) == keep);
-                }
+                .next(&ledger);
                 match identity::write_ledger(&self.dir, &next) {
                     Ok(()) => "ok",
                     Err(_) => "failed",

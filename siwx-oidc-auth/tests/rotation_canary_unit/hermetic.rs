@@ -111,12 +111,15 @@ struct Quirks {
     /// whoami answers this status.
     whoami_status: Option<u16>,
     /// How `GET /devices` describes a device, by id: its display name and its
-    /// `last_seen_ts`. A device not named here is described the way a device
-    /// that an unfinished sign-in of the canary leaves is: named after the
-    /// canary's client and never seen.
+    /// `last_seen_ts`. A device not named here is described the way Synapse
+    /// describes one the canary made: named after the canary's client, and seen
+    /// once its token was used (an unfinished sign-in's never was).
     device_meta: HashMap<String, (Option<String>, Option<i64>)>,
     /// `/authorize` sets one more cookie, with this value, besides the session.
     authorize_cookie: Option<String>,
+    /// `DELETE /devices/{id}` answers 200 and deletes nothing (siwx-oidc's
+    /// best-effort teardown).
+    delete_device_is_noop: bool,
 }
 
 impl Default for Quirks {
@@ -143,6 +146,7 @@ impl Default for Quirks {
             whoami_status: None,
             device_meta: HashMap::new(),
             authorize_cookie: None,
+            delete_device_is_noop: false,
         }
     }
 }
@@ -164,6 +168,9 @@ struct State {
     /// Every credential the fake handed out, for the leak assertions.
     minted: Vec<String>,
     devices: Vec<String>,
+    /// When a device's token was last used, in the server's clock (ms): what
+    /// Synapse lists as its `last_seen_ts`.
+    seen_ms: HashMap<String, i64>,
     display_name: Option<String>,
     /// Whether the key's DID has an account (`/sign_in` makes it).
     account_exists: bool,
@@ -240,6 +247,7 @@ impl Fake {
             signed_in_device: String::new(),
             minted: Vec::new(),
             devices: Vec::new(),
+            seen_ms: HashMap::new(),
             display_name: None,
             account_exists: true,
             nonces: Vec::new(),
@@ -305,7 +313,16 @@ impl Fake {
 
     fn authorised(&self, request: &Request) -> bool {
         let bearer = Self::bearer(request);
-        self.with(|s| !s.logged_out && bearer.as_deref() == Some(s.access.as_str()))
+        self.with(|s| {
+            let ok = !s.logged_out && bearer.as_deref() == Some(s.access.as_str());
+            if ok {
+                // Like Synapse: a device whose token is used has been seen.
+                let at = Utc::now().timestamp_millis() + s.quirks.clock_offset * 1000;
+                let device = s.device.clone();
+                s.seen_ms.insert(device, at);
+            }
+            ok
+        })
     }
 
     fn mint_session(&self, s: &mut State) -> Value {
@@ -471,7 +488,7 @@ impl Fake {
                         .map(|d| {
                             let (name, seen) = s.quirks.device_meta.get(d).cloned().unwrap_or((
                                 Some(flow::DEVICE_NAME.to_string()),
-                                None,
+                                s.seen_ms.get(d).copied(),
                             ));
                             json!({
                                 "device_id": d, "display_name": name,
@@ -492,6 +509,9 @@ impl Fake {
                 self.with(|s| {
                     if s.quirks.delete_device_status != 200 {
                         return reply(s.quirks.delete_device_status, json!({"errcode": "M_UNKNOWN"}));
+                    }
+                    if s.quirks.delete_device_is_noop {
+                        return reply(200, json!({}));
                     }
                     s.devices.retain(|d| *d != id);
                     s.quirks.extra_devices.retain(|d| *d != id);
@@ -994,9 +1014,14 @@ async fn a_device_the_canary_left_behind_is_tolerated_and_forgotten() {
     assert!(run.has("logout", "leftovers=SIWX_old"));
     assert!(run.has("logout", "cleaned=1"));
     assert!(fake.with(|s| s.quirks.extra_devices.is_empty()));
+    let ledger = identity::read_ledger(&dir);
     assert!(
-        identity::read_ledger(&dir).pending.is_empty(),
-        "the leftover is gone, and this run's own device left the ledger with its proven logout"
+        ledger.pending.is_empty(),
+        "the leftover is no longer tolerated blindly"
+    );
+    assert!(
+        ledger.logged_out.contains("SIWX_old"),
+        "the 200 is not proof: it leaves the ledger when a run sees it gone"
     );
 }
 
@@ -1069,20 +1094,24 @@ async fn a_proven_matrix_logout_takes_the_device_off_the_ledger_and_a_revoke_log
     let run = run_check(check_cfg(&fake, true), &scratch.0).await;
     assert_eq!(run.code, 0);
     let device = fake.with(|s| s.device.clone());
+    let ledger = identity::read_ledger(&dir);
     assert_eq!(
-        identity::read_ledger(&dir),
-        identity::Ledger {
-            logged_out: BTreeSet::from([device]),
-            ..identity::Ledger::default()
-        },
+        ledger.logged_out.ids(),
+        BTreeSet::from([device.clone()]),
         "the proof is about the grant: the device waits on the ledger until a run sees it gone"
+    );
+    assert!(ledger.pending.is_empty() && ledger.unfinished.is_empty());
+    let at = ledger.logged_out.at(&device).unwrap();
+    assert!(
+        (Utc::now().timestamp() - at).abs() < 60,
+        "with the time the canary last used it"
     );
     // The next run finds it gone and forgets it, and holds its own.
     let run = run_check(check_cfg(&fake, true), &scratch.0).await;
     assert_eq!(run.code, 0, "{:#?}", run.lines);
     let device = fake.with(|s| s.device.clone());
     assert_eq!(
-        identity::read_ledger(&dir).logged_out,
+        identity::read_ledger(&dir).logged_out.ids(),
         BTreeSet::from([device])
     );
 
@@ -1125,8 +1154,8 @@ async fn a_sign_in_that_failed_after_its_device_was_made_is_reported_then_forgiv
     let ledger = identity::read_ledger(&dir);
     assert!(ledger.attempts.is_empty(), "the marker is spent");
     assert!(
-        ledger.pending.contains(&killed),
-        "the device is the canary's now"
+        ledger.unfinished.contains(&killed) && !ledger.pending.contains(&killed),
+        "excused as unfinished, which holds only while nobody uses it"
     );
 
     // Run 3: it is a leftover, tolerated and deleted.
@@ -1135,11 +1164,12 @@ async fn a_sign_in_that_failed_after_its_device_was_made_is_reported_then_forgiv
     assert!(run.has("logout", &format!("leftovers={killed}")));
     assert!(run.has("logout", "cleaned=1"));
     let ledger = identity::read_ledger(&dir);
-    assert!(ledger.pending.is_empty() && ledger.attempts.is_empty());
+    assert!(ledger.pending.is_empty() && ledger.unfinished.is_empty());
+    assert!(ledger.attempts.is_empty());
     assert_eq!(
-        ledger.logged_out,
-        BTreeSet::from([fake.with(|s| s.device.clone())]),
-        "only this run's own, proven device is left on it"
+        ledger.logged_out.ids(),
+        BTreeSet::from([fake.with(|s| s.device.clone()), killed]),
+        "this run's own, proven device and the one it deleted wait to be seen gone"
     );
     assert!(fake.with(|s| s.devices.is_empty()));
 }
@@ -1189,7 +1219,7 @@ async fn a_device_that_no_attempt_can_explain_still_fires_the_tripwire() {
 }
 
 #[tokio::test]
-async fn a_run_that_never_learned_its_device_keeps_its_marker_for_the_next_run() {
+async fn a_run_that_never_learned_its_device_records_the_one_it_cannot_explain_as_its_own() {
     let (fake, scratch) = (Fake::start().await, Scratch::new("nowhoami"));
     let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
     // whoami fails, so this run never learns its device id, and the logout
@@ -1205,19 +1235,24 @@ async fn a_run_that_never_learned_its_device_keeps_its_marker_for_the_next_run()
         run.has("logout", "result=ok"),
         "its one unexplained device is its own"
     );
+    let left = fake.with(|s| s.signed_in_device.clone());
     let ledger = identity::read_ledger(&dir);
-    assert_eq!(ledger.attempts.len(), 1, "the marker stays");
-    assert!(ledger.pending.is_empty());
+    assert!(
+        ledger.logged_out.contains(&left),
+        "recorded like a device whoami named: {ledger:?}"
+    );
+    assert!(ledger.attempts.is_empty(), "the marker did its job");
 
+    // The next run finds it listed, as Synapse lists it once its token was used.
     fake.quirks(|q| {
         q.whoami_status = None;
         q.leave_device_on_logout = false;
     });
-    let left = fake.with(|s| s.signed_in_device.clone());
     let run = run_check(check_cfg(&fake, true), &scratch.0).await;
     assert_eq!(run.code, 1, "{:#?}", run.lines);
-    assert!(run.has("logout", "reason=unfinished_sign_in_device"));
-    assert!(run.has("logout", &format!("unfinished={left}")));
+    assert!(run.has("logout", "reason=device_survived_logout"));
+    assert!(run.has("logout", &format!("survivors={left}")));
+    assert!(run.has("logout", "tripwire=clean"));
 }
 
 /// How a homeserver describes a stranger's device: any name or none, seen or not.
@@ -1346,7 +1381,7 @@ async fn a_device_that_outlives_a_proven_logout_is_reported_and_deleted_not_a_st
     let survivor = fake.with(|s| s.device.clone());
     assert!(fake.with(|s| s.devices.contains(&survivor)));
     assert_eq!(
-        identity::read_ledger(&dir).logged_out,
+        identity::read_ledger(&dir).logged_out.ids(),
         BTreeSet::from([survivor.clone()])
     );
 
@@ -1366,9 +1401,9 @@ async fn a_device_that_outlives_a_proven_logout_is_reported_and_deleted_not_a_st
     assert_clean(&run, &fake);
     let second = fake.with(|s| s.device.clone());
     assert_eq!(
-        identity::read_ledger(&dir).logged_out,
-        BTreeSet::from([second]),
-        "the survivor left the ledger with its deletion; this run's own device is on it"
+        identity::read_ledger(&dir).logged_out.ids(),
+        BTreeSet::from([survivor.clone(), second]),
+        "the 200 is not proof: the survivor stays until a run sees it gone"
     );
 
     // Run 3: nothing survived; the ledger holds only the last run's device.
@@ -1377,7 +1412,7 @@ async fn a_device_that_outlives_a_proven_logout_is_reported_and_deleted_not_a_st
     assert!(!run.has("logout", "survivors="));
     let third = fake.with(|s| s.device.clone());
     assert_eq!(
-        identity::read_ledger(&dir).logged_out,
+        identity::read_ledger(&dir).logged_out.ids(),
         BTreeSet::from([third]),
         "a device seen gone is forgotten"
     );
@@ -1671,15 +1706,19 @@ async fn init_records_nothing_when_the_probe_says_nothing_about_the_route() {
 }
 
 #[tokio::test]
-async fn init_with_a_matrix_logout_leaves_the_ledger_empty() {
+async fn init_with_a_matrix_logout_puts_its_device_on_the_logged_out_list() {
     let (fake, scratch) = (Fake::start().await, Scratch::new("init-ledger"));
     let run = run_init(init_cfg(&fake, false), &scratch.0).await;
     assert_eq!(run.code, 0, "{:#?}", run.lines);
+    let ledger = identity::read_ledger(&scratch.0.join("local"));
+    let device = fake.with(|s| s.device.clone());
     assert_eq!(
-        identity::read_ledger(&scratch.0.join("local")),
-        identity::Ledger::default(),
-        "the device is deleted by the proven logout and the attempt is finished"
+        ledger.logged_out.ids(),
+        BTreeSet::from([device]),
+        "the proven logout deleted the device, best-effort: the first check sees it gone"
     );
+    assert!(ledger.pending.is_empty() && ledger.unfinished.is_empty());
+    assert!(ledger.attempts.is_empty(), "and the attempt is finished");
 }
 
 #[tokio::test]
@@ -1954,4 +1993,308 @@ fn core_dumps_are_off_after_startup() {
     // SAFETY: `PR_GET_DUMPABLE` takes plain integers.
     #[cfg(target_os = "linux")]
     assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Review round of PR #81: the fixes the audit tests above pin, and their edges.
+// ---------------------------------------------------------------------------
+
+/// A retired device (a proven logout, or a deletion) as the ledger holds it,
+/// retired `ago` seconds ago.
+fn retire(dir: &Path, id: &str, ago: i64) {
+    let at = Utc::now().timestamp() - ago;
+    identity::update_ledger(dir, |l| l.logged_out.insert(id.to_string(), at)).unwrap();
+}
+
+#[tokio::test]
+async fn a_canary_named_device_recreated_on_a_retired_id_and_used_since_is_a_stranger() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("retired-used"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    retire(&dir, "SIWX_retired", 3_600);
+    fake.quirks(|q| q.extra_devices = vec!["SIWX_retired".to_string()]);
+    // As the canary's client would name it, used a minute ago: after the canary
+    // last used the id, an hour ago.
+    describe(
+        &fake,
+        "SIWX_retired",
+        Some("rotation-canary"),
+        Some(seen_now_ms()),
+    );
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 4, "{:#?}", run.lines);
+    assert!(run.has("logout", "reason=identity_compromised"));
+    assert!(run.has("logout", "strangers=SIWX_retired"));
+    assert!(
+        fake.with(|s| s.quirks.extra_devices.contains(&"SIWX_retired".to_string())),
+        "evidence stays"
+    );
+    assert!(identity::read_ledger(&dir)
+        .logged_out
+        .contains("SIWX_retired"));
+
+    // The same id, last used before the canary retired it: its own survivor.
+    let (fake, scratch) = (Fake::start().await, Scratch::new("retired-unused"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    retire(&dir, "SIWX_retired", 3_600);
+    fake.quirks(|q| q.extra_devices = vec!["SIWX_retired".to_string()]);
+    describe(
+        &fake,
+        "SIWX_retired",
+        Some("rotation-canary"),
+        Some((Utc::now().timestamp() - 3_700) * 1000),
+    );
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 1, "{:#?}", run.lines);
+    assert!(run.has("logout", "reason=device_survived_logout"));
+    assert!(run.has("logout", "survivors=SIWX_retired"));
+    assert!(run.has("logout", "tripwire=clean"));
+}
+
+#[tokio::test]
+async fn init_s_device_on_a_retired_id_that_was_used_since_is_a_stranger() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("init-retired-used"));
+    fake.quirks(|q| q.leave_device_on_logout = true);
+    let run = run_init(init_cfg(&fake, false), &scratch.0).await;
+    assert_eq!(run.code, 0, "{:#?}", run.lines);
+    let dir = scratch.0.join("local");
+    let init_device = fake.with(|s| s.device.clone());
+    assert!(identity::read_ledger(&dir)
+        .logged_out
+        .contains(&init_device));
+    // Init's logout was an hour ago and somebody used the device after it.
+    retire(&dir, &init_device, 3_600);
+    fake.quirks(|q| q.leave_device_on_logout = false);
+    describe(
+        &fake,
+        &init_device,
+        Some("rotation-canary"),
+        Some(seen_now_ms()),
+    );
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 4, "{:#?}", run.lines);
+    assert!(run.has("logout", &format!("strangers={init_device}")));
+}
+
+#[tokio::test]
+async fn a_leftover_whose_delete_was_a_silent_noop_is_reported_next_time_not_a_stranger() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("leftover-noop"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    identity::update_ledger(&dir, |l| {
+        l.pending.insert("SIWX_old".to_string());
+    })
+    .unwrap();
+    fake.quirks(|q| {
+        q.extra_devices = vec!["SIWX_old".to_string()];
+        q.delete_device_is_noop = true;
+    });
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 0, "{:#?}", run.lines);
+    assert!(run.has("logout", "cleaned=1"));
+    assert!(identity::read_ledger(&dir).logged_out.contains("SIWX_old"));
+
+    // The 200 deleted nothing: the next run reports it, and does not fire.
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 1, "{:#?}", run.lines);
+    assert!(run.has("logout", "reason=device_survived_logout"));
+    assert!(run.has("logout", "survivors=SIWX_old"));
+
+    // Once the server really deletes it, a run sees it gone and forgets it.
+    fake.quirks(|q| q.delete_device_is_noop = false);
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 1, "{:#?}", run.lines);
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 0, "{:#?}", run.lines);
+    assert!(!identity::read_ledger(&dir).logged_out.contains("SIWX_old"));
+}
+
+#[tokio::test]
+async fn a_room_that_fired_the_tripwire_does_not_leave_a_marker_to_excuse_a_second_device() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("room-marker"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    leave_marker(&dir, "earlier", 60);
+    fake.quirks(|q| {
+        q.rooms = 1;
+        q.extra_devices = vec!["SIWX_first".to_string()];
+    });
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 4, "{:#?}", run.lines);
+    assert!(run.has("logout", "unfinished=SIWX_first"));
+    let ledger = identity::read_ledger(&dir);
+    assert!(
+        !ledger.pending.contains("SIWX_first") && !ledger.unfinished.contains("SIWX_first"),
+        "a fired tripwire excuses and records nothing: {ledger:?}"
+    );
+    assert_eq!(ledger.attempts.len(), 1, "the marker stays as evidence");
+    assert!(fake.with(|s| s.quirks.extra_devices.contains(&"SIWX_first".to_string())));
+
+    // The room is gone, but a second device appeared: one marker covers one
+    // device, not the first and the second.
+    fake.quirks(|q| {
+        q.rooms = 0;
+        q.extra_devices = vec!["SIWX_first".to_string(), "SIWX_second".to_string()];
+    });
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 4, "{:#?}", run.lines);
+    assert!(run.has("logout", "strangers=SIWX_first,SIWX_second"));
+}
+
+// ---------------------------------------------------------------------------
+// Review of the tripwire fix (#81): each `audit_*` test states the secure
+// expectation. `audit_a2` is a known gap, tracked in #84.
+// ---------------------------------------------------------------------------
+
+fn seen_now_ms() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
+/// A1: a device excused as unfinished goes to `pending`; a later run tolerates
+/// it as a leftover whatever happened to it since, so a device that was unseen
+/// at run 1 and used afterwards is deleted with exit 0.
+#[tokio::test]
+async fn audit_a1_an_excused_device_used_afterwards_is_not_laundered_as_a_leftover() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("audit-a1"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    leave_marker(&dir, "failed-run", 60);
+    fake.quirks(|q| q.extra_devices = vec!["SIWX_dormant".to_string()]);
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 1, "{:#?}", run.lines);
+    assert!(run.has("logout", "unfinished=SIWX_dormant"));
+    // The holder of the device now uses its token.
+    describe(
+        &fake,
+        "SIWX_dormant",
+        Some("rotation-canary"),
+        Some(seen_now_ms()),
+    );
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(
+        run.code, 4,
+        "a device unseen when excused and seen now is a stranger's: {:#?}",
+        run.lines
+    );
+}
+
+/// A2: a fired tripwire is not sticky: a marker recorded after the fire (a
+/// later run that failed before `/sign_in`) excuses the same devices.
+#[tokio::test]
+#[ignore = "known gap, tracked in #84 (item 1)"]
+async fn audit_a2_a_fired_tripwire_is_not_excused_by_a_later_marker() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("audit-a2"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    leave_marker(&dir, "m1", 60);
+    fake.quirks(|q| q.extra_devices = vec!["SIWX_x".to_string(), "SIWX_y".to_string()]);
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 4, "{:#?}", run.lines);
+    leave_marker(&dir, "m2", 0);
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(
+        run.code, 4,
+        "the devices that fired the tripwire are excused now: {:#?}",
+        run.lines
+    );
+}
+
+/// A3: a run whose whoami failed on the revoke route (the device stays by
+/// design) puts its own device on no list; Synapse marks it seen (the run's
+/// own GET /devices used the token), so the next run fires exit 4.
+#[tokio::test]
+async fn audit_a3_a_failed_whoami_on_the_revoke_route_does_not_fire_the_next_run() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("audit-a3"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Revoke);
+    fake.quirks(|q| q.whoami_status = Some(503));
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 1, "{:#?}", run.lines);
+    let left = fake.with(|s| s.signed_in_device.clone());
+    assert!(fake.with(|s| s.devices.contains(&left)));
+    // Not on any list was the bug; the run's one unexplained device is its own.
+    let ledger = identity::read_ledger(&dir);
+    assert!(
+        ledger.pending.contains(&left),
+        "the device stays by design: {ledger:?}"
+    );
+    fake.quirks(|q| q.whoami_status = None);
+    // As Synapse lists it: run 1 used its token for joined_rooms and devices.
+    describe(&fake, &left, Some("rotation-canary"), Some(seen_now_ms()));
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_ne!(run.code, 4, "the canary's own device: {:#?}", run.lines);
+}
+
+/// A4: a device id on `logged_out` is a survivor by id alone. A stranger who
+/// proposes that id at sign-in (siwx-oidc upserts a proposed id; with flag 2
+/// off a deleted id is recreated) gets exit 1 and the evidence deleted.
+#[tokio::test]
+async fn audit_a4_a_stranger_on_a_logged_out_id_is_not_a_survivor() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("audit-a4"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 0, "{:#?}", run.lines);
+    let gone = fake.with(|s| s.device.clone());
+    assert!(!fake.with(|s| s.devices.contains(&gone)));
+    assert!(identity::read_ledger(&dir).logged_out.contains(&gone));
+    // A stranger signs in proposing that id, and uses it.
+    fake.quirks(|q| q.extra_devices = vec![gone.clone()]);
+    describe(&fake, &gone, Some("Element Web"), Some(seen_now_ms()));
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(
+        run.code, 4,
+        "recreated after the proven logout and used: {:#?}",
+        run.lines
+    );
+}
+
+/// A5: the survivor's delete answers 200 (siwx-oidc's best-effort teardown)
+/// but the device stays; it leaves `logged_out` on the 200 and the next run
+/// takes the canary's own device for a stranger.
+#[tokio::test]
+async fn audit_a5_a_survivor_whose_delete_was_a_silent_noop_stays_on_the_ledger() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("audit-a5"));
+    let dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    fake.quirks(|q| q.leave_device_on_logout = true);
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 0, "{:#?}", run.lines);
+    let survivor = fake.with(|s| s.device.clone());
+    fake.quirks(|q| {
+        q.leave_device_on_logout = false;
+        q.delete_device_is_noop = true;
+    });
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 1, "{:#?}", run.lines);
+    assert!(run.has("logout", "survivors_cleaned=1"));
+    assert!(fake.with(|s| s.devices.contains(&survivor)), "still there");
+    describe(
+        &fake,
+        &survivor,
+        Some("rotation-canary"),
+        Some(seen_now_ms()),
+    );
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_ne!(
+        run.code,
+        4,
+        "the canary's own device, whose deletion was answered 200: {:#?} ledger={:?}",
+        run.lines,
+        identity::read_ledger(&dir)
+    );
+}
+
+/// A6: init's proven Matrix logout takes its device off the ledger without
+/// putting it on `logged_out`, so a device that outlives init's logout fires
+/// the first check (the #79 item 2 fix is not applied to init).
+#[tokio::test]
+async fn audit_a6_a_device_that_outlives_inits_logout_is_not_a_stranger() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("audit-a6"));
+    fake.quirks(|q| q.leave_device_on_logout = true);
+    let run = run_init(init_cfg(&fake, false), &scratch.0).await;
+    assert_eq!(run.code, 0, "{:#?}", run.lines);
+    let init_device = fake.with(|s| s.device.clone());
+    assert!(fake.with(|s| s.devices.contains(&init_device)));
+    fake.quirks(|q| q.leave_device_on_logout = false);
+    describe(
+        &fake,
+        &init_device,
+        Some("rotation-canary"),
+        Some(seen_now_ms()),
+    );
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_ne!(run.code, 4, "init's own device: {:#?}", run.lines);
 }
