@@ -38,7 +38,7 @@ use super::config;
 use super::device_auth;
 use super::did_assertion::DidPublication;
 use super::introspect;
-use super::oidc::{self, CustomError, EcdsaSigningKey};
+use super::oidc::{self, CustomError, EcdsaSigningKey, ProviderSigner};
 use super::resolve;
 use super::synapse_client::SynapseClient;
 use super::webauthn as wa;
@@ -51,7 +51,9 @@ use siwx_oidc::redact::fingerprint;
 
 #[derive(Clone)]
 struct AppState {
-    signing_key: Arc<EcdsaSigningKey>,
+    /// The provider's signing backend (`signing_backend`): every private-key
+    /// use goes through it, and the JWKS publishes its public key.
+    signing_key: Arc<dyn ProviderSigner>,
     /// Verification JWKs for signing keys this provider has RETIRED, published
     /// alongside the live one so that DID assertions minted before a rotation
     /// stay verifiable. Never used to sign — see `oidc::jwks`.
@@ -243,7 +245,7 @@ impl IntoResponse for CustomError {
 // -- Route handlers --------------------------------------------------------
 
 async fn jwk_set(State(state): State<AppState>) -> Result<Json<CoreJsonWebKeySet>, CustomError> {
-    let jwks = oidc::jwks(&state.signing_key, &state.retired_verification_keys)?;
+    let jwks = oidc::jwks(state.signing_key.as_ref(), &state.retired_verification_keys)?;
     Ok(jwks.into())
 }
 
@@ -359,7 +361,7 @@ async fn token(
     let token_response = oidc::token(
         form,
         credentials,
-        &state.signing_key,
+        state.signing_key.as_ref(),
         &state.config,
         &state.redis_client,
         state.synapse_client.as_deref(),
@@ -370,10 +372,14 @@ async fn token(
         // Wrap non-Token errors so they always produce a JSON body.
         let error = match e {
             // A server-side fault (the store, a dependency) decides nothing about the
-            // grant: `TokenEndpointError` answers it with a retryable 503.
+            // grant: `TokenEndpointError` answers it with a retryable 503. A signer's
+            // refusal of the token (`signing_backend = socket`) is the 500
+            // `server_error` it was raised as: a retry fails the same way, and a 4xx
+            // would end a Matrix client's session.
             CustomError::BadRequestToken(_)
             | CustomError::ServiceUnavailable(_)
-            | CustomError::Other(_) => e,
+            | CustomError::Other(_)
+            | CustomError::Coded { status: 500, .. } => e,
             CustomError::Unauthorized(msg) => CustomError::BadRequestToken(oidc::TokenError {
                 error: CoreErrorResponseType::InvalidClient,
                 error_description: msg,
@@ -423,7 +429,7 @@ async fn end_session_response(
 ) -> Result<Response, CustomError> {
     let outcome = oidc::end_session(
         params,
-        &state.signing_key,
+        state.signing_key.as_ref(),
         &state.retired_verification_keys,
         &state.config,
         &state.redis_client,
@@ -492,7 +498,7 @@ async fn sign_in(
     // the discovery document and rejects a mismatch as "minted by a different
     // provider".
     let publication = DidPublication {
-        key: &state.signing_key,
+        key: state.signing_key.as_ref(),
         issuer: state.config.base_url.as_str(),
     };
     let (url, did) = match oidc::sign_in(
@@ -583,7 +589,7 @@ async fn userinfo(
     let payload = oidc::UserInfoPayload { access_token: None };
     let claims = oidc::userinfo(
         &state.config,
-        &state.signing_key,
+        state.signing_key.as_ref(),
         bearer.map(|b| b.0 .0),
         payload,
         &state.redis_client,
@@ -602,7 +608,7 @@ async fn userinfo_post(
 ) -> Result<UserInfoResponse, CustomError> {
     let claims = oidc::userinfo(
         &state.config,
-        &state.signing_key,
+        state.signing_key.as_ref(),
         bearer.map(|b| b.0 .0),
         payload,
         &state.redis_client,
@@ -1814,42 +1820,89 @@ pub async fn main() {
     // BOTH branches — configured key and random fallback shared one identifier,
     // so a restart silently swapped the key underneath a stable `kid` and every
     // durably-stored assertion started failing as "bad signature". See the
-    // `EcdsaSigningKey` type doc in `oidc.rs` (H4). Do not reintroduce a literal.
-    let signing_key = if let Some(key) = &config.signing_key_pem {
-        let key = EcdsaSigningKey::from_pem(key).expect("Failed to load signing key from PEM");
-        info!(
-            kid = %key.kid(),
-            "Loaded durable ES256 signing key from SIWXOIDC_SIGNING_KEY_PEM. \
-             DID assertions will be minted under this kid."
-        );
-        key
-    } else {
-        info!("Generating ephemeral ES256 signing key...");
-        let key = EcdsaSigningKey::generate();
-        // SECURITY: never log private key material. Log only a non-sensitive
-        // fingerprint of the *public* key so operators can correlate the live
-        // key without exposing the secret. This key rotates on every restart
-        // (ID tokens and signed userinfo issued before it stop verifying; the
-        // opaque access/refresh tokens live in Redis and are unaffected) — set
-        // SIWEOIDC_SIGNING_KEY_PEM to persist.
-        //
-        // Emitted at `warn!`, not `info!`: this is a degraded-mode announcement
-        // with a second, quieter consequence that an operator MUST see, namely
-        // that provider-attested DID assertions are suppressed entirely while
-        // the key is ephemeral (`did_assertion::mint_did_assertion` returns
-        // `None`). A profile that carries `{"did": …}` with no `"proof"` key is
-        // explained by this line and by nothing else.
-        warn!(
-            kid = %key.kid(),
-            pubkey_fp = %key.public_key_fingerprint(),
-            "Generated ephemeral ES256 signing key (NOT persisted). \
-             Tokens stop verifying on restart AND provider-attested DID \
-             assertions will NOT be minted (no `proof` is written to user \
-             profiles) for as long as this key is ephemeral. \
-             Set SIWXOIDC_SIGNING_KEY_PEM to use a stable key in production."
-        );
-        key
+    // `EcdsaSigningKey` type doc in `siwx_oidc::signing` (H4). Do not reintroduce
+    // a literal.
+    let backend = config
+        .signing_backend()
+        .unwrap_or_else(|e| panic!("FATAL: {e}"));
+    let signing_key: Arc<dyn ProviderSigner> = match backend {
+        config::SigningBackend::Socket { path, timeout } => {
+            // The key lives in the signer process; this one never holds or
+            // generates one. A signer that cannot be asked, or that names a `kid`
+            // its key does not derive to, stops the start. So does one that would
+            // refuse every token this server asks for (another issuer, a token
+            // lifetime above its limit, or 0): its healthcheck would stay green
+            // while every sign-in failed.
+            let signer = siwx_oidc::signing::socket::SocketSigner::connect(path.clone(), timeout)
+                .await
+                .unwrap_or_else(|e| {
+                    let path = path.display();
+                    panic!(
+                        "FATAL: signing_backend = socket: asking the signer at {path} for its \
+                         public key failed: {e}"
+                    )
+                });
+            signer
+                .check_fits(
+                    config.base_url.as_str(),
+                    &[
+                        (
+                            "id_token_ttl_secs (SIWXOIDC_ID_TOKEN_TTL_SECS)",
+                            config.id_token_ttl_secs,
+                        ),
+                        (
+                            "the back-channel logout token lifetime",
+                            crate::backchannel::LOGOUT_TOKEN_LIFETIME_SECS.unsigned_abs(),
+                        ),
+                    ],
+                )
+                .unwrap_or_else(|e| panic!("FATAL: signing_backend = socket: {e}"));
+            Arc::new(signer)
+        }
+        config::SigningBackend::Pem => {
+            let pem = config
+                .signing_key_pem
+                .as_deref()
+                .expect("signing_backend() returns Pem only with signing_key_pem set");
+            let key = EcdsaSigningKey::from_pem(pem).expect("Failed to load signing key from PEM");
+            info!(
+                kid = %key.kid(),
+                "Loaded durable ES256 signing key from SIWXOIDC_SIGNING_KEY_PEM. \
+                 DID assertions will be minted under this kid."
+            );
+            Arc::new(key)
+        }
+        config::SigningBackend::Ephemeral => {
+            info!("Generating ephemeral ES256 signing key...");
+            let key = EcdsaSigningKey::generate();
+            // SECURITY: never log private key material. Log only a non-sensitive
+            // fingerprint of the *public* key so operators can correlate the live
+            // key without exposing the secret. This key rotates on every restart
+            // (ID tokens and signed userinfo issued before it stop verifying; the
+            // opaque access/refresh tokens live in Redis and are unaffected); set
+            // SIWEOIDC_SIGNING_KEY_PEM to persist.
+            //
+            // Emitted at `warn!`, not `info!`: this is a degraded-mode announcement
+            // with a second, quieter consequence that an operator MUST see, namely
+            // that provider-attested DID assertions are suppressed entirely while
+            // the key is ephemeral (`did_assertion::mint_did_assertion` returns
+            // `None`). A profile that carries `{"did": …}` with no `"proof"` key is
+            // explained by this line and by nothing else.
+            warn!(
+                kid = %key.kid(),
+                pubkey_fp = %key.public_key_fingerprint(),
+                "Generated ephemeral ES256 signing key (NOT persisted). \
+                 Tokens stop verifying on restart AND provider-attested DID \
+                 assertions will NOT be minted (no `proof` is written to user \
+                 profiles) for as long as this key is ephemeral. \
+                 Set SIWXOIDC_SIGNING_KEY_PEM to use a stable key in production."
+            );
+            Arc::new(key)
+        }
     };
+    // One line names the backend and the live `kid` in every mode; never key
+    // material.
+    info!(backend = %signing_key.backend(), kid = %signing_key.kid(), "signing");
 
     // Retired verification keys (SIWEOIDC_RETIRED_SIGNING_KEYS_PEM).
     //
@@ -1929,7 +1982,7 @@ pub async fn main() {
     };
 
     let state = AppState {
-        signing_key: Arc::new(signing_key),
+        signing_key,
         retired_verification_keys: Arc::new(retired_verification_keys),
         config: config.clone(),
         redis_client,
@@ -3264,5 +3317,211 @@ mod token_store_fault_tests {
         assert!(body.get("errcode").is_none(), "no errcode: {body}");
         assert_eq!(body["error"], "temporarily_unavailable", "{body}");
         assert!(retry_after.is_some(), "the 503 says when to retry");
+    }
+}
+
+#[cfg(test)]
+mod signer_fault_tests {
+    //! With `signing_backend = socket` and the signer down, `POST /token` answers the
+    //! retryable 503 of a server-side fault (with `Retry-After`, no `errcode`, no
+    //! token) and signed userinfo answers 503: nothing unsigned is handed out. A
+    //! signer that refuses the message itself is a 500 without `Retry-After`.
+    use super::*;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use headers::authorization::Bearer;
+    use openidconnect::core::{CoreClientAuthMethod, CoreJwsSigningAlgorithm};
+    use openidconnect::RedirectUrl;
+    use sha2::{Digest, Sha256};
+    use siwx_oidc::signing::socket::SocketSigner;
+    use siwx_oidc::test_support::TestSigner;
+
+    const DID: &str = "did:key:zSignerBackendTestFixture";
+    const VERIFIER: &str = "a-pkce-verifier-for-the-signer-fault-tests-0123456789";
+
+    /// Generic mode (no MAS shared secret) at the base URL a test signer expects.
+    fn state(redis: RedisClient, signer: Arc<dyn ProviderSigner>) -> AppState {
+        let config = config::Config {
+            ens_api_url: None,
+            eth_provider: None,
+            ..config::Config::default()
+        };
+        let base = url::Url::parse("http://localhost:8000").unwrap();
+        let (wa_config, rp_dispatch) =
+            wa::build_rp_dispatch(&base, None, None, None).expect("build rp dispatch");
+        AppState {
+            signing_key: signer,
+            retired_verification_keys: Arc::new(Vec::new()),
+            config,
+            redis_client: redis,
+            webauthn: Arc::new(wa_config.webauthn),
+            rp_id: wa_config.rp_id,
+            rp_origin: wa_config.rp_origin,
+            rp_dispatch: Arc::new(rp_dispatch),
+            synapse_client: None,
+        }
+    }
+
+    fn client(signed: bool) -> ClientEntry {
+        let mut metadata = SiwxClientMetadata::new(
+            vec![RedirectUrl::new("https://rp.example.org/cb".into()).unwrap()],
+            LogoutClientMetadata::default(),
+        )
+        .set_token_endpoint_auth_method(Some(CoreClientAuthMethod::None));
+        if signed {
+            metadata = metadata
+                .set_userinfo_signed_response_alg(Some(CoreJwsSigningAlgorithm::EcdsaP256Sha256));
+        }
+        ClientEntry::new("client-secret", metadata, None)
+    }
+
+    /// A client with signed userinfo, a code for it, and an access token of
+    /// its grant: `(client_id, code, access_token)`.
+    async fn fixture(redis: &RedisClient) -> (String, String, String) {
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let client_id = format!("signer-fault-{tag}");
+        redis
+            .set_client(client_id.clone(), client(true))
+            .await
+            .unwrap();
+        let code = format!("code-{tag}");
+        redis
+            .set_code(
+                code.clone(),
+                CodeEntry {
+                    exchange_count: 0,
+                    did: DID.to_string(),
+                    nonce: None,
+                    client_id: client_id.clone(),
+                    auth_time: chrono::Utc::now(),
+                    code_challenge: Some(URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER))),
+                    code_challenge_method: Some("S256".into()),
+                    device_id: None,
+                    localpart: Some(siwx_oidc::mxid::localpart_for(DID)),
+                    scope: Some("openid".into()),
+                    client_class: Some(ClientClass::Matrix),
+                },
+            )
+            .await
+            .unwrap();
+        let access = redis
+            .issue_grant(&siwx_oidc::db::grant::NewGrant {
+                kind: siwx_oidc::db::grant::GrantKind::Oidc,
+                username: siwx_oidc::mxid::localpart_for(DID),
+                did: DID.to_string(),
+                client_id: client_id.clone(),
+                confidential_client: false,
+                device_id: String::new(),
+                scope: "openid".to_string(),
+                name: DID.to_string(),
+                auth_ms: None,
+                access_ttl: ACCESS_TOKEN_TTL,
+                refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
+                absolute_deadline: None,
+            })
+            .await
+            .unwrap()
+            .access_token;
+        (client_id, code, access)
+    }
+
+    /// `POST /token` for `code`: status, `Retry-After`, body.
+    async fn exchange(
+        state: &AppState,
+        client_id: &str,
+        code: &str,
+    ) -> (StatusCode, Option<header::HeaderValue>, serde_json::Value) {
+        let response = token(
+            State(state.clone()),
+            HeaderMap::new(),
+            Form(oidc::TokenForm {
+                code: Some(code.to_string()),
+                client_id: Some(client_id.to_string()),
+                client_secret: None,
+                grant_type: openidconnect::core::CoreGrantType::AuthorizationCode,
+                code_verifier: Some(VERIFIER.to_string()),
+                refresh_token: None,
+                device_code: None,
+            }),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let retry_after = response.headers().get(header::RETRY_AFTER).cloned();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        (status, retry_after, body)
+    }
+
+    /// Signed userinfo for `access`: status and `Retry-After`.
+    async fn signed_userinfo(
+        state: &AppState,
+        access: &str,
+    ) -> (StatusCode, Option<header::HeaderValue>) {
+        let response = userinfo(
+            State(state.clone()),
+            Some(TypedHeader(
+                Authorization::<Bearer>::bearer(access).unwrap(),
+            )),
+        )
+        .await
+        .into_response();
+        let retry_after = response.headers().get(header::RETRY_AFTER).cloned();
+        (response.status(), retry_after)
+    }
+
+    #[tokio::test]
+    async fn a_stopped_signer_is_a_retryable_503_at_the_token_endpoint_and_at_signed_userinfo() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let service = TestSigner::start(EcdsaSigningKey::generate(), TestSigner::options());
+        let signer = SocketSigner::connect(&service.socket, std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        let (client_id, code, access) = fixture(&redis).await;
+        service.stop();
+        let state = state(redis, Arc::new(signer));
+
+        let (status, retry_after, body) = exchange(&state, &client_id, &code).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"], "temporarily_unavailable", "{body}");
+        assert!(body.get("errcode").is_none(), "no errcode: {body}");
+        assert!(body.get("id_token").is_none() && body.get("access_token").is_none());
+        assert!(retry_after.is_some(), "the 503 says when to retry");
+
+        let (status, _) = signed_userinfo(&state, &access).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// AUDIT PR83 F6: a signer that refuses the message (`shape`; here a
+    /// signer started for another issuer, which the start check would have
+    /// stopped) fails the same way on every retry. It is a 500 `server_error`
+    /// without `Retry-After`, never the retryable 503, and no token.
+    #[tokio::test]
+    async fn a_shape_refusal_is_a_500_without_retry_after_never_the_retryable_503() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let mut options = TestSigner::options();
+        options.issuer = "https://other.example.org".to_string();
+        let service = TestSigner::start(EcdsaSigningKey::generate(), options);
+        let signer = SocketSigner::connect(&service.socket, std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        let (client_id, code, access) = fixture(&redis).await;
+        let state = state(redis, Arc::new(signer));
+
+        let (status, retry_after, body) = exchange(&state, &client_id, &code).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["error"], "server_error", "{body}");
+        assert!(retry_after.is_none(), "no Retry-After for a refusal");
+        assert!(body.get("id_token").is_none() && body.get("access_token").is_none());
+
+        let (status, retry_after) = signed_userinfo(&state, &access).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(retry_after.is_none());
+        drop(service);
     }
 }

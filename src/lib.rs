@@ -52,6 +52,12 @@ pub mod guest_invite;
 /// redeem proof of possession. Pure, so every rule is tested without Redis or HTTP.
 pub mod guest_admission;
 
+/// The provider's signing interface (`ProviderSigner`) and its backends: the
+/// in-process key (`EcdsaSigningKey`) and the `siwx-signer` socket. In the
+/// library crate so the `siwx-signer` binary signs with the same key type and
+/// derives the same `kid`.
+pub mod signing;
+
 // `synapse_client` is DELIBERATELY not re-exposed here.
 //
 // It used to be `pub mod synapse_client;`, which compiled the same file into

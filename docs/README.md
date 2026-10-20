@@ -15,6 +15,7 @@ An index of the documentation in this repository. Start with the project
 | [troubleshooting.md](troubleshooting.md) | Symptoms and fixes for headless, wallet, passkey, account, QR and DID problems; Redis inspection |
 | [architecture.md](architecture.md) | Layers, code map, DID methods, frontend, Redis keyspace, logging, lineage from siwe-oidc |
 | [configuration.md](configuration.md) | Every configuration option, key rotation, reverse proxy and CORS, running with Docker |
+| [signer.md](signer.md) | The `siwx-signer` process that alone holds the signing key (`signing_backend = socket`): commands, the socket protocol, shape checks, a hardened compose setup, failure behaviour |
 | [comparison.md](comparison.md) | How siwx-oidc compares with MAS and other options, including putting siwx-oidc behind MAS |
 
 For contributors: [AGENTS.md](../AGENTS.md) (code rules and invariants),

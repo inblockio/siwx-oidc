@@ -81,7 +81,9 @@
 //! a grant deletion can be observed, and where the logout entry of an `oidc`
 //! grant is queued for back-channel logout ([`super::outbox`]). A grant whose
 //! key simply expires runs no script: its index entry expires with it (same
-//! TTL), and no logout token is sent.
+//! TTL), and no logout token is sent. Nor is one queued for a grant discarded
+//! because its tokens were never answered ([`RedisClient::discard_unanswered_grant`]):
+//! no relying party ever learnt its `sid`.
 //!
 //! # The rotation decision ([`RedisClient::rotate_refresh_token`])
 //!
@@ -744,15 +746,17 @@ end
 /// one hook for whatever must follow a grant deletion: for an `oidc` grant it
 /// queues the back-channel logout entry in the outbox
 /// ([`super::outbox::KV_BACKCHANNEL_OUTBOX`], due now), in the same script as
-/// the deletion. A `matrix_device` or `service` grant queues nothing.
+/// the deletion. A `matrix_device` or `service` grant queues nothing, and
+/// neither does a `quiet` drop ([`DISCARD_LUA`] only: a grant whose tokens
+/// were never answered, so no relying party holds its `sid`).
 const LUA_DROP: &str = r#"
-local function drop_grant(key)
+local function drop_grant(key, quiet)
   local f = redis.call('HMGET', key, 'sid', 'kind', 'client_id', 'did')
   if f[1] and f[1] ~= '' then
     redis.call('DEL', 'idx:grants:sid/' .. f[1])
   end
   local n = redis.call('DEL', key)
-  if n == 1 and f[2] == 'oidc' then
+  if n == 1 and f[2] == 'oidc' and not quiet then
     local t = redis.call('TIME')
     local due = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
     redis.call('ZADD', 'outbox:backchannel_logout', string.format('%.0f', due),
@@ -1158,6 +1162,20 @@ drop_grant(KEYS[1])
 redis.call('SREM', KEYS[2], ARGV[1])
 if ARGV[3] == '1' then redis.call('SREM', KEYS[3], ARGV[1]) end
 return 1
+"#;
+
+/// Discard a grant whose tokens were never answered
+/// ([`RedisClient::discard_unanswered_grant`]): the grant (quietly, no logout
+/// queued), its first access token and its index entries. Needs [`LUA_DROP`].
+///
+/// KEYS: 1 grant, 2 its access entry, 3 user index, 4 device index. ARGV: 1
+/// grant id, 2 has device. Returns 1 when the grant existed, else 0.
+const DISCARD_LUA: &str = r#"
+local n = drop_grant(KEYS[1], true)
+redis.call('DEL', KEYS[2])
+redis.call('SREM', KEYS[3], ARGV[1])
+if ARGV[2] == '1' then redis.call('SREM', KEYS[4], ARGV[1]) end
+return n
 "#;
 
 /// End the grant a `sid` names (RP-initiated logout), if it belongs to the
@@ -1857,6 +1875,33 @@ impl RedisClient {
             ],
         )
         .await
+    }
+
+    /// Discard a grant [`Self::issue_grant`] issued whose tokens were never
+    /// answered to anyone, because the ID token that goes with them could not
+    /// be signed: the grant, its first access token and its index entries go
+    /// in one step, and no back-channel logout is queued (no relying party
+    /// ever received its `sid` or a token of it). `username` and `device_id`
+    /// are the ones the grant was issued with. Returns whether it existed.
+    pub async fn discard_unanswered_grant(
+        &self,
+        issued: &IssuedGrant,
+        username: &str,
+        device_id: &str,
+    ) -> Result<bool> {
+        let removed: i64 = self
+            .eval(
+                &format!("{LUA_DROP}{DISCARD_LUA}"),
+                &[
+                    &grant_key(&issued.grant_id),
+                    &at_key(&issued.access_token),
+                    &user_idx_key(username),
+                    &device_idx_key(username, device_id),
+                ],
+                &[issued.grant_id.as_str(), flag(!device_id.is_empty())],
+            )
+            .await?;
+        Ok(removed == 1)
     }
 
     /// End the grant whose session id is `sid` (RP-initiated logout), if it

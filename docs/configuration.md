@@ -135,7 +135,10 @@ the signing key.
 
 | Key | Environment | Default | Meaning |
 |---|---|---|---|
-| `signing_key_pem` | `SIWXOIDC_SIGNING_KEY_PEM` | none: a key is generated at startup | P-256 private key, PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`). Signs ID tokens, signed userinfo and DID assertions (ES256). |
+| `signing_backend` | `SIWXOIDC_SIGNING_BACKEND` | unset: `pem` when `signing_key_pem` is set, else `ephemeral` | Where the private key is held: `pem` (this process, from `signing_key_pem`), `ephemeral` (generated at every start) or `socket` (a separate `siwx-signer` process, see [signer.md](signer.md)). |
+| `signing_key_pem` | `SIWXOIDC_SIGNING_KEY_PEM` | none: a key is generated at startup | P-256 private key, PKCS#8 PEM. Signs ID tokens, signed userinfo, DID assertions and back-channel logout tokens (ES256). Refused with `signing_backend` `ephemeral` or `socket`. |
+| `signer_socket` | `SIWXOIDC_SIGNER_SOCKET` | none | Path of the `siwx-signer` Unix socket. Required by `signing_backend = socket`, refused by every other backend. |
+| `signer_timeout_ms` | `SIWXOIDC_SIGNER_TIMEOUT_MS` | `2000` | Bound on one signer round trip (`socket` only). Must be at least 1. |
 | `retired_signing_keys_pem` | `SIWXOIDC_RETIRED_SIGNING_KEYS_PEM` | none | One or more **public** P-256 keys (SPKI, `-----BEGIN PUBLIC KEY-----`), concatenated. Published in the JWKS so assertions signed before a rotation stay verifiable. Never used to sign. |
 | `id_token_ttl_secs` | `SIWXOIDC_ID_TOKEN_TTL_SECS` | `300` | ID token lifetime in seconds. |
 
@@ -153,6 +156,33 @@ for any deployment that publishes DIDs.
 The JWKS `kid` is derived from the public key (first 16 hex characters of SHA-256 over the
 uncompressed point), so the same PEM always yields the same `kid` and a changed key shows up as
 an unknown `kid` rather than a bad signature.
+
+#### Signing backends
+
+Every start logs one line naming the backend and the live `kid`, never key material:
+`signing backend=<pem|ephemeral|socket> kid=<kid>`.
+
+| `signing_backend` | Needs | Refuses at start |
+|---|---|---|
+| unset | nothing | `signer_socket` |
+| `pem` | `signing_key_pem` | `signer_socket` |
+| `ephemeral` | nothing | `signing_key_pem`, `signer_socket` |
+| `socket` | `signer_socket` | `signing_key_pem` from any layer (either env prefix, either config file) |
+
+Unset keeps the behaviour from before backends: an existing deployment that sets nothing new
+starts exactly as it did. With `socket`, siwx-oidc holds no private key and never generates one:
+at start it asks the signer for its public key and exits non-zero if that fails, if the
+signer names a `kid` other than the one its public key derives to, signs for an issuer other
+than `base_url`, or would refuse the `id_token_ttl_secs` in use (0, or above the signer's
+lifetime limit). Every signature the signer returns is verified against that key before it is
+used. When a signature cannot be had (the signer down, slow or misbehaving), the token endpoint
+answers its retryable 503 (the code or approved device code stays redeemable, and nothing it
+issued stays behind), signed userinfo answers 503, the DID profile field is not written (the
+next sign-in re-asserts it), and a back-channel logout stays queued without spending a delivery
+attempt. A signer that refuses the token itself is a 500 without `Retry-After`. A client may
+register no `userinfo_signed_response_alg` other than `ES256` under `socket`.
+`retired_signing_keys_pem` works with every backend. Setup and the protocol:
+[signer.md](signer.md).
 
 #### Key rotation
 

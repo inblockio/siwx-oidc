@@ -260,7 +260,8 @@ pub struct Config {
     pub port: u16,
     pub base_url: Url,
     /// PKCS#8 PEM for the ES256 (P-256 ECDSA) signing key.
-    /// If absent, a random key is generated on startup.
+    /// If absent, a random key is generated on startup. Refused with
+    /// `signing_backend = ephemeral` or `socket`.
     pub signing_key_pem: Option<String>,
     /// One or more **public** (SPKI `-----BEGIN PUBLIC KEY-----`) P-256 PEM
     /// blocks, concatenated, for signing keys this provider has RETIRED.
@@ -273,6 +274,23 @@ pub struct Config {
     ///
     /// Env: `SIWEOIDC_RETIRED_SIGNING_KEYS_PEM`
     pub retired_signing_keys_pem: Option<String>,
+    /// Where the signing key is held: `pem` (this process, from
+    /// `signing_key_pem`), `ephemeral` (generated at start) or `socket` (the
+    /// `siwx-signer` process at `signer_socket`). Unset keeps the behaviour
+    /// from before backends: `pem` when `signing_key_pem` is set, else
+    /// `ephemeral`. See [`Config::signing_backend`].
+    ///
+    /// Env: `SIWXOIDC_SIGNING_BACKEND`
+    pub signing_backend: Option<SigningBackendKind>,
+    /// The `siwx-signer` socket, for `signing_backend = socket` only.
+    ///
+    /// Env: `SIWXOIDC_SIGNER_SOCKET`
+    pub signer_socket: Option<PathBuf>,
+    /// The bound on one signer round trip, in milliseconds (`socket` only).
+    /// A signature not had in time fails the request with a 503.
+    ///
+    /// Env: `SIWXOIDC_SIGNER_TIMEOUT_MS`
+    pub signer_timeout_ms: u64,
     /// Redis holding sessions, codes, tokens, clients and passkeys. A password goes in
     /// the URL's user information or, to keep it out of the environment, in
     /// `redis_password_file`, never both.
@@ -697,6 +715,99 @@ impl Config {
     }
 }
 
+/// The values `signing_backend` takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SigningBackendKind {
+    Pem,
+    Ephemeral,
+    Socket,
+}
+
+/// The signing backend start-up builds, resolved from `signing_backend`,
+/// `signing_key_pem`, `signer_socket` and `signer_timeout_ms`. Holds no key
+/// material: the `pem` backend reads `signing_key_pem` itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SigningBackend {
+    /// The key from `signing_key_pem`, held in this process.
+    Pem,
+    /// A key generated at start, held in this process until it exits.
+    Ephemeral,
+    /// The `siwx-signer` process at `path`; each round trip bounded by `timeout`.
+    Socket {
+        path: PathBuf,
+        timeout: std::time::Duration,
+    },
+}
+
+impl Config {
+    /// The signing backend, or why the configuration is refused at start.
+    ///
+    /// | `signing_backend` | needs | refuses |
+    /// |---|---|---|
+    /// | unset | nothing (`pem` with `signing_key_pem`, else `ephemeral`) | `signer_socket` |
+    /// | `pem` | `signing_key_pem` | `signer_socket` |
+    /// | `ephemeral` | nothing | `signing_key_pem`, `signer_socket` |
+    /// | `socket` | `signer_socket`, a non-zero `signer_timeout_ms` | `signing_key_pem` |
+    ///
+    /// `signing_key_pem` is refused whatever layer set it (either env prefix or
+    /// either config file): the figment merges them all into this one field.
+    /// A `signer_socket` without `socket` is refused rather than ignored: an
+    /// operator who set it meant the key to live elsewhere, and silently
+    /// signing with a key in this process would defeat that.
+    pub fn signing_backend(&self) -> Result<SigningBackend, String> {
+        let pem = self.signing_key_pem.is_some();
+        let kind = match self.signing_backend {
+            Some(kind) => kind,
+            None if pem => SigningBackendKind::Pem,
+            None => SigningBackendKind::Ephemeral,
+        };
+        if kind != SigningBackendKind::Socket && self.signer_socket.is_some() {
+            return Err(
+                "signer_socket (SIWXOIDC_SIGNER_SOCKET) is set but signing_backend is \
+                 not `socket`: set SIWXOIDC_SIGNING_BACKEND=socket to sign through the \
+                 signer, or unset SIWXOIDC_SIGNER_SOCKET."
+                    .to_string(),
+            );
+        }
+        match kind {
+            SigningBackendKind::Pem if !pem => Err("signing_backend = pem needs \
+                 signing_key_pem (SIWXOIDC_SIGNING_KEY_PEM)."
+                .to_string()),
+            SigningBackendKind::Pem => Ok(SigningBackend::Pem),
+            SigningBackendKind::Ephemeral if pem => Err("signing_backend = ephemeral refuses \
+                 a configured signing_key_pem. Unset it (SIWXOIDC_SIGNING_KEY_PEM, \
+                 SIWEOIDC_SIGNING_KEY_PEM and the entry in siwx-oidc.toml or siwe-oidc.toml), \
+                 or set signing_backend = pem."
+                .to_string()),
+            SigningBackendKind::Ephemeral => Ok(SigningBackend::Ephemeral),
+            SigningBackendKind::Socket if pem => Err("signing_backend = socket refuses \
+                 signing_key_pem from every layer, because the signer process holds the key \
+                 and this process must hold none. Remove it (SIWXOIDC_SIGNING_KEY_PEM, \
+                 SIWEOIDC_SIGNING_KEY_PEM and the entry in siwx-oidc.toml or siwe-oidc.toml)."
+                .to_string()),
+            SigningBackendKind::Socket => {
+                let path = self.signer_socket.clone().ok_or_else(|| {
+                    "signing_backend = socket needs signer_socket (SIWXOIDC_SIGNER_SOCKET), \
+                     the path of the siwx-signer socket."
+                        .to_string()
+                })?;
+                if self.signer_timeout_ms == 0 {
+                    return Err(
+                        "signer_timeout_ms (SIWXOIDC_SIGNER_TIMEOUT_MS) must be at least 1: \
+                         a zero bound fails every signature."
+                            .to_string(),
+                    );
+                }
+                Ok(SigningBackend::Socket {
+                    path,
+                    timeout: std::time::Duration::from_millis(self.signer_timeout_ms),
+                })
+            }
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -705,6 +816,9 @@ impl Default for Config {
             base_url: Url::parse("http://127.0.0.1:8000").unwrap(),
             signing_key_pem: None,
             retired_signing_keys_pem: None,
+            signing_backend: None,
+            signer_socket: None,
+            signer_timeout_ms: 2000,
             redis_url: Url::parse("redis://localhost").unwrap(),
             redis_password_file: None,
             default_clients: HashMap::default(),
@@ -1378,6 +1492,171 @@ mod tests {
             shortest.grant_lifetime().unwrap().cap_for("a"),
             Some(MIN_GRANT_ABSOLUTE_LIFETIME_SECS)
         );
+    }
+
+    // -- signing_backend ------------------------------------------------------
+
+    /// A stand-in for a PEM: `signing_backend` judges presence, never content.
+    const PEM_FIXTURE: &str = "not-a-secret-test-fixture";
+
+    fn backend_of(jail: &mut Jail) -> Result<SigningBackend, String> {
+        let _ = jail;
+        figment()
+            .extract::<Config>()
+            .map_err(|e| e.to_string())?
+            .signing_backend()
+    }
+
+    #[test]
+    fn an_unset_backend_keeps_the_behaviour_from_before_backends() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            assert_eq!(backend_of(jail), Ok(SigningBackend::Ephemeral));
+            jail.set_env("SIWXOIDC_SIGNING_KEY_PEM", PEM_FIXTURE);
+            assert_eq!(backend_of(jail), Ok(SigningBackend::Pem));
+            Ok(())
+        });
+        assert_eq!(Config::default().signing_backend, None);
+        assert_eq!(Config::default().signer_timeout_ms, 2000);
+    }
+
+    #[test]
+    fn pem_needs_a_pem_and_ephemeral_refuses_one_from_any_layer() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.set_env("SIWXOIDC_SIGNING_BACKEND", "pem");
+            assert!(backend_of(jail)
+                .unwrap_err()
+                .contains("needs signing_key_pem"));
+            jail.set_env("SIWXOIDC_SIGNING_KEY_PEM", PEM_FIXTURE);
+            assert_eq!(backend_of(jail), Ok(SigningBackend::Pem));
+
+            jail.set_env("SIWXOIDC_SIGNING_BACKEND", "ephemeral");
+            assert!(backend_of(jail).unwrap_err().contains("ephemeral refuses"));
+            Ok(())
+        });
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.set_env("SIWXOIDC_SIGNING_BACKEND", "ephemeral");
+            assert_eq!(backend_of(jail), Ok(SigningBackend::Ephemeral));
+            jail.create_file(
+                LEGACY_CONFIG_FILE,
+                &format!("[default]\nsigning_key_pem = \"{PEM_FIXTURE}\"\n"),
+            )?;
+            assert!(backend_of(jail).unwrap_err().contains("ephemeral refuses"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn socket_needs_a_socket_and_a_timeout_and_reads_both() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.set_env("SIWXOIDC_SIGNING_BACKEND", "socket");
+            assert!(backend_of(jail)
+                .unwrap_err()
+                .contains("needs signer_socket"));
+            jail.set_env("SIWXOIDC_SIGNER_SOCKET", "/run/siwx-signer/signer.sock");
+            assert_eq!(
+                backend_of(jail),
+                Ok(SigningBackend::Socket {
+                    path: PathBuf::from("/run/siwx-signer/signer.sock"),
+                    timeout: std::time::Duration::from_millis(2000),
+                })
+            );
+            jail.set_env("SIWXOIDC_SIGNER_TIMEOUT_MS", 750);
+            assert_eq!(
+                backend_of(jail),
+                Ok(SigningBackend::Socket {
+                    path: PathBuf::from("/run/siwx-signer/signer.sock"),
+                    timeout: std::time::Duration::from_millis(750),
+                })
+            );
+            jail.set_env("SIWXOIDC_SIGNER_TIMEOUT_MS", 0);
+            assert!(backend_of(jail).unwrap_err().contains("at least 1"));
+            Ok(())
+        });
+        // The legacy prefix names the backend too, as it names every setting.
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.set_env("SIWEOIDC_SIGNING_BACKEND", "socket");
+            jail.set_env("SIWEOIDC_SIGNER_SOCKET", "/run/siwx-signer/signer.sock");
+            assert!(matches!(
+                backend_of(jail),
+                Ok(SigningBackend::Socket { .. })
+            ));
+            Ok(())
+        });
+    }
+
+    /// The socket backend refuses a PEM whichever layer sets it: either env
+    /// prefix, either config file.
+    #[test]
+    fn socket_refuses_a_pem_from_every_layer() {
+        /// One layer that can carry `signing_key_pem`.
+        enum Layer {
+            Env(&'static str),
+            File(&'static str),
+        }
+        let layers = [
+            Layer::Env("SIWXOIDC_SIGNING_KEY_PEM"),
+            Layer::Env("SIWEOIDC_SIGNING_KEY_PEM"),
+            Layer::File(CONFIG_FILE),
+            Layer::File(LEGACY_CONFIG_FILE),
+        ];
+        for (n, layer) in layers.iter().enumerate() {
+            Jail::expect_with(|jail| {
+                scrub_config_env(jail);
+                jail.set_env("SIWXOIDC_SIGNING_BACKEND", "socket");
+                jail.set_env("SIWXOIDC_SIGNER_SOCKET", "/run/siwx-signer/signer.sock");
+                assert!(backend_of(jail).is_ok(), "layer {n}: fine without a PEM");
+                match layer {
+                    Layer::Env(name) => jail.set_env(name, PEM_FIXTURE),
+                    Layer::File(name) => {
+                        jail.create_file(
+                            name,
+                            &format!("[default]\nsigning_key_pem = \"{PEM_FIXTURE}\"\n"),
+                        )?;
+                    }
+                }
+                let err = backend_of(jail).expect_err("a PEM is refused");
+                assert!(err.contains("socket refuses"), "layer {n}: {err}");
+                assert!(
+                    !err.contains(PEM_FIXTURE),
+                    "the refusal names no value: {err}"
+                );
+                Ok(())
+            });
+        }
+    }
+
+    #[test]
+    fn a_signer_socket_without_the_socket_backend_is_refused() {
+        for backend in [None, Some("pem"), Some("ephemeral")] {
+            Jail::expect_with(|jail| {
+                scrub_config_env(jail);
+                if backend != Some("ephemeral") {
+                    jail.set_env("SIWXOIDC_SIGNING_KEY_PEM", PEM_FIXTURE);
+                }
+                if let Some(backend) = backend {
+                    jail.set_env("SIWXOIDC_SIGNING_BACKEND", backend);
+                }
+                jail.set_env("SIWXOIDC_SIGNER_SOCKET", "/run/siwx-signer/signer.sock");
+                let err = backend_of(jail).expect_err("a stray socket is refused");
+                assert!(err.contains("signer_socket"), "{backend:?}: {err}");
+                Ok(())
+            });
+        }
+    }
+
+    #[test]
+    fn an_unknown_backend_is_a_start_error() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.set_env("SIWXOIDC_SIGNING_BACKEND", "hsm");
+            assert!(figment().extract::<Config>().is_err());
+            Ok(())
+        });
     }
 
     // -- Secrets from files -----------------------------------------------------------

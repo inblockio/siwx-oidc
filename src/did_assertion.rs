@@ -113,7 +113,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Once;
 use tracing::{debug, warn};
 
-use crate::oidc::EcdsaSigningKey;
+use siwx_oidc::signing::{ProviderSigner, Purpose, SignError};
 
 /// The MSC4133 custom profile field that carries the provider-attested DID.
 ///
@@ -202,8 +202,10 @@ static EPHEMERAL_MINT_WARNED: Once = Once::new();
 
 /// Mint a compact ES256 JWS binding `did` to `mxid`.
 ///
-/// Returns `None` — and mints nothing — when the provider's signing key is
-/// ephemeral.
+/// Returns `Ok(None)`, and mints nothing, when the provider's signing key is
+/// ephemeral, and an error when the signer fails (the `socket` backend down,
+/// slow, or answering with something that does not verify): never a proof
+/// that is not a good signature.
 ///
 /// # Why the ephemeral gate is here and not at the call site
 ///
@@ -232,13 +234,13 @@ static EPHEMERAL_MINT_WARNED: Once = Once::new();
 /// rather than folded into the `Option`. Folding it in would make `None`
 /// ambiguous between "ephemeral key" (expected, benign) and "serialization
 /// broke" (impossible, and if it ever happened, silent).
-pub fn mint_did_assertion(
-    key: &EcdsaSigningKey,
+pub async fn mint_did_assertion(
+    key: &dyn ProviderSigner,
     issuer: &str,
     did: &str,
     mxid: &str,
     now: i64,
-) -> Option<String> {
+) -> Result<Option<String>, SignError> {
     if key.is_ephemeral() {
         EPHEMERAL_MINT_WARNED.call_once(|| {
             warn!(
@@ -253,7 +255,7 @@ pub fn mint_did_assertion(
             mxid = %mxid,
             "DID assertion suppressed: ephemeral signing key"
         );
-        return None;
+        return Ok(None);
     }
 
     let header = DidAssertionHeader {
@@ -283,17 +285,19 @@ pub fn mint_did_assertion(
         URL_SAFE_NO_PAD.encode(&payload_json)
     );
 
-    let signature = key.sign_es256(signing_input.as_bytes());
+    let signature = key
+        .sign(Purpose::DidProof, signing_input.as_bytes())
+        .await?;
     debug_assert_eq!(
         signature.len(),
         64,
         "ES256 JWS signatures are raw r||s (64 bytes), never DER"
     );
 
-    Some(format!(
+    Ok(Some(format!(
         "{signing_input}.{}",
         URL_SAFE_NO_PAD.encode(&signature)
-    ))
+    )))
 }
 
 /// Everything the DID-publication side effect needs, bundled so a sign-in path
@@ -321,7 +325,7 @@ pub fn mint_did_assertion(
 pub struct DidPublication<'a> {
     /// The provider's ES256 signing key. Whether it is durable enough to mint a
     /// `proof` is decided inside [`mint_did_assertion`], never here.
-    pub key: &'a EcdsaSigningKey,
+    pub key: &'a dyn ProviderSigner,
     /// The OIDC issuer URL (`config.base_url`), written verbatim into `iss`.
     ///
     /// It must be the value a consumer's OIDC discovery document reports as
@@ -348,6 +352,14 @@ pub struct DidPublication<'a> {
 /// verification error — so an operator can tell "this deployment has no
 /// configured signing key" apart from "this proof is bad" without reading logs.
 ///
+/// # A signer failure fails the whole value, not just the `proof`
+///
+/// When the key is durable but the signature cannot be had (the `socket`
+/// backend down or misbehaving), this returns the error and nothing is
+/// written: `{"did": …}` without a `proof` would replace a good proof already
+/// in the profile with none. The caller skips the write and the next sign-in
+/// re-asserts the field.
+///
 /// Do not "improve" this by emitting `"proof": null` or `"proof": ""`: the
 /// consumer filters an empty string back out (`siwx-oidc-auth`'s
 /// `.filter(|s| !s.is_empty())`), so both spellings would land in the same
@@ -367,13 +379,13 @@ pub struct DidPublication<'a> {
 /// default (`require_auth_for_profile_requests`, Synapse v1.159.0
 /// `config/server.py:561`) and custom fields federate. Anything this function
 /// returns is world-readable, forever. Plan invariant 4.
-pub fn did_profile_value(
-    key: &EcdsaSigningKey,
+pub async fn did_profile_value(
+    key: &dyn ProviderSigner,
     issuer: &str,
     did: &str,
     mxid: &str,
     now: i64,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, SignError> {
     let mut value = serde_json::Map::new();
     // Exact case. A `did:key` multibase payload carries meaning in its case and
     // is NOT recoverable from the (lowercased) Matrix localpart — "MXID to DID
@@ -382,10 +394,10 @@ pub fn did_profile_value(
         "did".to_string(),
         serde_json::Value::String(did.to_string()),
     );
-    if let Some(proof) = mint_did_assertion(key, issuer, did, mxid, now) {
+    if let Some(proof) = mint_did_assertion(key, issuer, did, mxid, now).await? {
         value.insert("proof".to_string(), serde_json::Value::String(proof));
     }
-    serde_json::Value::Object(value)
+    Ok(serde_json::Value::Object(value))
 }
 
 /// Verify a DID assertion against a public key that the caller has ALREADY
@@ -512,6 +524,7 @@ mod tests {
     use p256::ecdsa::SigningKey as P256SigningKey;
     use p256::pkcs8::DecodePrivateKey;
     use serde_json::Value;
+    use siwx_oidc::signing::EcdsaSigningKey;
 
     const ISSUER: &str = "https://siwx-oidc.inblock.io";
     /// Mixed case ON PURPOSE. `did:key` multibase payloads are case-sensitive;
@@ -533,8 +546,24 @@ mod tests {
         (key, vk)
     }
 
+    /// Drive a minter future to completion in a synchronous test. The
+    /// in-process key answers at once; nothing here waits on I/O.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime builds")
+            .block_on(future)
+    }
+
     fn mint(key: &EcdsaSigningKey) -> String {
-        mint_did_assertion(key, ISSUER, DID, MXID, IAT).expect("durable key must mint")
+        block_on(mint_did_assertion(key, ISSUER, DID, MXID, IAT))
+            .expect("an in-process key never fails to sign")
+            .expect("durable key must mint")
+    }
+
+    fn profile_value(key: &EcdsaSigningKey, issuer: &str, mxid: &str) -> Value {
+        block_on(did_profile_value(key, issuer, DID, mxid, IAT))
+            .expect("an in-process key never fails to sign")
     }
 
     fn decode_part(part: &str) -> Value {
@@ -578,7 +607,9 @@ mod tests {
         let key = EcdsaSigningKey::generate();
         assert!(key.is_ephemeral(), "generate() must mark the key ephemeral");
         assert!(
-            mint_did_assertion(&key, ISSUER, DID, MXID, IAT).is_none(),
+            block_on(mint_did_assertion(&key, ISSUER, DID, MXID, IAT))
+                .unwrap()
+                .is_none(),
             "an ephemeral key must never mint a durable assertion"
         );
     }
@@ -591,7 +622,9 @@ mod tests {
             !key.is_ephemeral(),
             "from_pem() must mark the key as durable"
         );
-        assert!(mint_did_assertion(&key, ISSUER, DID, MXID, IAT).is_some());
+        assert!(block_on(mint_did_assertion(&key, ISSUER, DID, MXID, IAT))
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -816,7 +849,7 @@ mod tests {
     #[test]
     fn h1_did_profile_value_is_did_plus_proof() {
         let (key, vk) = durable_key();
-        let value = did_profile_value(&key, ISSUER, DID, MXID, IAT);
+        let value = profile_value(&key, ISSUER, MXID);
         let obj = value.as_object().expect("the field value is a JSON object");
 
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
@@ -853,7 +886,7 @@ mod tests {
     fn h5_ephemeral_key_publishes_a_did_with_no_proof_key() {
         let key = EcdsaSigningKey::generate();
         assert!(key.is_ephemeral());
-        let value = did_profile_value(&key, ISSUER, DID, MXID, IAT);
+        let value = profile_value(&key, ISSUER, MXID);
         let obj = value.as_object().expect("the field value is a JSON object");
 
         let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
@@ -874,7 +907,7 @@ mod tests {
     fn did_profile_value_binds_the_mxid_it_was_given() {
         let (key, vk) = durable_key();
         let other_mxid = "@zzzzzzzzzzzzzzzz:inblock.io";
-        let value = did_profile_value(&key, ISSUER, DID, other_mxid, IAT);
+        let value = profile_value(&key, ISSUER, other_mxid);
         let claims =
             verify_with_key(value["proof"].as_str().unwrap(), &vk).expect("proof must verify");
         assert_eq!(claims.mxid, other_mxid);
@@ -900,8 +933,8 @@ mod tests {
 /// # Why it lives here and not in `tests/`
 ///
 /// `tests/*.rs` integration tests link against the `siwx_oidc` **library**
-/// crate (`src/lib.rs`), and both the minter and `EcdsaSigningKey` live in the
-/// **binary** crate's module tree (`src/main.rs`). A file under `tests/`
+/// crate (`src/lib.rs`), and the minter lives in the **binary** crate's module
+/// tree (`src/main.rs`). A file under `tests/`
 /// literally cannot name `mint_did_assertion`. A `#[cfg(test)]` module in the
 /// binary can, and `[dev-dependencies]` are linked for it — which is what makes
 /// the cross-crate call possible at all. (The same reasoning is already
@@ -911,6 +944,7 @@ mod interop_with_the_shipped_verifier {
     use super::*;
     use axum::routing::get;
     use axum::{Json, Router};
+    use siwx_oidc::signing::EcdsaSigningKey;
     use siwx_oidc_auth::did_assertion::{verify_did_assertion, DidAssertionError};
     use tokio::net::TcpListener;
 
@@ -964,7 +998,9 @@ mod interop_with_the_shipped_verifier {
         let key = EcdsaSigningKey::from_pem(&test_p256_pem()).expect("test PEM must load");
         let (issuer, handle) = spawn_issuer(&key).await;
 
-        let value = did_profile_value(&key, &issuer, DID, MXID, IAT);
+        let value = did_profile_value(&key, &issuer, DID, MXID, IAT)
+            .await
+            .expect("an in-process key never fails to sign");
         let proof = value["proof"]
             .as_str()
             .expect("a durable key must publish a proof");
@@ -987,6 +1023,97 @@ mod interop_with_the_shipped_verifier {
         handle.abort();
     }
 
+    /// H8 for the `socket` backend: a proof the `siwx-signer` process made
+    /// verifies in the shipped verifier against the published JWKS, and the
+    /// JWKS of the socket backend is the document the in-process key publishes.
+    /// With the signer stopped no value is built at all.
+    #[tokio::test]
+    async fn h8_a_socket_signed_assertion_verifies_in_the_client_crate() {
+        use siwx_oidc::signing::socket::SocketSigner;
+        use siwx_oidc::test_support::TestSigner;
+        let key = EcdsaSigningKey::from_pem(&test_p256_pem()).expect("test PEM must load");
+        let (issuer, handle) = spawn_issuer(&key).await;
+        // The issuer as siwx-oidc writes it (`base_url` read as a URL).
+        let iss = format!("{issuer}/");
+        let mut options = TestSigner::options();
+        options.issuer = iss.clone();
+        let service = TestSigner::start(key.clone(), options);
+        let signer = SocketSigner::connect(&service.socket, std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(crate::oidc::jwks(&signer, &[]).unwrap()).unwrap(),
+            serde_json::to_value(crate::oidc::jwks(&key, &[]).unwrap()).unwrap(),
+            "the socket backend publishes the same JWKS as the key it fronts"
+        );
+
+        let now = chrono::Utc::now().timestamp();
+        let value = did_profile_value(&signer, &iss, DID, MXID, now)
+            .await
+            .expect("the signer signs a DID proof of the emitted shape");
+        let proof = value["proof"].as_str().expect("a durable signer mints");
+        let verified = verify_did_assertion(&issuer, proof, MXID)
+            .await
+            .expect("the shipped verifier accepts a socket-signed assertion");
+        assert_eq!(verified.did(), DID);
+        assert_eq!(verified.mxid(), MXID);
+        assert_eq!(verified.issued_at(), now);
+
+        service.stop();
+        assert!(
+            did_profile_value(&signer, &iss, DID, MXID, now)
+                .await
+                .is_err(),
+            "no value, so no write, without a signature"
+        );
+        handle.abort();
+    }
+
+    /// AUDIT PR83 F3, end to end: a confused or compromised caller asks the
+    /// signer for a `userinfo` signature over a DID proof's payload (plus an
+    /// `aud`, which the userinfo shape requires). The signer signs it, and the
+    /// shipped verifier accepts the result as a provider-attested DID binding:
+    /// the `did_proof` shape (exact members, `typ` JWT, `sub` a DID) is not
+    /// what decides whether a DID proof can be had.
+    #[tokio::test]
+    async fn audit_pr83_a_userinfo_signature_is_not_a_did_proof() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use siwx_oidc::signing::socket::SocketSigner;
+        use siwx_oidc::signing::Purpose;
+        use siwx_oidc::test_support::TestSigner;
+        let key = EcdsaSigningKey::from_pem(&test_p256_pem()).expect("test PEM must load");
+        let (issuer, handle) = spawn_issuer(&key).await;
+        let iss = format!("{issuer}/");
+        let mut options = TestSigner::options();
+        options.issuer = iss.clone();
+        let service = TestSigner::start(key.clone(), options);
+        let signer = SocketSigner::connect(&service.socket, std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let header = serde_json::json!({"alg": "ES256", "typ": "JWT", "kid": key.kid()});
+        let payload = serde_json::json!({"iss": iss, "aud": "any-client", "sub": DID,
+            "mxid": MXID, "iat": now});
+        let input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap()),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
+        );
+        let outcome = signer.sign(Purpose::Userinfo, input.as_bytes()).await;
+        let accepted = match outcome {
+            Err(_) => false,
+            Ok(sig) => {
+                let proof = format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig));
+                verify_did_assertion(&issuer, &proof, MXID).await.is_ok()
+            }
+        };
+        handle.abort();
+        assert!(
+            !accepted,
+            "a signature asked for as `userinfo` must not verify as a DID proof"
+        );
+    }
+
     /// H6/H8: the replay guard holds across the crate boundary too.
     ///
     /// This is the whole security property of the `mxid` claim: user B copies
@@ -1001,7 +1128,9 @@ mod interop_with_the_shipped_verifier {
         let key = EcdsaSigningKey::from_pem(&test_p256_pem()).expect("test PEM must load");
         let (issuer, handle) = spawn_issuer(&key).await;
 
-        let value = did_profile_value(&key, &issuer, DID, MXID, IAT);
+        let value = did_profile_value(&key, &issuer, DID, MXID, IAT)
+            .await
+            .expect("an in-process key never fails to sign");
         let proof = value["proof"].as_str().unwrap();
 
         // Control leg: the same proof DOES verify for the account it names, so
@@ -1032,10 +1161,12 @@ mod interop_with_the_shipped_verifier {
     /// `SIWEOIDC_SIGNING_KEY_PEM`; a verification failure means "this proof is
     /// not acceptable", which they investigate. This asserts the server's
     /// omission lands in the consumer's intended bucket.
-    #[test]
-    fn h5_proofless_object_maps_to_the_consumers_proof_absent_discriminator() {
+    #[tokio::test]
+    async fn h5_proofless_object_maps_to_the_consumers_proof_absent_discriminator() {
         let key = EcdsaSigningKey::generate();
-        let value = did_profile_value(&key, "https://issuer.example", DID, MXID, IAT);
+        let value = did_profile_value(&key, "https://issuer.example", DID, MXID, IAT)
+            .await
+            .expect("an in-process key never fails to sign");
         assert!(
             value.get("proof").is_none(),
             "precondition: an ephemeral key publishes no proof"

@@ -23,7 +23,7 @@ notice. There are no tagged releases yet; `main` is what runs.
 ## Code map
 
 Workspace: the root package `siwx-oidc` (library crate `siwx_oidc` in `src/lib.rs`, binaries
-`siwx-oidc` and `migrate-credentials`) plus `siwx-oidc-auth/`. Crypto comes from the external
+`siwx-oidc`, `migrate-credentials` and `siwx-signer`) plus `siwx-oidc-auth/`. Crypto comes from the external
 crate [aqua-auth](https://github.com/inblockio/aqua-auth), pinned by tag in both manifests.
 Modules marked **lib** are compiled into the library crate, so `tests/*.rs` can link them;
 everything else exists only in the binary crate.
@@ -34,7 +34,7 @@ everything else exists only in the binary crate.
 | `lib.rs` | Library crate root. `synapse_client` is deliberately not re-exported (see Invariants). |
 | `axum_lib.rs` | Startup: loads config through `config::figment()`, validates it (DID methods and pkh namespaces against the aqua-auth registries, signing key, retired keys, WebAuthn), `store_default_clients` (digested, no expiry, prunes the clients the map no longer names), `AppState`, the router, handler glue, the `siwx_user` / `acct_session` cookies, the CORS layer. |
 | `config.rs` | `Config`, its defaults, and `figment()`: the one place config names and precedence are defined. `Config::read_secret_files` reads `mas_shared_secret_file` and `redis_password_file` once at start. `Config` is deliberately not `Debug` (it holds secrets). Reference: [docs/configuration.md](docs/configuration.md). |
-| `oidc.rs` | OIDC core: discovery, JWKS, `authorize`, `sign_in`, `token` (authorization-code, refresh-token and device-code grants; `authenticate_code_client` and `authenticate_refresh_client` authenticate the client for the first two, and `client_is_confidential` decides which clients must present a secret; `exchange_issuance` decides what a code exchange issues, by deployment mode and client class), `userinfo`, client registration, RP-initiated logout (`end_session`, `verify_id_token_hint`), `EcdsaSigningKey` (ES256, key-derived `kid`), retired-key parsing, ENS claims, `provision_synapse_account` (the account half of provisioning and the single DID-publication site) and `provision_synapse_device` (calls it, then adds the device half). |
+| `oidc.rs` | OIDC core: discovery, JWKS, `authorize`, `sign_in`, `token` (authorization-code, refresh-token and device-code grants; `authenticate_code_client` and `authenticate_refresh_client` authenticate the client for the first two, and `client_is_confidential` decides which clients must present a secret; `exchange_issuance` decides what a code exchange issues, by deployment mode and client class), `userinfo`, client registration, RP-initiated logout (`end_session`, `verify_id_token_hint`), retired-key parsing, ENS claims, `provision_synapse_account` (the account half of provisioning and the single DID-publication site) and `provision_synapse_device` (calls it, then adds the device half). |
 | `introspect.rs` | `POST /oauth2/introspect` (RFC 7662) for Synapse, inactive for an `oidc` grant's token; opaque `mat_`/`mcr_` token generation. |
 | `admin_token.rs` | `POST /oauth2/admin_token`: short-TTL token whose scope carries `urn:synapse:admin:*`. |
 | `compat.rs` | `POST /oauth2/revoke` (RFC 7009) and the Matrix client-server endpoints siwx-oidc answers (login flows, logout, logout/all, refresh, device deletion); `TeardownPolicy`, and `CompatState` (`new`, `acts_on`) with which grants the Matrix routes act on. |
@@ -49,6 +49,7 @@ everything else exists only in the binary crate.
 | `mxid.rs` (lib) | Pure localpart derivation: `localpart_for`, `legacy_localpart`, `canonicalize`. `sha2` only. |
 | `redact.rs` (lib) | `fingerprint`, `redact_key`, `redact_url`: what a log line may say about a credential. `redact_url` rebuilds a URL from scheme, host, port and path, so a password in the user information, the `pass` query of a unix-socket URL or a fragment never survives. |
 | `secret_file.rs` (lib) | Secrets read from mounted files: `read` (an absolute path to a regular file, so a named pipe cannot block start-up; one trailing line ending removed, and what is left must not be empty, start or end with whitespace, hold a control character or start with a BOM, because Synapse strips surrounding whitespace from the file it shares; every error names the setting and, for an absolute path, the path, and never content, and a path that is not absolute is not shown), `redis_url_with_password_file` (the one rule for every Redis password file: a URL that already carries a password and every unix-socket scheme are refused, because the client reads a unix-socket password only from `pass`), `url_with_password` (`Url::set_password` leaves `%` alone, so it encodes `%` first; without that the Redis client decodes `%41` to `A`), `url_carries_password`, `both_set`. |
+| `signing/` (lib) | The provider's signing interface `ProviderSigner` and its backends (`signing_backend`): `EcdsaSigningKey` (ES256, key-derived `kid`, `fingerprint_of_public`, `verification_jwk`; `pem` and `ephemeral`) and `socket::SocketSigner` (`socket`); `sign_jwt` and `CaptureKey`, which sign an openidconnect token through an async backend. `protocol.rs` (the `siwx-signer` wire protocol), `shape.rs` (what the signer signs, per purpose), `server.rs` (the signer's socket service, `bind`). In the library so `siwx-signer` reuses the key type and the `kid` derivation. Guide: [docs/signer.md](docs/signer.md). |
 | `alias.rs` (lib) | `alias_for(did)`: the generated `Firstname Surname` a new account is seeded with. |
 | `credential_identity.rs` (lib) | Which identity a stored passkey authenticates: a `webauthn:link/*` entry overrides the derived `did:key`. |
 | `credential_store.rs` (lib) | Optional aqua-auth credential store, dual-write and read-through, enabled by `AQUA_WEBAUTHN_REDIS_URL` (its password may come from the file `AQUA_WEBAUTHN_REDIS_PASSWORD_FILE`: `resolve_url`, under the rules of `redis_password_file`); `did_has_credential_bounded`, the scan-bounded passkey check of the device page. |
@@ -61,6 +62,7 @@ everything else exists only in the binary crate.
 | `db/tokens.rs` (lib) | Token formats (`mat_`, `msa_`, `mcr_{handle}_{secret}`), `parse_refresh_token` (never panics), `digest` (the SHA-256 every credential a client holds is stored as). |
 | `db/seal.rs` (lib) | The sealed successor pair: AES-256-GCM under a key HKDF-derived from the previous refresh token, so only its presenter can open it. |
 | `bin/migrate-credentials.rs` | Operator tool for the credential backfill. Dry run unless `--apply`. |
+| `bin/siwx-signer.rs` | The signer process for `signing_backend = socket`: `serve`, `self-test`, `keygen`, `kid`. Non-dumpable, prints no key bytes. |
 
 | `siwx-oidc-auth/src/` | Role |
 |---|---|
@@ -99,13 +101,14 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 
 - **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
   mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
-  `cargo test --workspace` runs the unit tests of both crates plus 52 tests in thirteen files:
+  `cargo test --workspace` runs the unit tests of both crates plus 66 tests in fifteen files:
   `openapi_covers_every_route` (2), `localpart_vectors` (1), `graceful_shutdown` (7),
   `static_client_startup` (10), `secret_files_startup` (12, one of which serves requests from
   database 3 of the test Redis), `audit_pr82_findings` (4, the pins of the audit of the
   secret-file change; one of them takes database 1 of the test Redis),
-  `log_hygiene_credential_store` (1) and
-  `log_capture_callsite_interest` (1), which need nothing; `account_linking_dual_write` (6), which needs the test Redis, and `log_hygiene`
+  `log_hygiene_credential_store` (1),
+  `log_capture_callsite_interest` (1), `siwx_signer_cli` (10) and `signing_backend_startup` (4),
+  which need nothing; `account_linking_dual_write` (6), which needs the test Redis, and `log_hygiene`
   (4, one of them needs it);
   `credential_migration_live` (2), which needs its own disposable, empty Redis named by
   `MIGRATION_TEST_REDIS_URL`; and the pure check `an_absent_strict_skips_variable_means_strict`
@@ -236,16 +239,65 @@ doc; read it before changing the code the rule covers.
 
 ### Signing keys and DID assertions
 
-- **`kid` is derived from the public key** (`EcdsaSigningKey::fingerprint_of`). Both constructors
-  go through `with_derived_kid`. Do not add a `kid` parameter or make `kid` optional. Pin:
+- **Every private-key use goes through `ProviderSigner`** (`siwx_oidc::signing`): ID tokens,
+  signed userinfo, the DID assertion, logout tokens. openidconnect's `PrivateSigningKey::sign`
+  is synchronous, so its tokens are built against a `CaptureKey` and signed by `sign_jwt`, which
+  checks that the captured input is the token's `header.payload` and puts the real signature in
+  place of the placeholder. Never `block_in_place` (it panics on the current-thread test
+  runtime). Pin: `sign_jwt_signs_exactly_the_captured_header_and_payload_and_verifies_with_the_jwks`,
+  `the_capture_path_gives_the_in_process_key_byte_identical_tokens`.
+- **`signing_backend = socket`: siwx-oidc holds no private key.** It refuses `signing_key_pem` from
+  any layer, never generates a key, derives the `kid` itself from the signer's public key at start
+  and exits when the signer names another, exits when the signer's `public` answer names another
+  issuer than `base_url` or a lifetime limit below `id_token_ttl_secs` (or the logout token's), or
+  `id_token_ttl_secs` is 0, and verifies every signature against that key before using it. Unset
+  keeps the behaviour from before backends. Pin:
+  `socket_refuses_a_pem_from_every_layer`, `an_unset_backend_keeps_the_behaviour_from_before_backends`,
+  `connect_derives_the_kid_itself_and_refuses_a_signer_that_names_another`,
+  `connect_keeps_the_signers_issuer_and_limit_and_refuses_what_it_would_not_sign`,
+  `every_sign_answer_is_verified_and_a_bad_one_is_an_error_never_a_signature`,
+  `the_socket_backend_refuses_to_start_without_a_signer_or_with_a_pem`,
+  `the_socket_backend_refuses_a_signer_for_another_issuer_or_a_lifetime_it_will_not_sign`.
+- **A signature that cannot be had fails closed**: a retryable 503 at `/token` and at signed
+  userinfo, no DID field write (never `{did}` over a good proof), a logout kept queued without
+  spending an attempt. A refusal of the message itself (`shape`, a protocol refusal) is a 500
+  `server_error` without `Retry-After` (`SignError::is_retryable`), never the retryable 503. A
+  token request whose ID token cannot be signed leaves nothing behind that nobody holds: the
+  grant it issued is discarded with no logout queued (`discard_unanswered_grant`, a quiet
+  `drop_grant`), the authorization code is put back for the rest of its life (`restore_code`),
+  and a device-code poll deletes the Matrix device it created (never one that existed) and
+  releases its claim, so the retry redeems the same code. Pin:
+  `a_stopped_signer_is_a_retryable_503_at_the_token_endpoint_and_at_signed_userinfo`,
+  `a_shape_refusal_is_a_500_without_retry_after_never_the_retryable_503`,
+  `audit_pr83_a_code_exchange_retried_after_a_signer_outage_succeeds`,
+  `audit_pr83_a_device_grant_retried_after_a_signer_outage_is_redeemed`,
+  `a_failed_poll_never_deletes_a_device_it_did_not_create`,
+  `an_unanswered_grant_is_discarded_with_its_tokens_and_queues_no_logout`,
+  `with_the_signer_stopped_the_did_field_is_not_written`,
+  `through_the_socket_signer_a_logout_is_delivered_and_a_stopped_signer_spends_no_attempt`.
+- **`siwx-signer` signs only the shapes siwx-oidc emits** (`signing::shape`), and logs neither
+  key nor message bytes. A change to what a token carries (a new header member, a new `typ`, an
+  `exp` on the DID assertion, a claim userinfo or an ID token did not carry) must change the shape
+  check in the same change, or the `socket` backend answers a 500 for it. The purposes stay
+  disjoint: userinfo carries no time and no `nonce`, `at_hash`, `c_hash`, `auth_time`, `sid` or
+  `mxid`, and an ID token and a logout token no `mxid`, so no signature serves as an endless ID
+  token or a DID proof; a member named twice is refused. Pin: the `signing::shape` tests
+  (`no_purpose_signs_what_another_purpose_emits`, `audit_pr83_a_member_named_twice_is_refused`),
+  `audit_pr83_a_userinfo_signature_is_not_a_did_proof`, every test in
+  `oidc::signer_backend_tests`, `a_shape_refusal_and_a_signature_log_the_purpose_and_length_never_the_message`.
+- **`kid` is derived from the public key** (`signing::fingerprint_of_public`, through
+  `EcdsaSigningKey::fingerprint_of`; `siwx-signer` and the socket backend use the same function).
+  Both constructors go through `with_derived_kid`. Do not add a `kid` parameter or make `kid`
+  optional. Pin:
   `h4_two_generated_keys_get_different_kids`,
   `h4_the_same_pem_yields_the_same_kid_across_constructions`,
   `published_jwk_always_carries_the_derived_kid`.
 - **No `exp` in a DID assertion.** The binding is permanent. Pin: `payload_has_no_exp_claim`.
-- **ES256 signatures are raw `r‖s`, 64 bytes, never DER.** Pin:
-  `signature_is_64_raw_bytes_never_der`, which covers the DID-assertion signature only. ID
-  tokens share `sign_es256` by construction (`PrivateSigningKey::sign` delegates to it); no
-  separate test pins that.
+- **ES256 signatures are raw `r‖s`, 64 bytes, never DER.** Every backend signs with
+  `EcdsaSigningKey::sign_es256` (in this process, or in `siwx-signer`), and the socket backend
+  refuses any other length. Pin: `signature_is_64_raw_bytes_never_der`,
+  `sign_jwt_signs_exactly_the_captured_header_and_payload_and_verifies_with_the_jwks`,
+  `every_sign_answer_is_verified_and_a_bad_one_is_an_error_never_a_signature` (a DER answer).
 - **Claim and header order is struct declaration order**; those bytes are signed. Pin:
   `minted_jws_has_exactly_three_parts_and_the_exact_header`.
 - **An ephemeral key mints no assertion at all.** `mint_did_assertion` returns `None`.
@@ -850,7 +902,9 @@ doc; read it before changing the code the rule covers.
   and no `errcode`, never a 4xx.** Element Web (matrix-js-sdk) ends the session on any 4xx from
   the token endpoint and on any error body with an `errcode`, 5xx included; it retries every
   other failure. `TokenEndpointError` renders `ServiceUnavailable` and `Other` (a store error,
-  a dependency) this way, and the body names no internal error. A refresh whose rotation
+  a dependency) this way, and the body names no internal error. The one 500 is a signer's
+  refusal of the token (`signing_backend = socket`): `server_error` without `Retry-After`, no
+  `errcode`, because a retry fails the same way. A refresh whose rotation
   committed before the fault gets the same pair on the retry (I4). Pin:
   `a_store_fault_at_the_token_endpoint_is_a_retryable_503_without_an_errcode`,
   and for a refusal that is not a fault, `a_device_code_approved_before_an_epoch_is_invalid_grant`
@@ -949,7 +1003,9 @@ doc; read it before changing the code the rule covers.
   client id, `iat`, `exp` = `iat` + 120 s, a random `jti`, `sub` = the DID, `sid` when the grant
   has one, `events`; never a `nonce`) and POSTs `logout_token=…`; 200 and 204 are success,
   anything else is retried with exponential backoff, five attempts in all, then dropped with a
-  `warn!` naming the client and the grant fingerprint, never the URI or the token. A client that
+  `warn!` naming the client and the grant fingerprint, never the URI or the token. A token that
+  cannot be signed (the `socket` signer down) is not an attempt: nothing is sent, the entry stays
+  leased unchanged and is claimed again when the lease ends. A client that
   requires a `sid` gets no token for a grant without one. D4 (provisional): with
   `backchannel_logout_required_for_refresh`, generic-mode registration refuses a client that may
   refresh without a `backchannel_logout_uri`. Pin:

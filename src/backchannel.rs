@@ -52,10 +52,11 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 use url::{Host, Url};
 
-use crate::oidc::EcdsaSigningKey;
+use siwx_oidc::signing::{ProviderSigner, Purpose, SignError};
 
-/// The one event a logout token carries (§2.4).
-pub const BACKCHANNEL_LOGOUT_EVENT: &str = "http://schemas.openid.net/event/backchannel-logout";
+/// The one event a logout token carries (§2.4). Defined once, with the
+/// signer's shape check that requires it.
+pub use siwx_oidc::signing::shape::BACKCHANNEL_LOGOUT_EVENT;
 /// The JWS `typ` of a logout token (§2.4).
 pub const LOGOUT_TOKEN_TYP: &str = "logout+jwt";
 /// A logout token's lifetime: `exp` = `iat` + this.
@@ -90,13 +91,14 @@ struct LogoutClaims<'a> {
 }
 
 /// The logout token for `entry`, signed at `now` (Unix seconds) with a new
-/// random `jti`. `sid` is omitted, never empty, for a grant without one.
-pub fn mint_logout_token(
-    key: &EcdsaSigningKey,
+/// random `jti`. `sid` is omitted, never empty, for a grant without one. An
+/// error when the signer fails; the worker then keeps the entry queued.
+pub async fn mint_logout_token(
+    key: &dyn ProviderSigner,
     issuer: &str,
     entry: &LogoutEntry,
     now: i64,
-) -> String {
+) -> Result<String, SignError> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     let header = LogoutHeader {
@@ -119,8 +121,8 @@ pub fn mint_logout_token(
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).expect("encodable header")),
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).expect("encodable claims"))
     );
-    let signature = key.sign_es256(input.as_bytes());
-    format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature))
+    let signature = key.sign(Purpose::LogoutToken, input.as_bytes()).await?;
+    Ok(format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature)))
 }
 
 /// An address class delivery never connects to.
@@ -352,7 +354,7 @@ fn millis(d: Duration) -> u64 {
 #[derive(Clone)]
 pub struct Worker {
     pub redis: RedisClient,
-    pub signing_key: Arc<EcdsaSigningKey>,
+    pub signing_key: Arc<dyn ProviderSigner>,
     pub issuer: String,
     pub guard: UriGuard,
     pub policy: OutboxPolicy,
@@ -428,12 +430,23 @@ impl Worker {
             return;
         }
         let host = uri.host_str().unwrap_or_default().to_string();
-        let token = mint_logout_token(
-            &self.signing_key,
+        // A signing failure is not a delivery attempt: nothing was sent. The
+        // entry stays claimed, unchanged, and is claimed again when the lease
+        // ends, with its attempt count as it was.
+        let token = match mint_logout_token(
+            self.signing_key.as_ref(),
             &self.issuer,
             entry,
             chrono::Utc::now().timestamp(),
-        );
+        )
+        .await
+        {
+            Ok(token) => token,
+            Err(e) => {
+                warn!(client_id, grant, error = %e, "back-channel logout: signing failed, retried after the lease without spending an attempt");
+                return;
+            }
+        };
         let attempt = entry.attempt + 1;
         match deliver(&self.guard, &uri, &token).await {
             Ok(()) => {
@@ -482,6 +495,12 @@ mod tests {
     use std::sync::atomic::{AtomicU16, Ordering};
     use std::sync::Mutex;
 
+    /// Database 10 of the test Redis has two users, the two tests that run an outbox
+    /// [`Worker`]. A worker claims every due entry in its database, so the tests take turns
+    /// (Redis has 16 databases and every other number is taken: see
+    /// `test_support::redis_db`).
+    static DB_10: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn entry(sid: &str) -> LogoutEntry {
         LogoutEntry {
             client_id: "rp-1".into(),
@@ -509,7 +528,7 @@ mod tests {
         (decode(parts[0]), decode(parts[1]))
     }
 
-    fn verifying_key(key: &EcdsaSigningKey) -> VerifyingKey {
+    fn verifying_key(key: &siwx_oidc::signing::EcdsaSigningKey) -> VerifyingKey {
         use openidconnect::PrivateSigningKey;
         let jwk = serde_json::to_value(key.as_verification_key()).unwrap();
         let coord = |c: &str| URL_SAFE_NO_PAD.decode(jwk[c].as_str().unwrap()).unwrap();
@@ -519,10 +538,12 @@ mod tests {
         VerifyingKey::from_sec1_bytes(&sec1).unwrap()
     }
 
-    #[test]
-    fn the_logout_token_has_the_spec_header_claims_and_a_raw_signature() {
-        let key = EcdsaSigningKey::generate();
-        let token = mint_logout_token(&key, "https://op.example.org/", &entry("sid-1"), 1_000);
+    #[tokio::test]
+    async fn the_logout_token_has_the_spec_header_claims_and_a_raw_signature() {
+        let key = siwx_oidc::signing::EcdsaSigningKey::generate();
+        let token = mint_logout_token(&key, "https://op.example.org/", &entry("sid-1"), 1_000)
+            .await
+            .unwrap();
         let (header, claims) = verified(&token, &verifying_key(&key));
         assert_eq!(
             header,
@@ -555,12 +576,16 @@ mod tests {
         );
         let jti = claims["jti"].as_str().unwrap();
         assert!(jti.len() >= 22, "a random jti: {jti}");
-        let other = mint_logout_token(&key, "https://op.example.org/", &entry("sid-1"), 1_000);
+        let other = mint_logout_token(&key, "https://op.example.org/", &entry("sid-1"), 1_000)
+            .await
+            .unwrap();
         let (_, other) = verified(&other, &verifying_key(&key));
         assert_ne!(other["jti"], claims["jti"], "every token has its own jti");
 
         let (_, no_sid) = verified(
-            &mint_logout_token(&key, "https://op.example.org/", &entry(""), 1_000),
+            &mint_logout_token(&key, "https://op.example.org/", &entry(""), 1_000)
+                .await
+                .unwrap(),
             &verifying_key(&key),
         );
         assert!(
@@ -969,12 +994,107 @@ mod tests {
         g.sid
     }
 
+    /// The worker signs through the `socket` backend: the RP gets a token the
+    /// signer made, verifiable with its key. With the signer stopped nothing is
+    /// sent, the entry stays queued with its attempt count unchanged, and once
+    /// the lease ends a worker that can sign delivers it as its first attempt.
+    /// It shares database 10 with the worker test below and takes turns with it (`DB_10`).
+    #[tokio::test]
+    async fn through_the_socket_signer_a_logout_is_delivered_and_a_stopped_signer_spends_no_attempt(
+    ) {
+        use siwx_oidc::signing::socket::SocketSigner;
+        use siwx_oidc::test_support::TestSigner;
+        let _turn = DB_10.lock().await;
+        let Some(db) = siwx_oidc::test_support::redis_db(10).await else {
+            return;
+        };
+        let url = siwx_oidc::test_support::redis_db_url(10);
+        let mut conn = siwx_oidc::test_support::raw_connection(&url).await.unwrap();
+        let _: i64 = bb8_redis::redis::cmd("DEL")
+            .arg(siwx_oidc::db::outbox::KV_BACKCHANNEL_OUTBOX)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let (stub, addr) = stub_rp().await;
+        let uri = format!("http://127.0.0.1:{}/bcl", addr.port());
+        register_rp(&db, "rp-socket", &uri).await;
+
+        let key = siwx_oidc::signing::EcdsaSigningKey::generate();
+        let mut options = TestSigner::options();
+        options.issuer = "https://op.example.org/".to_string();
+        let service = TestSigner::start(key.clone(), options);
+        let signer = SocketSigner::connect(&service.socket, Duration::from_secs(2))
+            .await
+            .unwrap();
+        let lease = Duration::from_millis(300);
+        let worker = Worker {
+            redis: db.clone(),
+            signing_key: Arc::new(signer),
+            issuer: "https://op.example.org/".into(),
+            guard: UriGuard::new(&["127.0.0.1".to_string()]),
+            policy: OutboxPolicy {
+                max_attempts: 3,
+                backoff_base: Duration::from_millis(20),
+                lease,
+                poll: Duration::from_millis(10),
+                batch: 8,
+            },
+        };
+
+        let sid = end_oidc_grant(&db, "rp-socket").await.expect("a sid");
+        assert_eq!(worker.tick().await, 1);
+        let hits = stub.hits();
+        assert_eq!(hits.len(), 1, "delivered through the signer");
+        let token = hits[0].1.strip_prefix("logout_token=").unwrap();
+        let (header, claims) = verified(token, &verifying_key(&key));
+        assert_eq!(header["kid"], key.kid());
+        assert_eq!(claims["sid"], sid.as_str());
+        assert!(db.pending_logout_entries().await.unwrap().is_empty());
+
+        service.stop();
+        let log = siwx_oidc::test_support::LogCapture::start();
+        end_oidc_grant(&db, "rp-socket").await;
+        assert_eq!(worker.tick().await, 1, "the entry is claimed");
+        assert_eq!(stub.hits().len(), 1, "nothing is sent without a signature");
+        let pending = db.pending_logout_entries().await.unwrap();
+        assert_eq!(pending.len(), 1, "the entry stays queued");
+        assert_eq!(
+            pending[0].0.attempt, 0,
+            "a signing failure spends no attempt"
+        );
+        assert!(
+            log.output().contains("signing failed"),
+            "the failure is logged: {}",
+            log.output()
+        );
+
+        tokio::time::sleep(lease + Duration::from_millis(200)).await;
+        let signing_again = Worker {
+            signing_key: Arc::new(key.clone()),
+            ..worker.clone()
+        };
+        assert_eq!(
+            signing_again.tick().await,
+            1,
+            "claimed again after the lease"
+        );
+        assert_eq!(stub.hits().len(), 2, "and delivered");
+        assert!(
+            log.output().contains("back-channel logout delivered")
+                && log.output().contains("attempt=1"),
+            "as its first attempt: {}",
+            log.output()
+        );
+        assert!(db.pending_logout_entries().await.unwrap().is_empty());
+    }
+
     /// In-process H7: the worker sends a logout token the RP can verify with
     /// our key, naming the ended grant's `sid`; a failing RP is retried
     /// `max_attempts` times in all and then dropped with a warning that names
     /// fingerprints only; an RP without a URI is never contacted.
     #[tokio::test]
     async fn the_worker_delivers_retries_a_failing_rp_then_drops_it_with_a_warning() {
+        let _turn = DB_10.lock().await;
         let Some(db) = siwx_oidc::test_support::redis_db(10).await else {
             return;
         };
@@ -989,7 +1109,7 @@ mod tests {
         let (stub, addr) = stub_rp().await;
         let uri = format!("http://127.0.0.1:{}/bcl", addr.port());
         register_rp(&db, "rp-ok", &uri).await;
-        let key = Arc::new(EcdsaSigningKey::generate());
+        let key = Arc::new(siwx_oidc::signing::EcdsaSigningKey::generate());
         let worker = Worker {
             redis: db.clone(),
             signing_key: key.clone(),
