@@ -92,6 +92,26 @@ Every ceremony runs inside the OIDC session started by `GET /authorize`
 (`session` cookie). After registering, the login page immediately runs a sign-in
 with the new passkey.
 
+## Related origins
+
+A passkey is bound to the RP ID it was registered for. To let a page on another origin
+(an explorer, a second app) use a passkey registered here, so the person keeps one
+`did:key`, set `SIWXOIDC_RELATED_ORIGINS` to those origins (comma-separated, see
+[configuration.md](configuration.md)). The server then answers
+`GET /.well-known/webauthn` with `{"origins":[...]}`, the document Chrome 128+ reads
+(WebAuthn Level 3, "related origin requests") before it lets such a page call
+`navigator.credentials.get({publicKey: {rpId: "<this host>"}})`. It is off by default, and
+Chrome reads at most 5 distinct registrable-domain labels from the list.
+
+The setting only publishes the list. It changes nothing about which origins this server
+accepts: its own ceremonies, CORS and redirect checks do not use it, and the other site's
+backend must verify the assertion itself against this RP ID and its own origin (pinned in
+`tests/related_origins.rs` and in `src/webauthn.rs`,
+`related_origins_leave_the_ceremony_origins_of_both_rp_arms_unchanged`). The browser reads
+the document at `https://<RP ID>/.well-known/webauthn`, so it serves the RP ID that is this
+server's host (the legacy RP with two relying parties, see `legacy_rp_id`); a unified RP ID
+on another host needs the document there.
+
 ## Linking a passkey to a wallet
 
 A wallet user can register a passkey that signs them in as their **wallet DID**

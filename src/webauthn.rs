@@ -3208,6 +3208,127 @@ mod tests {
         assert_eq!(d.policy.entries().len(), 2);
     }
 
+    /// `SIWXOIDC_RELATED_ORIGINS` is published at `/.well-known/webauthn` and nowhere else:
+    /// with it set, the origins this server accepts in its own ceremonies are those it
+    /// accepts with it unset, in the two-RP shape (both arms) and in the single-RP shape.
+    /// The related origins include one inside the RP ID's own domain, which the assertion
+    /// policy would accept had it been added. `build_rp_dispatch` takes no related origins;
+    /// this pins that the configuration the server builds the RPs from gives it none either.
+    #[test]
+    // `figment::Jail::expect_with` fixes the closure's return type to `figment::Result<()>`.
+    #[allow(clippy::result_large_err)]
+    fn related_origins_leave_the_ceremony_origins_of_both_rp_arms_unchanged() {
+        use crate::config::{figment, Config, ENV_PREFIX, LEGACY_ENV_PREFIX};
+        use figment::Jail;
+
+        let related = [
+            "https://aqua-node.example.net",
+            "https://aquafier.example.net",
+            "https://app.example.org",
+        ];
+        let related_value = related.join(", ");
+
+        // The RP arms of a configuration: per RP ID, the origins the assertion policy
+        // accepts, plus the origins of the registration/link ceremony and the arm ids.
+        fn arms(config: &Config) -> (AssertionPolicy, Vec<String>, Vec<String>, Vec<String>) {
+            let (legacy, d) = build_rp_dispatch(
+                &config.base_url,
+                config.rp_id.as_deref(),
+                config.rp_origin.as_deref(),
+                config.legacy_rp_id.as_deref(),
+            )
+            .expect("build rp dispatch");
+            let ceremony_origins = |w: &Webauthn| {
+                w.get_allowed_origins()
+                    .iter()
+                    .map(|o| o.to_string())
+                    .collect::<Vec<_>>()
+            };
+            (
+                d.policy.clone(),
+                ceremony_origins(&legacy.webauthn),
+                ceremony_origins(&d.legacy_webauthn),
+                vec![
+                    legacy.rp_id.clone(),
+                    legacy.rp_origin.clone(),
+                    d.legacy_rp_id.clone(),
+                    d.legacy_origin.clone(),
+                    d.unified
+                        .as_ref()
+                        .map(|u| u.rp_id.clone())
+                        .unwrap_or_default(),
+                ],
+            )
+        }
+
+        for (name, env) in [
+            (
+                "two RPs",
+                vec![
+                    ("SIWXOIDC_BASE_URL", "https://siwx.example.org"),
+                    ("SIWXOIDC_RP_ID", "example.org"),
+                    ("SIWXOIDC_RP_ORIGIN", "https://example.org"),
+                    ("SIWXOIDC_LEGACY_RP_ID", "siwx.example.org"),
+                ],
+            ),
+            (
+                "one RP",
+                vec![("SIWXOIDC_BASE_URL", "https://siwx.example.org")],
+            ),
+        ] {
+            Jail::expect_with(|jail| {
+                let ambient: Vec<String> = std::env::vars_os()
+                    .filter_map(|(key, _)| key.into_string().ok())
+                    .filter(|key| {
+                        key.to_ascii_uppercase().starts_with(ENV_PREFIX)
+                            || key.to_ascii_uppercase().starts_with(LEGACY_ENV_PREFIX)
+                    })
+                    .collect();
+                for key in ambient {
+                    jail.set_env(&key, "");
+                    std::env::remove_var(&key);
+                }
+                for (key, value) in &env {
+                    jail.set_env(key, value);
+                }
+                let off_config = figment().extract::<Config>()?;
+                assert_eq!(off_config.related_origin_list(), Ok(vec![]));
+                jail.set_env("SIWXOIDC_RELATED_ORIGINS", &related_value);
+                let on_config = figment().extract::<Config>()?;
+                assert_eq!(
+                    on_config.related_origin_list().expect("the origins parse"),
+                    related,
+                    "{name}: the feature is on"
+                );
+
+                let off = arms(&off_config);
+                let on = arms(&on_config);
+                assert_eq!(on.0, off.0, "{name}: the assertion policy is unchanged");
+                assert_eq!(on.1, off.1, "{name}: the registration ceremony origins");
+                assert_eq!(on.2, off.2, "{name}: the legacy arm's ceremony origins");
+                assert_eq!(on.3, off.3, "{name}: the RP ids and origins");
+                for entry in on.0.entries() {
+                    for origin in related {
+                        assert!(
+                            !entry.allows_origin(origin),
+                            "{name}: {origin} must not be accepted for {}",
+                            entry.rp_id
+                        );
+                    }
+                }
+                for origin in on.1.iter().chain(on.2.iter()) {
+                    assert!(
+                        !related.iter().any(|r| origin.starts_with(r)),
+                        "{name}: {origin} is a related origin in a ceremony"
+                    );
+                }
+                let rps = on.0.entries().len();
+                assert_eq!(rps, if name == "two RPs" { 2 } else { 1 }, "{name}");
+                Ok(())
+            });
+        }
+    }
+
     // -- store-free unified login ------------------------------------------------
 
     fn pkc_of(a: &aqua_auth::AssertionJson) -> PublicKeyCredential {

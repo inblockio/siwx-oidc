@@ -181,6 +181,39 @@ paths:
             application/json:
               schema: { type: object }
 
+  /.well-known/webauthn:
+    get:
+      tags: [Sign-in ceremonies]
+      operationId: webauthnRelatedOrigins
+      summary: WebAuthn related origins (only when `SIWXOIDC_RELATED_ORIGINS` is set)
+      description: |
+        The document a browser reads (Chrome 128+, WebAuthn Level 3 "related origin
+        requests") before it lets a page on another origin ask for a passkey registered for
+        this server's RP ID. It lists the origins `SIWXOIDC_RELATED_ORIGINS` names, as the
+        browser writes an origin (`scheme://host[:port]`, no trailing slash), without
+        repeats, in configuration order.
+
+        The route exists only when the setting is non-empty. Unset, empty or blank, the path
+        is not routed and answers like any other unknown path (404). The document needs no
+        credential, sets no cookie and is the only place these origins are published: this
+        server's own ceremonies, CORS and redirect checks never use them. Chrome reads at
+        most 5 distinct registrable-domain labels from the list.
+      responses:
+        "200":
+          description: The related origins.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [origins]
+                properties:
+                  origins:
+                    type: array
+                    items: { type: string, format: uri }
+              example:
+                origins: ["https://aqua-node.example.org", "https://aquafier.example.org"]
+        "404": { description: "Related origins are not configured." }
+
   /authorize:
     get:
       tags: [OIDC]

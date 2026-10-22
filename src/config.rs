@@ -250,6 +250,87 @@ where
         .map_err(|e| serde::de::Error::custom(format!("redis_url is not a valid URL: {e}")))
 }
 
+/// Parses `related_origins` (`SIWXOIDC_RELATED_ORIGINS`, comma-separated) into the
+/// browser's serialisation of each origin (`scheme://host[:port]`, no trailing slash),
+/// deduplicated, in configuration order; or the reason the value is refused.
+///
+/// Unset, empty and blank are `Ok(vec![])`: the feature is off. Otherwise every entry,
+/// trimmed, must be a bare origin: scheme `https` (`http` only for `localhost` and
+/// `127.0.0.1`, for local tests), a host, no user information, no path other than `/`,
+/// no query and no fragment. An empty entry (a stray comma) is refused too. One bad entry
+/// refuses the whole value, naming the entry by position and text, because a list that
+/// silently drops an entry publishes less than the operator meant. An entry with user
+/// information is named by position only: it can carry a password.
+pub fn parse_related_origins(raw: Option<&str>) -> Result<Vec<String>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let mut origins: Vec<String> = Vec::new();
+    for (index, entry) in raw.split(',').enumerate() {
+        let origin = related_origin(index + 1, entry.trim())?;
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
+    Ok(origins)
+}
+
+/// One entry of `related_origins`, `position` counting from 1: see [`parse_related_origins`].
+fn related_origin(position: usize, entry: &str) -> Result<String, String> {
+    let refuse = |why: &str| {
+        let shown = if entry.contains('@') {
+            "(not shown: it carries user information)".to_string()
+        } else {
+            format!("\"{entry}\"")
+        };
+        format!(
+            "related_origins (SIWXOIDC_RELATED_ORIGINS): entry {position} {shown} is refused: \
+             {why}"
+        )
+    };
+    if entry.is_empty() {
+        return Err(refuse("it is empty (a stray comma?)"));
+    }
+    if entry.contains('@') {
+        return Err(refuse("an origin carries no user information"));
+    }
+    if entry
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+    {
+        return Err(refuse(
+            "it holds white space, a control character or a backslash",
+        ));
+    }
+    let url = Url::parse(entry).map_err(|e| refuse(&format!("it is not a URL ({e})")))?;
+    let Some(host) = url.host_str() else {
+        return Err(refuse("it has no host"));
+    };
+    match url.scheme() {
+        "https" => {}
+        "http" if matches!(host, "localhost" | "127.0.0.1") => {}
+        "http" => {
+            return Err(refuse(
+                "the scheme must be https (http is accepted only for localhost and 127.0.0.1)",
+            ))
+        }
+        _ => return Err(refuse("the scheme must be https")),
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(refuse("an origin carries no user information"));
+    }
+    if !matches!(url.path(), "" | "/") {
+        return Err(refuse("an origin has no path"));
+    }
+    if url.query().is_some() {
+        return Err(refuse("an origin has no query"));
+    }
+    if url.fragment().is_some() {
+        return Err(refuse("an origin has no fragment"));
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
 /// The server's configuration. Deliberately **not** `Debug`: it holds secrets (the MAS
 /// shared secret, the signing key, the Redis password inside `redis_url`, the secrets of
 /// `default_clients`), and a `{:?}` of it in a log or a panic would print them. A test pins
@@ -338,6 +419,16 @@ pub struct Config {
     /// there is one RP (`rp_id`, else the hostname of `base_url`).
     #[serde(default, deserialize_with = "blank_string_as_none")]
     pub legacy_rp_id: Option<String>,
+    /// Origins of other sites that may use a passkey registered for this server's RP ID
+    /// (WebAuthn Level 3 "related origin requests"), comma-separated. They are published
+    /// as `{"origins":[...]}` at `GET /.well-known/webauthn` and nowhere else: they are
+    /// never added to the origins this server accepts in its own ceremonies, to its CORS
+    /// or to any redirect check. An empty or blank value is unset: no document is served.
+    /// An entry that is not a bare `https` origin is a start error
+    /// ([`parse_related_origins`]). Read it through [`Config::related_origin_list`].
+    /// Env: `SIWXOIDC_RELATED_ORIGINS`
+    #[serde(default, deserialize_with = "blank_string_as_none")]
+    pub related_origins: Option<String>,
     /// The MAS shared secret (MSC3861 mode); must equal Synapse's
     /// `matrix_authentication_service.secret`. It authenticates Synapse to
     /// `/oauth2/introspect` and `/oauth2/admin_token`, and this provider to
@@ -666,6 +757,12 @@ impl Config {
         Ok(())
     }
 
+    /// The origins to publish at `/.well-known/webauthn`, parsed and normalised, or the
+    /// reason the configuration is refused at start. Empty: the feature is off.
+    pub fn related_origin_list(&self) -> Result<Vec<String>, String> {
+        parse_related_origins(self.related_origins.as_deref())
+    }
+
     /// SS4: the session-end flags must be switched on together where they
     /// depend on each other, or the reason the combination is refused.
     ///
@@ -835,6 +932,7 @@ impl Default for Config {
             rp_id: None,
             rp_origin: None,
             legacy_rp_id: None,
+            related_origins: None,
             mas_shared_secret: None,
             mas_shared_secret_file: None,
             synapse_endpoint: None,
@@ -2084,6 +2182,197 @@ mod tests {
                 assert_eq!(c.redis_url.as_str(), url, "the URL is untouched");
                 assert_eq!(leaked_window(&error, &password), None, "{error}");
             }
+            Ok(())
+        });
+    }
+
+    // -- related_origins (SIWXOIDC_RELATED_ORIGINS) -----------------------------------
+
+    fn origins(raw: &str) -> Result<Vec<String>, String> {
+        parse_related_origins(Some(raw))
+    }
+
+    #[test]
+    fn related_origins_unset_empty_and_blank_are_off() {
+        assert_eq!(parse_related_origins(None), Ok(vec![]));
+        assert_eq!(origins(""), Ok(vec![]));
+        assert_eq!(origins("   \t "), Ok(vec![]));
+    }
+
+    #[test]
+    fn related_origins_one_and_several_keep_the_configured_order() {
+        assert_eq!(
+            origins("https://aqua-node.example.org"),
+            Ok(vec!["https://aqua-node.example.org".to_string()])
+        );
+        assert_eq!(
+            origins(" https://b.example.net , https://a.example.org:8443,https://c.example.com "),
+            Ok(vec![
+                "https://b.example.net".to_string(),
+                "https://a.example.org:8443".to_string(),
+                "https://c.example.com".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn related_origins_are_stored_as_the_browser_serialisation() {
+        // A trailing slash, an upper-case host and a default port are all one origin.
+        for spelling in [
+            "https://a.example.org/",
+            "https://A.EXAMPLE.org",
+            "HTTPS://a.example.org:443/",
+        ] {
+            assert_eq!(
+                origins(spelling),
+                Ok(vec!["https://a.example.org".to_string()]),
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn related_origins_are_deduplicated_by_their_serialisation() {
+        assert_eq!(
+            origins("https://a.example.org,https://b.example.org,https://a.example.org/,https://B.example.org"),
+            Ok(vec![
+                "https://a.example.org".to_string(),
+                "https://b.example.org".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn related_origins_refuse_a_path_query_or_fragment() {
+        for bad in [
+            "https://a.example.org/app",
+            "https://a.example.org//",
+            "https://a.example.org/?x=1",
+            "https://a.example.org?x=1",
+            "https://a.example.org/#top",
+            "https://a.example.org?",
+            "https://a.example.org#",
+        ] {
+            let e = origins(bad).expect_err(bad);
+            assert!(e.contains(bad), "the message names the entry {bad}: {e}");
+            assert!(e.contains("SIWXOIDC_RELATED_ORIGINS"), "{e}");
+        }
+    }
+
+    #[test]
+    fn related_origins_refuse_http_except_for_localhost() {
+        for bad in [
+            "http://a.example.org",
+            "http://localhost.example.org",
+            "http://10.0.0.1",
+        ] {
+            let e = origins(bad).expect_err(bad);
+            assert!(e.contains(bad) && e.contains("https"), "{e}");
+        }
+        assert_eq!(
+            origins("http://localhost:5173,http://127.0.0.1:8080"),
+            Ok(vec![
+                "http://localhost:5173".to_string(),
+                "http://127.0.0.1:8080".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn related_origins_refuse_garbage_and_other_schemes() {
+        for bad in [
+            "not a url",
+            "aqua-node.example.org",
+            "//a.example.org",
+            "ftp://a.example.org",
+            "mailto:a@example.org",
+            "https://",
+            "https://a.example.org\\app",
+            "javascript:alert(1)",
+        ] {
+            assert!(origins(bad).is_err(), "{bad} must be refused");
+        }
+    }
+
+    #[test]
+    fn related_origins_refuse_one_bad_entry_among_good_ones_and_name_it() {
+        let e = origins("https://a.example.org, https://b.example.org/x ,https://c.example.org")
+            .expect_err("the second entry has a path");
+        assert!(
+            e.contains("entry 2") && e.contains("https://b.example.org/x"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn related_origins_refuse_an_empty_entry() {
+        for bad in [
+            "https://a.example.org,",
+            ",https://a.example.org",
+            "https://a.example.org,,https://b.example.org",
+        ] {
+            let e = origins(bad).expect_err(bad);
+            assert!(e.contains("empty"), "{e}");
+        }
+    }
+
+    #[test]
+    fn related_origins_refuse_user_information_and_never_echo_it() {
+        for bad in [
+            "https://user:hunter2@a.example.org",
+            "https://hunter2@a.example.org",
+            "https://@a.example.org",
+        ] {
+            let e = origins(bad).expect_err(bad);
+            assert!(e.contains("user information"), "{e}");
+            assert!(!e.contains("hunter2"), "the secret is echoed: {e}");
+        }
+    }
+
+    #[test]
+    fn related_origins_is_unset_by_default_and_an_empty_variable_is_off() {
+        // A compose file's `SIWXOIDC_RELATED_ORIGINS=${SIWXOIDC_RELATED_ORIGINS:-}`
+        // passes an empty string; it must not panic and must not turn the feature on.
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            let config = figment().extract::<Config>()?;
+            assert_eq!(config.related_origins, None);
+            assert_eq!(config.related_origin_list(), Ok(vec![]));
+            for blank in ["", " ", "  \t "] {
+                jail.set_env("SIWXOIDC_RELATED_ORIGINS", blank);
+                let config = figment().extract::<Config>()?;
+                assert_eq!(config.related_origins, None, "{blank:?}");
+                assert_eq!(config.related_origin_list(), Ok(vec![]), "{blank:?}");
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn related_origins_are_read_from_the_environment_and_a_bad_entry_is_a_start_error() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.set_env(
+                "SIWXOIDC_RELATED_ORIGINS",
+                "https://aqua-node.example.org, https://aquafier.example.org/",
+            );
+            assert_eq!(
+                figment().extract::<Config>()?.related_origin_list(),
+                Ok(vec![
+                    "https://aqua-node.example.org".to_string(),
+                    "https://aquafier.example.org".to_string(),
+                ])
+            );
+            jail.set_env(
+                "SIWXOIDC_RELATED_ORIGINS",
+                "https://a.example.org,http://b.example.org",
+            );
+            // The value loads (it is only text) and the start-up check refuses it.
+            let e = figment()
+                .extract::<Config>()?
+                .related_origin_list()
+                .expect_err("an http origin is refused");
+            assert!(e.contains("http://b.example.org"), "{e}");
             Ok(())
         });
     }

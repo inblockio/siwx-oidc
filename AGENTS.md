@@ -101,9 +101,9 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 
 - **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
   mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
-  `cargo test --workspace` runs the unit tests of both crates plus 66 tests in fifteen files:
+  `cargo test --workspace` runs the unit tests of both crates plus 72 tests in sixteen files:
   `openapi_covers_every_route` (2), `localpart_vectors` (1), `graceful_shutdown` (7),
-  `static_client_startup` (10), `secret_files_startup` (12, one of which serves requests from
+  `static_client_startup` (10), `related_origins` (6), `secret_files_startup` (12, one of which serves requests from
   database 3 of the test Redis), `audit_pr82_findings` (4, the pins of the audit of the
   secret-file change; one of them takes database 1 of the test Redis),
   `log_hygiene_credential_store` (1),
@@ -1172,6 +1172,17 @@ doc; read it before changing the code the rule covers.
   `a_did_with_no_passkey_is_scanned_once_per_window`, `a_did_with_a_passkey_plants_no_marker`,
   `the_passkey_answer_for_a_code_is_computed_once`,
   `a_passkey_answer_the_server_cannot_give_is_not_kept`.
+- **`SIWXOIDC_RELATED_ORIGINS` is published at `/.well-known/webauthn` and nowhere else.** The
+  origins it names may use a passkey registered for this server's RP ID (WebAuthn Level 3
+  related origin requests); they are never added to the origins this server accepts in its own
+  ceremonies (either RP arm), to CORS, to a redirect check or to any other list. Unset, empty or
+  blank means no route at all, so the path answers like any unrouted path; an entry that is not
+  a bare `https` origin stops start-up. Only `config.rs` (parse) and `axum_lib.rs` (the route)
+  may name the setting. Pin: `related_origins_leave_the_ceremony_origins_of_both_rp_arms_unchanged`,
+  `related_origins_stay_out_of_every_other_module`, `related_origins_do_not_change_the_cors_answer`,
+  `the_document_lists_the_configured_origins_exactly`,
+  `unset_empty_and_blank_leave_the_path_as_unrouted_as_before`,
+  `a_refused_entry_stops_start_up_and_is_named`.
 - **A link overrides the derived DID**, for every reader (`credential_identity`); the credential
   store mirror never writes `webauthn:link/*`. Pin: `a_link_still_overrides_the_derived_did`,
   `mirroring_never_writes_the_link_namespace`.

@@ -1783,6 +1783,18 @@ pub async fn main() {
         .check_session_end_flags()
         .unwrap_or_else(|e| panic!("FATAL: {e}"));
 
+    // WebAuthn related origins: a refused entry exits here, before anything binds. The
+    // origins are published at `/.well-known/webauthn` and used nowhere else.
+    let related_origins = config
+        .related_origin_list()
+        .unwrap_or_else(|e| panic!("FATAL: {e}"));
+    if !related_origins.is_empty() {
+        info!(
+            origins = ?related_origins,
+            "WebAuthn related origins published at /.well-known/webauthn"
+        );
+    }
+
     let grant_lifetime = config
         .grant_lifetime()
         .unwrap_or_else(|e| panic!("FATAL: {e}"));
@@ -2188,7 +2200,9 @@ pub async fn main() {
         .route(
             "/_matrix/client/v3/refresh",
             post(compat::refresh).with_state(compat_state),
-        );
+        )
+        // WebAuthn related origins (`SIWXOIDC_RELATED_ORIGINS`); no route when it is unset.
+        .merge(related_origins_router(&related_origins));
 
     let app = with_request_logging(app).layer(
         CorsLayer::new()
@@ -2235,6 +2249,36 @@ pub async fn main() {
     if let Some(task) = device_reaper_task {
         let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
     }
+}
+
+/// `GET /.well-known/webauthn`, the path browsers read to learn which other origins may use a
+/// passkey registered for this server's RP ID (WebAuthn Level 3, "related origin requests"):
+/// `{"origins":[...]}` for the origins `SIWXOIDC_RELATED_ORIGINS` names (already parsed and normalised by [`config::parse_related_origins`]).
+///
+/// With no origins there is no route at all, so the path answers exactly as any unrouted
+/// path does and the feature adds nothing to the server. The document needs no state, no
+/// cookie and no authentication: Chrome fetches it without credentials. The origins are
+/// published here and nowhere else: they are not in the origins this server accepts in its
+/// own ceremonies (`webauthn::build_rp_dispatch` never sees them), in the CORS layer or in
+/// any redirect check. Pin: `tests/related_origins.rs` and, in `webauthn.rs`,
+/// `related_origins_leave_the_ceremony_origins_of_both_rp_arms_unchanged`.
+fn related_origins_router(origins: &[String]) -> Router {
+    if origins.is_empty() {
+        return Router::new();
+    }
+    let document: Arc<str> = serde_json::json!({ "origins": origins }).to_string().into();
+    Router::new().route(
+        "/.well-known/webauthn",
+        get(move || {
+            let document = document.clone();
+            async move {
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    document.to_string(),
+                )
+            }
+        }),
+    )
 }
 
 /// Request logging: one `info!` line per request (method and path) and one per
