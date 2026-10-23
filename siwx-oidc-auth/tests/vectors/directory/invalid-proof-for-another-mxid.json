@@ -1,0 +1,47 @@
+{
+  "description": "Bob copied Alice's genuine proof into his own profile: the signature is good and the binding is not.",
+  "expected": {
+    "limited": false,
+    "results": [
+      {
+        "alias": "Bob",
+        "did": {
+          "state": "invalid"
+        },
+        "mxid": "@bob:example.org"
+      }
+    ]
+  },
+  "format": "siwx-oidc-auth.directory-vector/1",
+  "issuer": "https://siwx.example.org",
+  "jwks": {
+    "keys": [
+      {
+        "alg": "ES256",
+        "crv": "P-256",
+        "kid": "vector-kid-1",
+        "kty": "EC",
+        "use": "sig",
+        "x": "tPu3jwpS2v6n-Jz8agbU69uYdv_3mB4_uaTeuYa10po",
+        "y": "1fJclFD081W4TLi6Sn-J94lhdm8V58IgqxBI4pNpgL4"
+      }
+    ]
+  },
+  "limit": 10,
+  "module_response": {
+    "limited": false,
+    "results": [
+      {
+        "did_field": {
+          "did": "did:key:zVectorFixtureAlice0000000000000000000000",
+          "proof": "eyJhbGciOiJFUzI1NiIsImtpZCI6InZlY3Rvci1raWQtMSIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3NTcwMDAwMDAsImlzcyI6Imh0dHBzOi8vc2l3eC5leGFtcGxlLm9yZyIsIm14aWQiOiJAYWxpY2U6ZXhhbXBsZS5vcmciLCJzdWIiOiJkaWQ6a2V5OnpWZWN0b3JGaXh0dXJlQWxpY2UwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIn0.2IOXgYfB8UlTdeUEc37hktdrVZSL-i2cAPuBwJS-Ss3XB5WoNwqqKHIPrl529z-fQ0asB2I4_iEn2fFQP7A8Tg"
+        },
+        "display_name": "Bob",
+        "user_id": "@bob:example.org"
+      }
+    ]
+  },
+  "name": "invalid-proof-for-another-mxid",
+  "server_name": "example.org",
+  "transport": "module"
+}
