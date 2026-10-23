@@ -40,7 +40,7 @@ description = "Key-first OpenID Connect provider and Matrix auth service: agents
 aqua-auth = { git = "https://github.com/inblockio/aqua-auth", tag = "v0.9.0", features = ["webauthn", "ceremony", "redis"] }
 alloy-primitives = { version = "1", features = ["serde"] }
 alloy = { version = "1", features = ["providers", "transport-http", "contract", "sol-types", "ens"] }
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
