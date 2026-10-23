@@ -315,6 +315,12 @@ issued to that party, or on a fresh signature by the DID's own key. The
 issuer their homeserver uses. Full details:
 [identity-model.md](identity-model.md#trust-model-a-discovery-hint-never-an-authorization-source).
 
+**Finding people by name.** A service that needs to search for people ("whom may
+this person find?") rather than verify one MXID uses the directory client in
+`siwx_oidc_auth::directory`. It signs in with the service's own key, as in this
+guide, with a fixed device id, and returns each person with a verified DID, or
+with the reason there is none. See [directory.md](directory.md).
+
 ## Operational notes
 
 - **Key custody.** The PEM file is the account. Keep it readable only by the

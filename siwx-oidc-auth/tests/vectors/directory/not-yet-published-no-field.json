@@ -1,0 +1,41 @@
+{
+  "description": "A local user with no io.inblock.did field, and no display name.",
+  "expected": {
+    "limited": false,
+    "results": [
+      {
+        "did": {
+          "state": "not_yet_published"
+        },
+        "mxid": "@bob:example.org"
+      }
+    ]
+  },
+  "format": "siwx-oidc-auth.directory-vector/1",
+  "issuer": "https://siwx.example.org",
+  "jwks": {
+    "keys": [
+      {
+        "alg": "ES256",
+        "crv": "P-256",
+        "kid": "vector-kid-1",
+        "kty": "EC",
+        "use": "sig",
+        "x": "tPu3jwpS2v6n-Jz8agbU69uYdv_3mB4_uaTeuYa10po",
+        "y": "1fJclFD081W4TLi6Sn-J94lhdm8V58IgqxBI4pNpgL4"
+      }
+    ]
+  },
+  "limit": 10,
+  "module_response": {
+    "limited": false,
+    "results": [
+      {
+        "user_id": "@bob:example.org"
+      }
+    ]
+  },
+  "name": "not-yet-published-no-field",
+  "server_name": "example.org",
+  "transport": "module"
+}

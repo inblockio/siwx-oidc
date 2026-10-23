@@ -485,6 +485,11 @@ Element Web's `resolve-did-search` patch (in siwx-oidc-matrix-server) is a
 second verifier that follows the same rules in the browser; see
 [api/README.md](api/README.md).
 
+To verify many people at once, as a search result, use the directory client
+(`siwx_oidc_auth::directory`): it runs these rules against keys fetched once and
+cached, and returns each person as `verified`, `not_yet_published` or `invalid`.
+See [directory.md](directory.md).
+
 ## Looking up an identity: `GET /resolve`
 
 The directory lookup for the table above: which Matrix account belongs to a

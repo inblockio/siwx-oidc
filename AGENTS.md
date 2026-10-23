@@ -67,7 +67,8 @@ everything else exists only in the binary crate.
 | `siwx-oidc-auth/src/` | Role |
 |---|---|
 | `lib.rs` | `SiwxKey` (PEM, hex, generated), `authenticate`, `authenticate_with_device`, `authenticate_with_scope`, `authenticate_with_scope_using`, `refresh`, `authenticate_device_flow`, `AuthTokens`. |
-| `did_assertion.rs` | The shipped verifier: `fetch_and_verify_did`, `verify_did_assertion`, `VerifiedDid`, `DidAssertionError`, `DID_PROFILE_FIELD`. |
+| `did_assertion.rs` | The shipped verifier: `fetch_and_verify_did`, `verify_did_assertion`, `VerifiedDid`, `DidAssertionError`, `DID_PROFILE_FIELD`. The public functions are `parse_proof`, `fetch_issuer_keys` and `verify_parsed` in that order (the `alg` gate still runs before any fetch); the directory client calls the three apart so it can cache the keys. |
+| `directory.rs` | The directory client for services ([docs/directory.md](docs/directory.md)): `register_public_client`, `ServiceSession` (key sign-in on a fixed device, in-memory tokens, single-flight refresh), `DirectoryClient` (`search_for_asker` through the homeserver's directory module, `search_as_user` through Synapse's user directory), `DirectoryResults` (`Serialize` only, like `VerifiedDid`). |
 | `main.rs` | CLI: `--key-file`, `--print-did`, `--server`, `--refresh-token`, `--device-flow`, `--verify-did <MXID> --homeserver <url>`. |
 
 Other paths: `tests/` (integration suites, mostly `#[ignore]`d; see below), `e2e/` (mock
@@ -116,7 +117,12 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   client's crate it also runs the three pure checks of `siwx-oidc-auth/tests/live_upgrade.rs`'s
   helpers and the 148 unit and hermetic tests of the rotation canary
   (`siwx-oidc-auth/tests/rotation_canary_unit.rs`, which compiles the modules of
-  `examples/rotation_canary.rs`; the hermetic ones talk to a fake server inside the test process).
+  `examples/rotation_canary.rs`; the hermetic ones talk to a fake server inside the test process),
+  and the directory client's suites: `siwx-oidc-auth/tests/directory.rs` (46 tests through the
+  public API against a fake siwx-oidc and a fake homeserver on local sockets, `tests/directory/support.rs`,
+  with a clock the tests move by hand) and the shared vectors in `siwx-oidc-auth/tests/vectors/directory/`
+  (`every_vector_gives_its_expected_result`; the `#[ignore]`d `regenerate_directory_vectors` makes them
+  with a key created in memory).
 - **Redis-backed tests** get their Redis from `siwx_oidc::test_support` (`src/test_support.rs`):
   `SIWX_TEST_REDIS_URL`, default `redis://localhost`. When it is unreachable each test prints
   one `SKIP <test>: …` line to stderr and passes; with `SIWX_TEST_REQUIRE_REDIS=1` it fails
@@ -319,6 +325,16 @@ doc; read it before changing the code the rule covers.
 - **Verify over the received bytes**, not a re-serialisation; `iss` must equal the discovery
   `issuer`; the verified `sub` beats the plain `did` member. Pin: `iss_mismatch_is_rejected`,
   `fetch_plain_did_disagreement_returns_the_verified_sub`.
+- **The directory client never turns an answer it could not check into a state**
+  ([docs/directory.md](docs/directory.md)). A fetch failure of the issuer's discovery or key set
+  fails the whole search with a retryable error and is stored nowhere; only a proof that was read
+  and fails is `invalid`. `DidState::Verified` can only be made inside `directory.rs` and the result
+  types derive `Serialize` only, like `VerifiedDid`. The verified cache is keyed by `(mxid, proof)`
+  and lives at most 10 minutes. Tokens stay in memory: no file API and no output macro in the module
+  outside its tests. Pin: `a_failure_to_get_the_keys_fails_the_search_and_is_stored_nowhere`,
+  `the_result_types_cannot_be_deserialized`, `a_cached_verification_is_for_that_mxid_and_that_proof_only`,
+  `a_verified_result_is_kept_for_ten_minutes_and_not_a_second_longer`,
+  `the_module_touches_no_file_and_prints_nothing`.
 
 ### Publication and the Synapse client ([docs/matrix-integration.md](docs/matrix-integration.md))
 

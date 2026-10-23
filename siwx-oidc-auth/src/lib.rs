@@ -23,6 +23,7 @@
 //! ```
 
 pub mod did_assertion;
+pub mod directory;
 
 /// Verification of the provider-attested DID published in a Matrix profile.
 ///

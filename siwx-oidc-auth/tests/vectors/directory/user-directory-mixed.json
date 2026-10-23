@@ -1,0 +1,87 @@
+{
+  "description": "Rows of the standard user directory plus the profile field of each local user; a remote user's profile is not read.",
+  "expected": {
+    "limited": false,
+    "results": [
+      {
+        "alias": "Alice Example",
+        "did": {
+          "state": "verified",
+          "value": "did:key:zVectorFixtureAlice0000000000000000000000"
+        },
+        "mxid": "@alice:example.org"
+      },
+      {
+        "did": {
+          "state": "not_yet_published"
+        },
+        "mxid": "@bob:example.org"
+      },
+      {
+        "alias": "Carol",
+        "did": {
+          "state": "invalid"
+        },
+        "mxid": "@carol:example.org"
+      },
+      {
+        "alias": "Remote",
+        "did": {
+          "state": "not_yet_published"
+        },
+        "mxid": "@remote:other.example"
+      }
+    ]
+  },
+  "format": "siwx-oidc-auth.directory-vector/1",
+  "issuer": "https://siwx.example.org",
+  "jwks": {
+    "keys": [
+      {
+        "alg": "ES256",
+        "crv": "P-256",
+        "kid": "vector-kid-1",
+        "kty": "EC",
+        "use": "sig",
+        "x": "tPu3jwpS2v6n-Jz8agbU69uYdv_3mB4_uaTeuYa10po",
+        "y": "1fJclFD081W4TLi6Sn-J94lhdm8V58IgqxBI4pNpgL4"
+      }
+    ]
+  },
+  "limit": 10,
+  "name": "user-directory-mixed",
+  "profiles": {
+    "@alice:example.org": {
+      "did": "did:key:zVectorFixtureAlice0000000000000000000000",
+      "proof": "eyJhbGciOiJFUzI1NiIsImtpZCI6InZlY3Rvci1raWQtMSIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3NTcwMDAwMDAsImlzcyI6Imh0dHBzOi8vc2l3eC5leGFtcGxlLm9yZyIsIm14aWQiOiJAYWxpY2U6ZXhhbXBsZS5vcmciLCJzdWIiOiJkaWQ6a2V5OnpWZWN0b3JGaXh0dXJlQWxpY2UwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIn0.2IOXgYfB8UlTdeUEc37hktdrVZSL-i2cAPuBwJS-Ss3XB5WoNwqqKHIPrl529z-fQ0asB2I4_iEn2fFQP7A8Tg"
+    },
+    "@bob:example.org": null,
+    "@carol:example.org": {
+      "did": "did:key:zVectorFixtureCarol0000000000000000000000",
+      "proof": "eyJhbGciOiJFUzI1NiIsImtpZCI6InZlY3Rvci1raWQtMSIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3NTcwMDAwMDAsImlzcyI6Imh0dHBzOi8vc2l3eC5leGFtcGxlLm9yZyIsIm14aWQiOiJAYWxpY2U6ZXhhbXBsZS5vcmciLCJzdWIiOiJkaWQ6a2V5OnpWZWN0b3JGaXh0dXJlQ2Fyb2wwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIn0.A4ep8tP7ocqm0s1T6q3iGSqw-G8ZXdMWwJrsmmJTHMSyo64w3-9udG8ZTNG0s2EW06qYmw4rsG-MZULAapOW3w"
+    }
+  },
+  "server_name": "example.org",
+  "transport": "user_directory",
+  "user_directory_response": {
+    "limited": false,
+    "results": [
+      {
+        "avatar_url": "mxc://example.org/avatar",
+        "display_name": "Alice Example",
+        "user_id": "@alice:example.org"
+      },
+      {
+        "user_id": "@bob:example.org"
+      },
+      {
+        "display_name": "Carol",
+        "user_id": "@carol:example.org"
+      },
+      {
+        "display_name": "Remote",
+        "user_id": "@remote:other.example"
+      }
+    ]
+  }
+}

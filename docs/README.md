@@ -8,6 +8,7 @@ An index of the documentation in this repository. Start with the project
 | Page | What it covers |
 |---|---|
 | [agents.md](agents.md) | Signing in software agents with their own key: `siwx-oidc-auth` CLI and library, stable devices, refresh, the device flow, verifying other parties, key custody |
+| [directory.md](directory.md) | The directory client for services (`siwx_oidc_auth::directory`): finding people by name with a verified DID over two transports, the service's own sign-in, the result shape, proof checking, caches and revocation, the shared test vectors |
 | [identity-model.md](identity-model.md) | The three identifiers (alias, MXID, DID), MXID derivation and grandfathering, the `io.inblock.did` wire format, trust model, publication, verification, `GET /resolve`, the `io.inblock.mxid` claim |
 | [matrix-integration.md](matrix-integration.md) | Wiring siwx-oidc into Synapse, dependencies and risks, MSC3861 history, token model, admin-token mint, device lifecycle, MSC4191 account management, device-code/QR login, cross-signing, what is not supported |
 | [passkeys.md](passkeys.md) | WebAuthn architecture, DID derivation, linking to a wallet, picker scoping, the new-account policy, unknown credentials |

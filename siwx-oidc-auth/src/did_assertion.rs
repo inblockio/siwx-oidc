@@ -445,6 +445,41 @@ pub async fn verify_did_assertion(
     jws: &str,
     expected_mxid: &str,
 ) -> Result<VerifiedDid> {
+    // Steps 1-2 judge the proof's own bytes and run before any network I/O.
+    let proof = parse_proof(jws)?;
+
+    let http = reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .context("failed to build HTTP client")?;
+
+    // Steps 3-5: the issuer's discovery document and key set.
+    let keys = fetch_issuer_keys(&http, issuer_base_url, None).await?;
+
+    // Steps 5-11: the signature and the claims.
+    verify_parsed(&keys, &proof, expected_mxid)
+}
+
+/// A proof that passed the structure and header gates (steps 1 and 2 of
+/// [`verify_did_assertion`]) and has not been checked against any key yet.
+///
+/// Split out so the directory client can judge a proof's shape before it needs
+/// the issuer's keys, and reuse one fetch of those keys for many proofs. The
+/// split changes nothing about the rules: [`verify_did_assertion`] is
+/// `parse_proof`, `fetch_issuer_keys` and `verify_parsed` in that order, so the
+/// `alg` gate still runs before any key is fetched.
+pub(crate) struct ParsedProof {
+    /// The ORIGINAL base64 text of the first two parts, joined by `.`: the
+    /// bytes that were signed.
+    signing_input: String,
+    payload_b64: String,
+    signature_b64: String,
+    kid: String,
+}
+
+/// Steps 1 and 2 of [`verify_did_assertion`]: structure, the `alg` gate, the
+/// `crit` gate, `typ` and `kid`. Pure: it touches no network.
+pub(crate) fn parse_proof(jws: &str) -> Result<ParsedProof> {
     // -- 1. Structure ------------------------------------------------------
     let parts: Vec<&str> = jws.split('.').collect();
     if parts.len() != 3 {
@@ -548,20 +583,65 @@ pub async fn verify_did_assertion(
                  fingerprint, `public_key_fingerprint`, `src/oidc.rs:188-190`), so a proof \
                  without one was not minted by this provider"
             )
-        })?;
+        })?
+        .to_string();
 
+    Ok(ParsedProof {
+        signing_input,
+        payload_b64: payload_b64.to_string(),
+        signature_b64: signature_b64.to_string(),
+        kid,
+    })
+}
+
+/// The issuer's discovery facts and key set, fetched once and pinned.
+///
+/// Holding one means the discovery document's `issuer` equalled the URL it was
+/// fetched from (step 3) and its `jwks_uri` shared that URL's origin (step 4).
+/// What a proof is verified against is therefore decided at fetch time, and a
+/// cached value keeps those guarantees for as long as it is kept.
+pub(crate) struct IssuerKeys {
+    anchor: String,
+    discovery_url: String,
+    issuer: String,
+    jwks_uri: String,
+    jwks: Jwks,
+}
+
+impl IssuerKeys {
+    /// Keys for a test that serves nothing: `issuer` is both the trust anchor
+    /// and the issuer the key set belongs to, `jwks` the key set itself. The
+    /// pins of steps 3 and 4 hold by construction, so a vector can name a
+    /// fixed issuer and run without a socket.
+    #[cfg(test)]
+    pub(crate) fn for_tests(issuer: &str, jwks: serde_json::Value) -> IssuerKeys {
+        let anchor = issuer.trim_end_matches('/').to_string();
+        IssuerKeys {
+            discovery_url: format!("{anchor}/.well-known/openid-configuration"),
+            jwks_uri: format!("{anchor}/jwk"),
+            issuer: anchor.clone(),
+            anchor,
+            jwks: serde_json::from_value(jwks).expect("a JWKS"),
+        }
+    }
+}
+
+/// Steps 3 to 5 of [`verify_did_assertion`], up to and including the fetch of
+/// the key set: discovery, the issuer pin, the same-origin rule for `jwks_uri`,
+/// and the JWKS. `body_cap` bounds each response body when given; the public
+/// verifier passes `None` and keeps its behaviour.
+pub(crate) async fn fetch_issuer_keys(
+    http: &reqwest::Client,
+    issuer_base_url: &str,
+    body_cap: Option<usize>,
+) -> Result<IssuerKeys> {
     // -- 3. Discovery, and PIN THE ISSUER TO THE URL IT CAME FROM ----------
-    let http = reqwest::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .build()
-        .context("failed to build HTTP client")?;
-
     // The caller's URL, minus a trailing slash, is the trust anchor for
     // everything below. Named rather than inlined because it is compared as
     // well as fetched from, and those two uses must not drift apart.
     let anchor = issuer_base_url.trim_end_matches('/');
     let discovery_url = format!("{anchor}/.well-known/openid-configuration");
-    let discovery: Discovery = get_json(&http, &discovery_url)
+    let discovery: Discovery = fetch_json(http, &discovery_url, body_cap)
         .await
         .context("OIDC discovery fetch failed")?;
 
@@ -617,11 +697,37 @@ pub async fn verify_did_assertion(
         format!("the `jwks_uri` in the discovery document at {discovery_url} is not acceptable")
     })?;
 
-    // -- 5. JWKS, selected by kid, with NO fallback ------------------------
-    let jwks: Jwks = get_json(&http, &discovery.jwks_uri)
+    // -- 5. JWKS ------------------------------------------------------------
+    let jwks: Jwks = fetch_json(http, &discovery.jwks_uri, body_cap)
         .await
         .with_context(|| format!("JWKS fetch from {} failed", discovery.jwks_uri))?;
 
+    Ok(IssuerKeys {
+        anchor: anchor.to_string(),
+        discovery_url,
+        issuer: discovery.issuer,
+        jwks_uri: discovery.jwks_uri,
+        jwks,
+    })
+}
+
+/// Steps 5 to 11 of [`verify_did_assertion`] against keys already fetched:
+/// the `kid` selection with no fallback, the JWK restrictions, the signature
+/// over the received bytes, the claims and the `mxid` binding.
+pub(crate) fn verify_parsed(
+    keys: &IssuerKeys,
+    proof: &ParsedProof,
+    expected_mxid: &str,
+) -> Result<VerifiedDid> {
+    let kid = proof.kid.as_str();
+    let signing_input = proof.signing_input.as_str();
+    let payload_b64 = proof.payload_b64.as_str();
+    let signature_b64 = proof.signature_b64.as_str();
+    let jwks = &keys.jwks;
+    let anchor = keys.anchor.as_str();
+    let discovery_url = keys.discovery_url.as_str();
+
+    // -- 5. Select the key by kid, with NO fallback ------------------------
     let jwk = jwks
         .keys
         .iter()
@@ -636,7 +742,7 @@ pub async fn verify_did_assertion(
                  key has been rotated or was ephemeral and did not survive a restart. This is \
                  deliberately a hard failure: trying every key instead would turn a rotated key \
                  into an indistinguishable \"bad signature\"",
-                discovery.jwks_uri,
+                keys.jwks_uri,
                 offered.join(", ")
             )
         })?;
@@ -675,12 +781,12 @@ pub async fn verify_did_assertion(
     let iss = claims
         .iss
         .ok_or_else(|| anyhow!("proof payload has no `iss` claim"))?;
-    if normalize_issuer(&iss) != normalize_issuer(&discovery.issuer) {
+    if normalize_issuer(&iss) != normalize_issuer(&keys.issuer) {
         bail!(
             "proof `iss` is `{iss}` but the discovery document at {discovery_url} says the issuer \
              is `{}` (a value already pinned to `{anchor}` by the §4.3 check above). This proof \
              was minted by a different provider",
-            discovery.issuer
+            keys.issuer
         );
     }
 
@@ -1067,6 +1173,67 @@ async fn get_json<T: serde::de::DeserializeOwned>(http: &reqwest::Client, url: &
         .await
         .with_context(|| format!("GET {url} did not return the expected JSON"))
 }
+
+/// [`get_json`] when `cap` is `None`; with a cap, the same fetch with the body
+/// read through [`read_capped`]. Only the directory client sets a cap.
+async fn fetch_json<T: serde::de::DeserializeOwned>(
+    http: &reqwest::Client,
+    url: &str,
+    cap: Option<usize>,
+) -> Result<T> {
+    let Some(cap) = cap else {
+        return get_json(http, url).await;
+    };
+    let resp = http
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url} failed"))?;
+    if !resp.status().is_success() {
+        bail!("GET {url} returned {}", resp.status());
+    }
+    let body = read_capped(resp, cap)
+        .await
+        .with_context(|| format!("GET {url} body"))?;
+    serde_json::from_slice(&body)
+        .with_context(|| format!("GET {url} did not return the expected JSON"))
+}
+
+/// Read a response body, failing with [`BodyTooLarge`] as soon as it passes
+/// `cap` bytes. A declared `Content-Length` over the cap fails before any byte
+/// is read; a body without one (or lying about it) is cut off while streaming,
+/// so the cap holds either way and nothing larger than `cap` is buffered.
+pub(crate) async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>> {
+    if resp.content_length().is_some_and(|n| n > cap as u64) {
+        return Err(BodyTooLarge { cap }.into());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .context("reading the response body failed")?
+    {
+        if body.len() + chunk.len() > cap {
+            return Err(BodyTooLarge { cap }.into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// A response body longer than the cap its reader was given.
+#[derive(Debug)]
+pub(crate) struct BodyTooLarge {
+    pub(crate) cap: usize,
+}
+
+impl fmt::Display for BodyTooLarge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "response body exceeds the {} byte cap", self.cap)
+    }
+}
+
+impl std::error::Error for BodyTooLarge {}
 
 // ---------------------------------------------------------------------------
 // Tests
