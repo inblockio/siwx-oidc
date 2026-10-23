@@ -78,6 +78,9 @@ pub struct Resp {
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub delay: Duration,
+    /// Send the body with `Transfer-Encoding: chunked` and no `Content-Length`,
+    /// so a client cannot know its size before it has read it.
+    pub chunked: bool,
 }
 
 impl Resp {
@@ -87,6 +90,7 @@ impl Resp {
             headers: vec![("Content-Type".into(), "application/json".into())],
             body: body.to_string().into_bytes(),
             delay: Duration::ZERO,
+            chunked: false,
         }
     }
     pub fn bytes(status: u16, body: Vec<u8>) -> Resp {
@@ -95,6 +99,17 @@ impl Resp {
             headers: vec![("Content-Type".into(), "application/json".into())],
             body,
             delay: Duration::ZERO,
+            chunked: false,
+        }
+    }
+    /// A plain-text answer, as the server's own error pages are.
+    pub fn text(status: u16, body: &str) -> Resp {
+        Resp {
+            status,
+            headers: vec![("Content-Type".into(), "text/plain".into())],
+            body: body.as_bytes().to_vec(),
+            delay: Duration::ZERO,
+            chunked: false,
         }
     }
     pub fn redirect(location: String, cookie: Option<&str>) -> Resp {
@@ -107,7 +122,19 @@ impl Resp {
             headers,
             body: Vec::new(),
             delay: Duration::ZERO,
+            chunked: false,
         }
+    }
+    /// A 302, the redirect a misdirected key fetch would meet.
+    pub fn found(location: String) -> Resp {
+        Resp {
+            status: 302,
+            ..Resp::redirect(location, None)
+        }
+    }
+    pub fn chunked(mut self) -> Resp {
+        self.chunked = true;
+        self
     }
     pub fn delayed(mut self, d: Duration) -> Resp {
         self.delay = d;
@@ -250,17 +277,36 @@ async fn serve<F>(
     }
     in_flight.fetch_sub(1, Ordering::SeqCst);
 
-    let mut out = format!(
-        "HTTP/1.1 {} X\r\nContent-Length: {}\r\nConnection: close\r\n",
-        resp.status,
-        resp.body.len()
-    );
+    let mut out = if resp.chunked {
+        format!(
+            "HTTP/1.1 {} X\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n",
+            resp.status
+        )
+    } else {
+        format!(
+            "HTTP/1.1 {} X\r\nContent-Length: {}\r\nConnection: close\r\n",
+            resp.status,
+            resp.body.len()
+        )
+    };
     for (k, v) in &resp.headers {
         out.push_str(&format!("{k}: {v}\r\n"));
     }
     out.push_str("\r\n");
     let _ = sock.write_all(out.as_bytes()).await;
-    let _ = sock.write_all(&resp.body).await;
+    if resp.chunked {
+        // 16 KiB chunks. A client that has read enough and hangs up makes a
+        // write fail, which ends the answer: that is the point of the cap.
+        for chunk in resp.body.chunks(16 * 1024) {
+            let framed = [format!("{:x}\r\n", chunk.len()).as_bytes(), chunk, b"\r\n"].concat();
+            if sock.write_all(&framed).await.is_err() {
+                return;
+            }
+        }
+        let _ = sock.write_all(b"0\r\n\r\n").await;
+    } else {
+        let _ = sock.write_all(&resp.body).await;
+    }
     let _ = sock.shutdown().await;
 }
 
@@ -325,6 +371,13 @@ pub struct IssuerState {
     pub discovery_status: u16,
     pub jwks_status: u16,
     pub jwks_delay: Duration,
+    /// Answer `/jwk` with a 302 to this URL instead of the key set.
+    pub jwks_redirect: Option<String>,
+    /// How long `/sign_in` takes to answer.
+    pub sign_in_delay: Duration,
+    /// Answer `/authorize` with this status and the server's own plain-text
+    /// body for an unregistered client, instead of the redirect.
+    pub authorize_status: Option<u16>,
     /// What the discovery document names as its issuer; `None` is its own URL.
     pub discovery_issuer: Option<String>,
     /// DID to the MXID `/resolve` finds; a DID that is absent does not exist.
@@ -358,6 +411,9 @@ impl Issuer {
             discovery_status: 200,
             jwks_status: 200,
             jwks_delay: Duration::ZERO,
+            jwks_redirect: None,
+            sign_in_delay: Duration::ZERO,
+            authorize_status: None,
             discovery_issuer: None,
             resolve,
             resolve_status: 200,
@@ -433,6 +489,9 @@ fn issuer_route(st: &Arc<Mutex<IssuerState>>, r: &Req) -> Resp {
             )
         }
         ("GET", "/jwk") => {
+            if let Some(to) = &s.jwks_redirect {
+                return Resp::found(to.clone());
+            }
             if s.jwks_status != 200 {
                 return Resp::json(s.jwks_status, json!({"error": "fixture"}));
             }
@@ -471,6 +530,9 @@ fn issuer_route(st: &Arc<Mutex<IssuerState>>, r: &Req) -> Resp {
             )
         }
         ("GET", "/authorize") => {
+            if let Some(status) = s.authorize_status {
+                return Resp::text(status, "Unrecognised client id.");
+            }
             let q = r.query_pairs();
             Resp::redirect(
                 format!(
@@ -491,13 +553,15 @@ fn issuer_route(st: &Arc<Mutex<IssuerState>>, r: &Req) -> Resp {
                 .get("redirect_uri")
                 .cloned()
                 .unwrap_or_default();
+            let delay = s.sign_in_delay;
             if let Some(error) = &s.sign_in_error {
                 return Resp::redirect(
                     format!("{uri}?error={error}&error_description=fixture&state=headless"),
                     None,
-                );
+                )
+                .delayed(delay);
             }
-            Resp::redirect(format!("{uri}?code=fixture-code&state=headless"), None)
+            Resp::redirect(format!("{uri}?code=fixture-code&state=headless"), None).delayed(delay)
         }
         ("POST", "/token") => {
             let form = r.form();
@@ -643,6 +707,15 @@ impl Homeserver {
         );
     }
 
+    /// Any answer at all for one profile.
+    pub fn profile_answer(&self, mxid: &str, resp: Resp) {
+        self.st
+            .lock()
+            .unwrap()
+            .profiles
+            .insert(mxid.to_string(), resp);
+    }
+
     pub fn profile_delay(&self, d: Duration) {
         self.st.lock().unwrap().profile_delay = d;
     }
@@ -690,6 +763,7 @@ fn hs_route(st: &Arc<Mutex<HsState>>, r: &Req) -> Resp {
                     headers: p.headers.clone(),
                     body: p.body.clone(),
                     delay,
+                    chunked: p.chunked,
                 },
                 None => Resp::json(404, json!({"errcode": "M_NOT_FOUND"})).delayed(delay),
             };
@@ -751,6 +825,10 @@ impl World {
 
     pub fn session(&self) -> ServiceSession {
         ServiceSession::new(self.session_config()).unwrap()
+    }
+
+    pub fn session_with(&self, tuning: Tuning) -> ServiceSession {
+        ServiceSession::new(self.session_config().with_tuning(tuning)).unwrap()
     }
 
     pub fn requests_total(&self) -> usize {

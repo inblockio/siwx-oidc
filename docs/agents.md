@@ -351,7 +351,12 @@ with the reason there is none. See [directory.md](directory.md).
   new id), `AccessDenied` for a deactivated or erased account (final), and
   `TemporarilyUnavailable` when Synapse could not be asked or could not set up
   the device (retry later). `is_device_refused(&err)` and `is_transient(&err)`
-  answer the two questions a caller usually has.
+  answer the two questions a caller usually has. `UnknownClient` is the one
+  refusal that is not a redirect: whatever its settings, the server answers
+  `/authorize` for a client id it does not know with a 401, and the library turns
+  that into the type (`is_unknown_client(&err)`): register the client again.
+  Error answers from `/sign_in`, `/token` and the refresh are reported by their
+  status and, when the body names one, its OAuth `error` code, never the body.
 - **Common errors** at sign-in, with fixes, are in
   [troubleshooting.md](troubleshooting.md#headless-sign-in-siwx-oidc-auth).
 

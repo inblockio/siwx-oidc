@@ -1261,3 +1261,724 @@ async fn both_transports_give_the_same_answer_for_the_same_people() {
         ]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Follow-ups from the PR 88 review (issue 89)
+// ---------------------------------------------------------------------------
+
+/// Eight callers at once, each holding its own handle to the session.
+async fn eight_callers(session: Arc<ServiceSession>) -> Vec<Result<String, DirectoryError>> {
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let s = session.clone();
+        tasks.push(tokio::spawn(async move { s.access_token().await }));
+    }
+    let mut out = Vec::new();
+    for t in tasks {
+        out.push(t.await.unwrap());
+    }
+    out
+}
+
+#[tokio::test]
+async fn waiters_share_one_failed_renewal_instead_of_signing_in_one_after_another() {
+    // With the cooldown at zero the sharing is the waiters' own doing, not the
+    // cooldown's.
+    for cooldown in [Duration::from_secs(5), Duration::ZERO] {
+        let w = World::new().await;
+        w.issuer.with(|s| s.sign_in_delay = Duration::from_secs(3));
+        let tuning = Tuning {
+            sign_in_timeout: Duration::from_millis(300),
+            failed_sign_in_cooldown: cooldown,
+            ..Tuning::default()
+        };
+        let session = Arc::new(w.session_with(tuning));
+        let started = std::time::Instant::now();
+        for got in eight_callers(session).await {
+            let err = got.unwrap_err();
+            assert!(matches!(err, DirectoryError::SignIn { .. }), "{err:?}");
+            assert!(err.is_retryable(), "a timeout is worth another try");
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "eight callers waited {:?}: one after another, not together",
+            started.elapsed()
+        );
+        assert_eq!(
+            w.issuer.mock.count("GET", "/sign_in"),
+            1,
+            "one attempt in flight, its outcome shared"
+        );
+    }
+}
+
+#[tokio::test]
+async fn after_a_failed_sign_in_the_next_try_waits_out_the_cooldown() {
+    let w = World::new().await;
+    w.issuer
+        .with(|s| s.sign_in_error = Some("temporarily_unavailable".into()));
+    let session = w.session();
+    let first = session.access_token().await.unwrap_err();
+    assert!(first.is_retryable(), "{first:?}");
+    assert_eq!(w.issuer.mock.count("GET", "/sign_in"), 1);
+
+    // The issuer is back, but the cooldown has not passed: the answer is the
+    // failure that was just seen, and nothing is sent.
+    w.issuer.with(|s| s.sign_in_error = None);
+    w.clock.advance(Duration::from_millis(4900));
+    let second = session.access_token().await.unwrap_err();
+    assert!(
+        matches!(second, DirectoryError::SignIn { .. }),
+        "{second:?}"
+    );
+    assert_eq!(second.to_string(), first.to_string());
+    assert_eq!(second.is_retryable(), first.is_retryable());
+    assert_eq!(w.issuer.mock.count("GET", "/sign_in"), 1, "no request");
+
+    // Five seconds after the failure, the next call tries again.
+    w.clock.advance(Duration::from_millis(100));
+    assert_eq!(session.access_token().await.unwrap(), "access-1");
+    assert_eq!(w.issuer.mock.count("GET", "/sign_in"), 2);
+}
+
+#[tokio::test]
+async fn the_cooldown_is_a_tuning_and_zero_means_no_waiting() {
+    let w = World::new().await;
+    w.issuer
+        .with(|s| s.sign_in_error = Some("temporarily_unavailable".into()));
+    let tuning = Tuning {
+        failed_sign_in_cooldown: Duration::ZERO,
+        ..Tuning::default()
+    };
+    let session = w.session_with(tuning);
+    session.access_token().await.unwrap_err();
+    w.issuer.with(|s| s.sign_in_error = None);
+    assert_eq!(session.access_token().await.unwrap(), "access-1");
+}
+
+#[tokio::test]
+async fn a_failed_renewal_is_shared_by_a_caller_that_was_refused_its_token() {
+    // The module refuses the token, and the sign-in that should replace it
+    // fails: the caller gets that failure, and the second caller (inside the
+    // cooldown) the same one without a request.
+    let w = World::new().await;
+    w.hs.on_module(|_, _| Resp::json(401, json!({"errcode": "M_UNKNOWN_TOKEN"})));
+    let dir = w.directory();
+    let session = w.session();
+    session.access_token().await.unwrap();
+    w.issuer
+        .with(|s| s.sign_in_error = Some("temporarily_unavailable".into()));
+    let err = dir
+        .search_for_asker(&session, ASKER_DID, "ada", 5)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DirectoryError::SignIn { .. }), "{err:?}");
+    let again = dir
+        .search_for_asker(&session, ASKER_DID, "ada", 5)
+        .await
+        .unwrap_err();
+    assert!(matches!(again, DirectoryError::SignIn { .. }), "{again:?}");
+    assert_eq!(
+        w.issuer.mock.count("GET", "/sign_in"),
+        2,
+        "the first sign-in and the one that failed; the second caller sent nothing"
+    );
+}
+
+#[tokio::test]
+async fn an_absurd_expires_in_is_capped_and_never_loses_the_new_tokens() {
+    for expires_in in [u64::MAX, u64::MAX / 2, 1 << 40] {
+        let w = World::new().await;
+        w.issuer.with(|s| s.expires_in = Some(expires_in));
+        let session = w.session();
+        assert_eq!(session.access_token().await.unwrap(), "access-1");
+
+        // Capped at 24 hours: good for 23, renewed after 25.
+        w.clock.advance(Duration::from_secs(23 * 3600));
+        assert_eq!(session.access_token().await.unwrap(), "access-1");
+        assert_eq!(w.issuer.refreshes(), 0);
+        w.issuer.with(|s| s.expires_in = Some(300));
+        w.clock.advance(Duration::from_secs(2 * 3600));
+        assert_eq!(session.access_token().await.unwrap(), "access-2");
+        assert_eq!(
+            w.issuer.refreshes(),
+            1,
+            "renewed with the refresh token the first answer brought"
+        );
+        assert_eq!(w.issuer.sign_ins(), 1);
+    }
+}
+
+/// A body over the cap, valid JSON padded with spaces.
+fn over_the_cap() -> Vec<u8> {
+    let mut body = br#"{"errcode":"M_LARGE"}"#.to_vec();
+    body.resize(256 * 1024 + 1, b' ');
+    body
+}
+
+#[tokio::test]
+async fn an_error_status_is_classified_by_its_status_however_large_its_body() {
+    for chunked in [false, true] {
+        let answer = move |status: u16| {
+            let r = Resp::bytes(status, over_the_cap());
+            if chunked {
+                r.chunked()
+            } else {
+                r
+            }
+        };
+
+        // 429, 5xx and 403 on the service transport.
+        let w = World::new().await;
+        w.hs.on_module(move |_, _| answer(429));
+        let err = w
+            .directory()
+            .search_for_asker(&w.session(), ASKER_DID, "ada", 5)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DirectoryError::RateLimited { .. }),
+            "chunked {chunked}: {err:?}"
+        );
+        assert!(err.is_retryable());
+
+        let w = World::new().await;
+        w.hs.on_module(move |_, _| answer(503));
+        let err = w
+            .directory()
+            .search_for_asker(&w.session(), ASKER_DID, "ada", 5)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DirectoryError::Unavailable(_)),
+            "chunked {chunked}: {err:?}"
+        );
+        assert!(err.is_retryable());
+
+        let w = World::new().await;
+        w.hs.on_module(move |_, _| answer(403));
+        let err = w
+            .directory()
+            .search_for_asker(&w.session(), ASKER_DID, "ada", 5)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DirectoryError::NotAdmitted),
+            "chunked {chunked}: {err:?}"
+        );
+
+        // Any other status keeps the status and no code.
+        let w = World::new().await;
+        w.hs.on_module(move |_, _| answer(404));
+        let err = w
+            .directory()
+            .search_for_asker(&w.session(), ASKER_DID, "ada", 5)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DirectoryError::UnexpectedStatus {
+                    status: 404,
+                    errcode: None
+                }
+            ),
+            "chunked {chunked}: {err:?}"
+        );
+
+        // A 401 still signs the service in again once, and retries once.
+        let w = World::new().await;
+        let hits = vec![published(&w, "alice")];
+        w.hs.on_module(move |_, n| {
+            if n == 0 {
+                answer(401)
+            } else {
+                Resp::json(200, json!({"results": hits.clone(), "limited": false}))
+            }
+        });
+        let got = w
+            .directory()
+            .search_for_asker(&w.session(), ASKER_DID, "ada", 5)
+            .await
+            .unwrap();
+        assert_eq!(got.results.len(), 1, "chunked {chunked}");
+        assert_eq!(w.issuer.sign_ins(), 2, "chunked {chunked}: signed in again");
+        assert_eq!(w.hs.module_calls(), 2);
+
+        // And on the user transport.
+        let w = World::new().await;
+        w.hs.on_user_directory(move |_, _| answer(401));
+        let err = w
+            .directory()
+            .search_as_user("t", "ada", 5)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DirectoryError::Unauthorized),
+            "chunked {chunked}: {err:?}"
+        );
+
+        // A profile read on the user transport.
+        let w = World::new().await;
+        w.hs.directory_rows(vec![json!({"user_id": mxid("alice")})]);
+        w.hs.profile_answer(&mxid("alice"), answer(503));
+        let err = w
+            .directory()
+            .search_as_user("t", "ada", 5)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DirectoryError::Unavailable(_)),
+            "chunked {chunked}: {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_success_over_the_cap_is_still_a_protocol_error_with_or_without_a_length() {
+    for chunked in [false, true] {
+        let w = World::new().await;
+        w.hs.on_module(move |_, _| {
+            let mut body = br#"{"results":[],"limited":false}"#.to_vec();
+            body.resize(256 * 1024 + 1, b' ');
+            let r = Resp::bytes(200, body);
+            if chunked {
+                r.chunked()
+            } else {
+                r
+            }
+        });
+        let err = w
+            .directory()
+            .search_for_asker(&w.session(), ASKER_DID, "ada", 5)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DirectoryError::Protocol(_)),
+            "chunked {chunked}: {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_chunked_answer_without_a_length_is_cut_off_at_the_cap() {
+    const CAP: usize = 256 * 1024;
+    let w = World::new().await;
+    let padded = |n: usize| {
+        let mut body = br#"{"results":[],"limited":false}"#.to_vec();
+        body.resize(n, b' ');
+        body
+    };
+    // Exactly the cap, streamed: accepted.
+    let at_cap = padded(CAP);
+    w.hs.on_module(move |_, _| Resp::bytes(200, at_cap.clone()).chunked());
+    let dir = w.directory();
+    let session = w.session();
+    dir.search_for_asker(&session, ASKER_DID, "ada", 5)
+        .await
+        .unwrap();
+
+    // One byte more, and a body of 8 MiB: both refused, the second without
+    // being buffered (the server's writes fail once the client hangs up).
+    for size in [CAP + 1, 8 * 1024 * 1024] {
+        let over = padded(size);
+        w.hs.on_module(move |_, _| Resp::bytes(200, over.clone()).chunked());
+        let err = dir
+            .search_for_asker(&session, ASKER_DID, "ada", 5)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DirectoryError::Protocol(_)),
+            "{size}: {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn concurrent_searches_make_one_discovery_and_key_set_fetch() {
+    let w = World::new().await;
+    w.hs.module_hits(vec![published(&w, "alice")]);
+    w.issuer.with(|s| s.jwks_delay = Duration::from_millis(300));
+    let dir = w.directory();
+    let session = Arc::new(w.session());
+    session.access_token().await.unwrap();
+
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let (dir, session) = (dir.clone(), session.clone());
+        tasks.push(tokio::spawn(async move {
+            dir.search_for_asker(&session, ASKER_DID, "a", 5).await
+        }));
+    }
+    for t in tasks {
+        let got = t.await.unwrap().unwrap();
+        assert!(got.results[0].did.verified_did().is_some());
+    }
+    assert_eq!(w.issuer.mock.count("GET", "/jwk"), 1, "one key set fetch");
+    assert_eq!(
+        w.issuer
+            .mock
+            .count("GET", "/.well-known/openid-configuration"),
+        1,
+        "one discovery fetch"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_key_set_fetch_is_shared_by_the_searches_that_waited_for_it() {
+    let w = World::new().await;
+    w.hs.module_hits(vec![published(&w, "alice")]);
+    w.issuer.with(|s| {
+        s.jwks_status = 500;
+        s.jwks_delay = Duration::from_millis(300);
+    });
+    let dir = w.directory();
+    let session = Arc::new(w.session());
+    session.access_token().await.unwrap();
+
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let (dir, session) = (dir.clone(), session.clone());
+        tasks.push(tokio::spawn(async move {
+            dir.search_for_asker(&session, ASKER_DID, "a", 5).await
+        }));
+    }
+    for t in tasks {
+        let err = t.await.unwrap().unwrap_err();
+        assert!(matches!(err, DirectoryError::Unavailable(_)), "{err:?}");
+        assert!(err.is_retryable());
+    }
+    assert_eq!(w.issuer.mock.count("GET", "/jwk"), 1, "one attempt, shared");
+
+    // Nothing of the failure is kept: the next search asks again.
+    w.issuer.with(|s| {
+        s.jwks_status = 200;
+        s.jwks_delay = Duration::ZERO;
+    });
+    let got = dir
+        .search_for_asker(&session, ASKER_DID, "a", 5)
+        .await
+        .unwrap();
+    assert!(got.results[0].did.verified_did().is_some());
+    assert_eq!(w.issuer.mock.count("GET", "/jwk"), 2);
+}
+
+/// A hit whose proof is signed by `key` under `kid`.
+fn signed_by(w: &World, key: &p256::ecdsa::SigningKey, kid: &str, name: &str) -> Value {
+    let (m, d) = (mxid(name), did_of(name));
+    let proof = mint(
+        key,
+        kid,
+        &json!({"iss": w.issuer.mock.base, "sub": d, "mxid": m, "iat": 1_757_000_000}),
+    );
+    hit(&m, Some(name), Some(json!({"did": d, "proof": proof})))
+}
+
+#[tokio::test]
+async fn a_proof_with_an_unknown_kid_refetches_the_key_set_once_per_thirty_seconds() {
+    let w = World::new().await;
+    let dir = w.directory();
+    let session = w.session();
+    let jwk_fetches = || w.issuer.mock.count("GET", "/jwk");
+
+    // The first search fetches and caches the issuer's first key set.
+    w.hs.module_hits(vec![published(&w, "alice")]);
+    dir.search_for_asker(&session, ASKER_DID, "a", 5)
+        .await
+        .unwrap();
+    assert_eq!(jwk_fetches(), 1);
+
+    // The issuer rotates its key. Carol's proof is signed with the new one.
+    let new_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+    w.issuer
+        .with(|s| s.jwks = json!({"keys": [jwk_of(&new_key, "fixture-kid-2")]}));
+    w.hs.module_hits(vec![signed_by(&w, &new_key, "fixture-kid-2", "carol")]);
+
+    // Inside 30 seconds of the last fetch the kid is unknown and stays so.
+    w.clock.advance(Duration::from_secs(29));
+    let got = dir
+        .search_for_asker(&session, ASKER_DID, "a", 5)
+        .await
+        .unwrap();
+    assert_eq!(states(&got), vec![json!({"state": "invalid"})]);
+    assert_eq!(jwk_fetches(), 1, "rate limited: no refetch yet");
+
+    // Thirty seconds after it, the unknown kid is worth one refetch.
+    w.clock.advance(Duration::from_secs(1));
+    let got = dir
+        .search_for_asker(&session, ASKER_DID, "a", 5)
+        .await
+        .unwrap();
+    assert_eq!(states(&got), vec![verified(&did_of("carol"))]);
+    assert_eq!(jwk_fetches(), 2);
+    assert_eq!(
+        w.issuer
+            .mock
+            .count("GET", "/.well-known/openid-configuration"),
+        2,
+        "discovery is fetched again with the keys"
+    );
+
+    // A kid that the fresh set does not have either is invalid, and asking
+    // again inside the interval does not fetch again.
+    let rogue = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+    w.hs.module_hits(vec![signed_by(&w, &rogue, "no-such-kid", "dave")]);
+    for _ in 0..3 {
+        let got = dir
+            .search_for_asker(&session, ASKER_DID, "a", 5)
+            .await
+            .unwrap();
+        assert_eq!(states(&got), vec![json!({"state": "invalid"})]);
+    }
+    assert_eq!(jwk_fetches(), 2);
+    w.clock.advance(Duration::from_secs(30));
+    let got = dir
+        .search_for_asker(&session, ASKER_DID, "a", 5)
+        .await
+        .unwrap();
+    assert_eq!(states(&got), vec![json!({"state": "invalid"})]);
+    assert_eq!(jwk_fetches(), 3, "one more refetch, then invalid again");
+}
+
+#[tokio::test]
+async fn many_searches_with_an_unknown_kid_cost_the_issuer_one_refetch() {
+    let w = World::new().await;
+    let dir = w.directory();
+    let session = Arc::new(w.session());
+    w.hs.module_hits(vec![published(&w, "alice")]);
+    dir.search_for_asker(&session, ASKER_DID, "a", 5)
+        .await
+        .unwrap();
+    w.clock.advance(Duration::from_secs(30));
+
+    let new_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+    w.issuer.with(|s| {
+        s.jwks = json!({"keys": [jwk_of(&new_key, "fixture-kid-2")]});
+        s.jwks_delay = Duration::from_millis(300);
+    });
+    w.hs.module_hits(vec![signed_by(&w, &new_key, "fixture-kid-2", "carol")]);
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let (dir, session) = (dir.clone(), session.clone());
+        tasks.push(tokio::spawn(async move {
+            dir.search_for_asker(&session, ASKER_DID, "a", 5).await
+        }));
+    }
+    for t in tasks {
+        let got = t.await.unwrap().unwrap();
+        assert_eq!(states(&got), vec![verified(&did_of("carol"))]);
+    }
+    assert_eq!(
+        w.issuer.mock.count("GET", "/jwk"),
+        2,
+        "the first fetch and one refetch"
+    );
+}
+
+/// Every character Python's `str.strip()` removes (`str.isspace()`, checked
+/// against Python 3 with Unicode 16): Rust's whitespace plus U+001C to U+001F.
+const MODULE_TRIMS: [char; 29] = [
+    '\u{9}', '\u{a}', '\u{b}', '\u{c}', '\u{d}', '\u{1c}', '\u{1d}', '\u{1e}', '\u{1f}', ' ',
+    '\u{85}', '\u{a0}', '\u{1680}', '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}',
+    '\u{2005}', '\u{2006}', '\u{2007}', '\u{2008}', '\u{2009}', '\u{200a}', '\u{2028}', '\u{2029}',
+    '\u{202f}', '\u{205f}', '\u{3000}',
+];
+
+fn module_terms(w: &World) -> Vec<String> {
+    w.hs.mock
+        .requests()
+        .iter()
+        .filter(|r| r.path == MODULE_PATH)
+        .map(|r| r.json()["term"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_term_the_module_would_refuse_is_refused_before_any_call() {
+    let w = World::new().await;
+    let dir = w.directory();
+    let session = w.session();
+    for term in [
+        // Control characters inside the term.
+        "ada\u{0}x",
+        "a\u{7}b",
+        "a\nb",
+        "a\tb",
+        "a\u{1c}b",
+        "a\u{85}b",
+        "a\u{9f}b",
+        // At an end, where only whitespace is trimmed and these are not.
+        "\u{7f}",
+        "\u{9f}a",
+        "ada\u{7}",
+        "\u{1b}ada",
+        "a\u{85}\u{0}",
+        // Nothing but what the module trims.
+        "\u{1c}",
+        "\u{1f}\u{1f}",
+        " \u{85}\u{a0}",
+        "",
+    ] {
+        let err = dir
+            .search_for_asker(&session, ASKER_DID, term, 5)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DirectoryError::InvalidInput(_)),
+            "{term:?}: {err:?}"
+        );
+        let err = dir.search_as_user("tok", term, 5).await.unwrap_err();
+        assert!(
+            matches!(err, DirectoryError::InvalidInput(_)),
+            "{term:?}: {err:?}"
+        );
+    }
+    assert_eq!(w.requests_total(), 0, "nothing was sent for any of them");
+}
+
+#[tokio::test]
+async fn the_term_is_trimmed_exactly_as_the_module_trims_it() {
+    let w = World::new().await;
+    let dir = w.directory();
+    let session = w.session();
+    for c in MODULE_TRIMS {
+        for term in [
+            format!("{c}ada"),
+            format!("ada{c}"),
+            format!("{c}{c}ada{c}"),
+        ] {
+            dir.search_for_asker(&session, ASKER_DID, &term, 5)
+                .await
+                .unwrap_or_else(|e| panic!("{term:?}: {e:?}"));
+        }
+    }
+    assert!(
+        module_terms(&w).iter().all(|t| t == "ada"),
+        "{:?}",
+        module_terms(&w)
+    );
+    assert_eq!(module_terms(&w).len(), MODULE_TRIMS.len() * 3);
+
+    // What the module keeps, the client keeps: format and separator characters
+    // that are not whitespace, and a line separator inside the term.
+    for term in [
+        "\u{200b}ada",
+        "\u{180e}ada",
+        "\u{feff}ada",
+        "a\u{2028}b",
+        "a b",
+    ] {
+        dir.search_for_asker(&session, ASKER_DID, term, 5)
+            .await
+            .unwrap();
+        assert_eq!(module_terms(&w).last().unwrap(), term);
+    }
+}
+
+#[tokio::test]
+async fn the_server_name_is_compared_the_way_synapse_does_exactly() {
+    let w = World::new().await;
+    let other_case = "@alice:EXAMPLE.org";
+    let proof_for_other_case = w.issuer.field(&did_of("alice"), other_case);
+    w.hs.module_hits(vec![
+        hit(other_case, Some("Alice"), Some(proof_for_other_case)),
+        published(&w, "bob"),
+    ]);
+    let dir = w.directory();
+    let got = dir
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        states(&got),
+        vec![
+            json!({"state": "not_yet_published"}),
+            verified(&did_of("bob"))
+        ],
+        "another spelling of the server name is another server"
+    );
+
+    // On the user transport its profile is not even read.
+    w.hs.directory_rows(vec![
+        json!({"user_id": other_case}),
+        json!({"user_id": mxid("bob")}),
+    ]);
+    w.hs.profile(
+        &mxid("bob"),
+        Some(w.issuer.field(&did_of("bob"), &mxid("bob"))),
+    );
+    let got = dir.search_as_user("t", "a", 5).await.unwrap();
+    assert_eq!(got.results[0].did, DidState::NotYetPublished);
+    assert_eq!(w.hs.profile_reads(), 1);
+}
+
+#[tokio::test]
+async fn the_public_verifier_follows_no_redirect_for_the_key_set() {
+    let w = World::new().await;
+    // An attacker's origin serves a key set it holds the key to, and a proof
+    // signed with it. If the redirect from the issuer's own `jwks_uri` were
+    // followed, the proof would verify as the issuer's.
+    let attacker_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+    let attacker_jwks = json!({"keys": [jwk_of(&attacker_key, KID)]});
+    let attacker = Mock::start(move |_| Resp::json(200, attacker_jwks.clone())).await;
+    let issuer = &w.issuer.mock.base;
+    let proof = mint(
+        &attacker_key,
+        KID,
+        &json!({"iss": issuer, "sub": did_of("mallory"), "mxid": mxid("mallory"), "iat": 1}),
+    );
+
+    // Control: a proof of the issuer's own key verifies.
+    let honest = w.issuer.proof(&did_of("alice"), &mxid("alice"));
+    siwx_oidc_auth::verify_did_assertion(issuer, &honest, &mxid("alice"))
+        .await
+        .unwrap();
+
+    w.issuer
+        .with(|s| s.jwks_redirect = Some(format!("{}/jwk", attacker.base)));
+    let err = siwx_oidc_auth::verify_did_assertion(issuer, &proof, &mxid("mallory"))
+        .await
+        .expect_err("the redirect must not be followed");
+    assert!(format!("{err:#}").contains("302"), "{err:#}");
+    assert_eq!(attacker.total(), 0, "the other origin was never asked");
+}
+
+#[tokio::test]
+async fn fetch_and_verify_did_follows_no_redirect_either() {
+    let w = World::new().await;
+    let elsewhere = Mock::start(|_| Resp::json(200, json!({"io.inblock.did": null}))).await;
+    let target = format!("{}/anything", elsewhere.base);
+    let home = Mock::start(move |_| Resp::found(target.clone())).await;
+    let err = siwx_oidc_auth::fetch_and_verify_did(&home.base, &mxid("alice"), &w.issuer.mock.base)
+        .await
+        .expect_err("a redirect is not a profile");
+    assert!(format!("{err:#}").contains("302"), "{err:#}");
+    assert_eq!(elsewhere.total(), 0, "the redirect target was never asked");
+}
+
+#[tokio::test]
+async fn an_unregistered_client_is_a_typed_sign_in_error() {
+    let w = World::new().await;
+    w.issuer.with(|s| s.authorize_status = Some(401));
+    let err = w.session().access_token().await.unwrap_err();
+    assert!(err.is_unknown_client(), "{err:?}");
+    assert!(
+        !err.is_retryable(),
+        "registering again is the caller's move"
+    );
+    let DirectoryError::SignIn { source } = &err else {
+        panic!("{err:?}");
+    };
+    assert_eq!(
+        source.downcast_ref::<siwx_oidc_auth::AuthError>(),
+        Some(&siwx_oidc_auth::AuthError::UnknownClient)
+    );
+    assert!(siwx_oidc_auth::is_unknown_client(source));
+
+    // Another failure at /authorize is not that.
+    let w = World::new().await;
+    w.issuer.with(|s| s.authorize_status = Some(500));
+    let err = w.session().access_token().await.unwrap_err();
+    assert!(!err.is_unknown_client(), "{err:?}");
+    assert!(err.is_retryable());
+}

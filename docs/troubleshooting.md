@@ -43,22 +43,24 @@ after a deployment.
 
 ## Headless sign-in (siwx-oidc-auth)
 
+The client reports an error answer by its status and, when the body names one,
+its OAuth `error` code, and never the body: a proxy or a hostile server decides
+what a body says. The reason a request was refused is in the server's log.
+
 | Error printed by the client | Cause | Fix |
 |---|---|---|
-| `/authorize returned 401 Unauthorized instead of 303` | the `client_id` is not registered | register a client ([agents.md](agents.md#prerequisites)) |
+| `/authorize returned 401 Unauthorized instead of 303: the client id is not registered at the server` (`AuthError::UnknownClient`) | the `client_id` is not registered, or a dynamic client lapsed after 30 days without a use | register a client ([agents.md](agents.md#prerequisites)); check with `siwx_oidc_auth::is_unknown_client` |
 | `/authorize response missing session cookie` | the `redirect_uri` is not registered for that client; the server answered with a 303 to `/error?message=unregistered_redirect_uri`, which sets no session cookie | pass exactly a registered redirect URI (query strings are ignored in the comparison) |
 | `/authorize refused the request: invalid_scope: …` | the scope passed to `authenticate_with_scope` asks for nothing the server will grant this client; the server answered with a 303 to the redirect URI carrying `error` and `error_description`, and the client reports both | read the description; ask for a scope the client may have, or change the client's allowed scopes |
-| `/sign_in returned 400 …: DID method 'key' is not enabled on this server` | `supported_did_methods` does not contain `"key"` | add it (it is in the default) |
-| `/sign_in returned 401 …: Signature verification failed` | the signature does not match the DID in the message | check the key file; do not edit the generated message |
-| `/sign_in returned 401 …: This account has been deactivated …` | the account was deactivated | a deactivated account cannot sign in |
-| `/sign_in returned 503 …` | the deactivation check could not reach Synapse | check Synapse and the shared secret; retry |
+| `/sign_in returned 400 Bad Request instead of 303` | the request was refused, for example because `supported_did_methods` does not contain `"key"` | the server log has the reason (`bad_request`); add `"key"` if that is it (it is in the default) |
+| `/sign_in returned 401 Unauthorized instead of 303` | the signature does not match the DID in the message, or the account was deactivated | the server log has the reason (`unauthorized`). Signature: check the key file, do not edit the generated message. Deactivated: such an account cannot sign in |
+| `/sign_in returned 503 Service Unavailable instead of 303` | the deactivation check could not reach Synapse | check Synapse and the shared secret; retry |
 | `/sign_in refused the request: invalid_scope: …` (`AuthError::DeviceRefused`) | the server runs `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` and the device id passed to `authenticate_with_device` was signed out (deleted); it is never recreated | forget the id and sign in with a new one; check with `siwx_oidc_auth::is_device_refused` |
 | `/sign_in refused the request: access_denied: …` (`AuthError::AccessDenied`) | the same setting, for a deactivated or erased account (the 401 above) | a deactivated account cannot sign in; stop, do not retry |
 | `/sign_in refused the request: temporarily_unavailable: …` (`AuthError::TemporarilyUnavailable`) | the same setting: Synapse could not be asked about the account, or could not set up the device (the 503 above); no tokens were issued | retry later, as after an outage (`siwx_oidc_auth::is_transient`) |
-| `/token returned 401 …: {"error":"invalid_client","error_description":"Secret required."}` | the client was registered as a confidential client | register it with `token_endpoint_auth_method: "none"` |
-| `/token refresh returned 400 …: invalid_grant` with "client_id does not match the refresh token." | the refresh names another client than the one the tokens were issued to | refresh with the `client_id` used at sign-in |
-| `/token refresh returned 400 …: invalid_grant` | the refresh token was already rotated (more than 60 s ago), expired, or its session was revoked | sign in again with the key; always store the newest refresh token |
-| `/token error: unsupported_grant_type: device_code grant requires MSC3861 mode.` with `--device-flow` | the server is not in delegated-auth mode ("MSC3861 mode" is the older name) | the device flow needs a Synapse-backed deployment |
+| `/token returned 401 Unauthorized (invalid_client)` | the client was registered as a confidential client ("Secret required.") | register it with `token_endpoint_auth_method: "none"` |
+| `/token refresh returned 400 Bad Request (invalid_grant)` | the refresh names another client than the one the tokens were issued to ("client_id does not match the refresh token."), or the refresh token was already rotated (more than 60 s ago), expired, or its session was revoked | the server log has the description. Refresh with the `client_id` used at sign-in; otherwise sign in again with the key, and always store the newest refresh token |
+| `/token error: unsupported_grant_type (400 Bad Request)` with `--device-flow` | the server is not in delegated-auth mode ("MSC3861 mode" is the older name): "device_code grant requires MSC3861 mode." | the device flow needs a Synapse-backed deployment |
 | every run shows a different DID | no key was given, so an ephemeral key was generated | pass `--key-file` or set `SIWX_KEY_FILE` |
 | a new Matrix device on every run | no pinned device ID | use `--device-id` / `authenticate_with_device`, and refresh instead of signing in again |
 

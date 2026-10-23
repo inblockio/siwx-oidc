@@ -118,7 +118,7 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   helpers and the 148 unit and hermetic tests of the rotation canary
   (`siwx-oidc-auth/tests/rotation_canary_unit.rs`, which compiles the modules of
   `examples/rotation_canary.rs`; the hermetic ones talk to a fake server inside the test process),
-  and the directory client's suites: `siwx-oidc-auth/tests/directory.rs` (46 tests through the
+  and the directory client's suites: `siwx-oidc-auth/tests/directory.rs` (64 tests through the
   public API against a fake siwx-oidc and a fake homeserver on local sockets, `tests/directory/support.rs`,
   with a clock the tests move by hand) and the shared vectors in `siwx-oidc-auth/tests/vectors/directory/`
   (`every_vector_gives_its_expected_result`; the `#[ignore]`d `regenerate_directory_vectors` makes them
@@ -331,10 +331,19 @@ doc; read it before changing the code the rule covers.
   and fails is `invalid`. `DidState::Verified` can only be made inside `directory.rs` and the result
   types derive `Serialize` only, like `VerifiedDid`. The verified cache is keyed by `(mxid, proof)`
   and lives at most 10 minutes. Tokens stay in memory: no file API and no output macro in the module
-  outside its tests. Pin: `a_failure_to_get_the_keys_fails_the_search_and_is_stored_nowhere`,
+  outside its tests. The key set is fetched by one request pair at a time and a waiter shares the
+  fetch's outcome; a proof with a `kid` the cached set lacks refetches it, at most once per 30 s; a
+  failed renewal of the service session is shared by its waiters and answered for 5 s; an error
+  status is classified by its status however long its body; the public verifier follows no
+  redirect (its `jwks_uri` was judged as named). Pin: `a_failure_to_get_the_keys_fails_the_search_and_is_stored_nowhere`,
   `the_result_types_cannot_be_deserialized`, `a_cached_verification_is_for_that_mxid_and_that_proof_only`,
   `a_verified_result_is_kept_for_ten_minutes_and_not_a_second_longer`,
-  `the_module_touches_no_file_and_prints_nothing`.
+  `the_module_touches_no_file_and_prints_nothing`,
+  `concurrent_searches_make_one_discovery_and_key_set_fetch`,
+  `a_proof_with_an_unknown_kid_refetches_the_key_set_once_per_thirty_seconds`,
+  `waiters_share_one_failed_renewal_instead_of_signing_in_one_after_another`,
+  `an_error_status_is_classified_by_its_status_however_large_its_body`,
+  `the_public_verifier_follows_no_redirect_for_the_key_set`.
 
 ### Publication and the Synapse client ([docs/matrix-integration.md](docs/matrix-integration.md))
 
@@ -587,6 +596,17 @@ doc; read it before changing the code the rule covers.
   `a_client_that_follows_redirects_gets_an_error_naming_the_redirect_policy`,
   `a_sign_in_that_answers_with_a_page_names_the_redirect_policy_too`,
   `an_error_status_at_authorize_is_not_blamed_on_the_redirect_policy`.
+- **The headless client's errors name a status and an OAuth `error` code, never a body, and a client
+  id the server does not know is typed.** `/authorize`, `/sign_in`, `/token`, the refresh and the
+  device flow read an error answer under the 256 KiB cap (`Refusal`) and keep the status and, when
+  the body is JSON with an `error` that is a short token, that code. `/authorize` answers 401 for an
+  unregistered client id (`oidc::authorize`) and the client returns `AuthError::UnknownClient`; a
+  consumer matches that type (`is_unknown_client`), not the text. Pin:
+  `a_token_error_is_reported_by_its_status_and_code_and_never_its_body`,
+  `a_sign_in_page_is_reported_by_its_status_and_never_its_body`,
+  `a_refresh_error_is_reported_by_its_status_and_code_and_never_its_body`,
+  `an_unregistered_client_at_authorize_is_a_typed_error`, and against this server's own handler
+  `an_unregistered_client_id_is_the_typed_unknown_client_error`.
 - **An empty `device_id` is JSON `null` on the wire, never `""`.** Synapse rejects `""`. Pin:
   `empty_device_id_renders_as_json_null`, `deviceless_token_body_carries_device_id_null`.
 - **The grant is the unit** (I2). Every access and refresh token belongs to exactly one grant

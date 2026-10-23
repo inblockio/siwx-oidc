@@ -448,10 +448,7 @@ pub async fn verify_did_assertion(
     // Steps 1-2 judge the proof's own bytes and run before any network I/O.
     let proof = parse_proof(jws)?;
 
-    let http = reqwest::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .build()
-        .context("failed to build HTTP client")?;
+    let http = http_client()?;
 
     // Steps 3-5: the issuer's discovery document and key set.
     let keys = fetch_issuer_keys(&http, issuer_base_url, None).await?;
@@ -475,6 +472,13 @@ pub(crate) struct ParsedProof {
     payload_b64: String,
     signature_b64: String,
     kid: String,
+}
+
+impl ParsedProof {
+    /// The `kid` the proof names.
+    pub(crate) fn kid(&self) -> &str {
+        &self.kid
+    }
 }
 
 /// Steps 1 and 2 of [`verify_did_assertion`]: structure, the `alg` gate, the
@@ -609,6 +613,14 @@ pub(crate) struct IssuerKeys {
 }
 
 impl IssuerKeys {
+    /// Whether the key set has a key with this `kid`. Step 5 selects by `kid`
+    /// with no fallback; a caller that caches a key set asks first, so that an
+    /// unknown `kid` (a rotation it has not seen) can be answered with a fresh
+    /// fetch instead of a verdict on a stale set.
+    pub(crate) fn has_kid(&self, kid: &str) -> bool {
+        self.jwks.keys.iter().any(|k| k.kid.as_deref() == Some(kid))
+    }
+
     /// Keys for a test that serves nothing: `issuer` is both the trust anchor
     /// and the issuer the key set belongs to, `jwks` the key set itself. The
     /// pins of steps 3 and 4 hold by construction, so a vector can name a
@@ -687,6 +699,10 @@ pub(crate) async fn fetch_issuer_keys(
     // mint verifies as the pinned issuer. Same-origin (RFC 6454 §4: scheme,
     // host, effective port) keeps key resolution inside the authority that was
     // just pinned.
+    //
+    // The fetch below follows no redirect (`http_client`): this rule judges the
+    // URL the issuer NAMED, and a 3xx from it would carry the fetch to another
+    // origin after the check.
     //
     // This is deliberately stricter than OIDC, which only requires the URL to
     // be https. We give up nothing real: a deployment that wants its JWKS
@@ -872,10 +888,7 @@ pub async fn fetch_and_verify_did(
     mxid: &str,
     issuer_base_url: &str,
 ) -> Result<VerifiedDid> {
-    let http = reqwest::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .build()
-        .context("failed to build HTTP client")?;
+    let http = http_client()?;
 
     // Unauthenticated on purpose: the stable v3 profile route is registered
     // unconditionally on Synapse 1.159.0 (`rest/client/profile.py:100-103`) and
@@ -972,6 +985,18 @@ pub async fn fetch_and_verify_did(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The HTTP client both public entry points use. It follows no redirect: the
+/// same-origin rule for `jwks_uri` (step 4) judges the URL the issuer named, and
+/// a redirect from that URL would carry the key fetch to an origin nobody
+/// vouched for, after the check. A 3xx is an error like any other non-success.
+fn http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("failed to build HTTP client")
+}
 
 /// Describe a disagreement between the object's plain `did` member and the
 /// signed `sub`, or `None` when they agree (or there is no plain member).
@@ -1203,9 +1228,22 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
 /// `cap` bytes. A declared `Content-Length` over the cap fails before any byte
 /// is read; a body without one (or lying about it) is cut off while streaming,
 /// so the cap holds either way and nothing larger than `cap` is buffered.
-pub(crate) async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>> {
+pub(crate) async fn read_capped(resp: reqwest::Response, cap: usize) -> Result<Vec<u8>> {
+    read_at_most(resp, cap)
+        .await?
+        .ok_or_else(|| BodyTooLarge { cap }.into())
+}
+
+/// [`read_capped`] for a caller that has a use for "too long" as an answer: the
+/// body, or `None` when it passes `cap` bytes, with the same bounds on what is
+/// read and kept. An error answer is read this way, so that its status still
+/// counts when its body is over the cap.
+pub(crate) async fn read_at_most(
+    mut resp: reqwest::Response,
+    cap: usize,
+) -> Result<Option<Vec<u8>>> {
     if resp.content_length().is_some_and(|n| n > cap as u64) {
-        return Err(BodyTooLarge { cap }.into());
+        return Ok(None);
     }
     let mut body = Vec::new();
     while let Some(chunk) = resp
@@ -1214,12 +1252,16 @@ pub(crate) async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Resu
         .context("reading the response body failed")?
     {
         if body.len() + chunk.len() > cap {
-            return Err(BodyTooLarge { cap }.into());
+            return Ok(None);
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(body)
+    Ok(Some(body))
 }
+
+/// The default bound on any one response body: 256 KiB, enough for a key set or
+/// a page of directory rows and far more than any error answer needs.
+pub(crate) const DEFAULT_BODY_CAP: usize = 256 * 1024;
 
 /// A response body longer than the cap its reader was given.
 #[derive(Debug)]
