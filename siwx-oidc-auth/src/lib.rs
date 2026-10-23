@@ -596,9 +596,9 @@ pub fn is_transient(err: &anyhow::Error) -> bool {
 }
 
 /// How a server refused a request, as far as this client repeats it: the status
-/// and, when the body is a JSON object with an OAuth `error` that is a short
-/// token, that code. Never the body itself, which is whatever the server (or
-/// whatever answers in its place) chose to write.
+/// and, when the body is a JSON object with a Matrix `errcode` or an OAuth
+/// `error` that is a short token, that code. Never the body itself, which is
+/// whatever the server (or whatever answers in its place) chose to write.
 struct Refusal {
     status: StatusCode,
     code: Option<String>,
@@ -609,13 +609,24 @@ impl Refusal {
     /// a longer body, or one that cannot be read, has no code and the status
     /// still stands.
     async fn of(resp: reqwest::Response) -> Refusal {
+        Refusal::within(resp, ERROR_BODY_CAP).await
+    }
+
+    /// [`Refusal::of`] with the read bounded by `cap` instead.
+    async fn within(resp: reqwest::Response, cap: usize) -> Refusal {
         let status = resp.status();
-        let code = did_assertion::read_at_most(resp, ERROR_BODY_CAP)
+        let code = did_assertion::read_at_most(resp, cap)
             .await
             .ok()
             .flatten()
             .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
-            .and_then(|json| directory::short_code(json.get("error")?.as_str()?));
+            .and_then(|json| {
+                // Matrix names its code `errcode` and puts a sentence in
+                // `error`; OAuth names its code `error`.
+                ["errcode", "error"]
+                    .into_iter()
+                    .find_map(|field| directory::short_code(json.get(field)?.as_str()?))
+            });
         Refusal { status, code }
     }
 
@@ -862,7 +873,9 @@ async fn code_flow(
         return Err(Refusal::of(resp).await.into_error("/token"));
     }
 
-    let raw: TokenResponseRaw = resp.json().await.context("/token JSON parse failed")?;
+    let raw: TokenResponseRaw = did_assertion::read_json(resp, did_assertion::DEFAULT_BODY_CAP)
+        .await
+        .context("/token JSON parse failed")?;
     Ok(AuthTokens {
         access_token: raw.access_token,
         token_type: raw.token_type,
@@ -913,8 +926,7 @@ pub async fn refresh(
         return Err(Refusal::of(resp).await.into_error("/token refresh"));
     }
 
-    let raw: TokenResponseRaw = resp
-        .json()
+    let raw: TokenResponseRaw = did_assertion::read_json(resp, did_assertion::DEFAULT_BODY_CAP)
         .await
         .context("/token refresh JSON parse failed")?;
     Ok(AuthTokens {
@@ -978,10 +990,10 @@ pub async fn authenticate_device_flow(server_url: &str, client_id: &str) -> Resu
         return Err(Refusal::of(resp).await.into_error("/device_authorization"));
     }
 
-    let device_auth: DeviceAuthResponseRaw = resp
-        .json()
-        .await
-        .context("/device_authorization JSON parse failed")?;
+    let device_auth: DeviceAuthResponseRaw =
+        did_assertion::read_json(resp, did_assertion::DEFAULT_BODY_CAP)
+            .await
+            .context("/device_authorization JSON parse failed")?;
 
     // Step 2: Display instructions
     eprintln!();
@@ -1026,7 +1038,10 @@ pub async fn authenticate_device_flow(server_url: &str, client_id: &str) -> Resu
             .context("POST /token (device poll) failed")?;
 
         if resp.status().is_success() {
-            let raw: TokenResponseRaw = resp.json().await.context("/token JSON parse failed")?;
+            let raw: TokenResponseRaw =
+                did_assertion::read_json(resp, did_assertion::DEFAULT_BODY_CAP)
+                    .await
+                    .context("/token JSON parse failed")?;
             let did = raw
                 .id_token
                 .as_ref()
@@ -1834,6 +1849,68 @@ mod tests {
         assert_eq!(
             format!("{error:#}"),
             "/token refresh returned 500 Internal Server Error"
+        );
+    }
+
+    /// A success answer is parsed under the cap too, and a parse failure says
+    /// only that the shape is wrong: serde's own message quotes the offending
+    /// value (`invalid type: string "..."`).
+    #[tokio::test]
+    async fn a_success_answer_of_the_wrong_shape_is_reported_without_its_content() {
+        let json = ["content-type: application/json"];
+        let wrong_shape = "JSON parse failed: the body is JSON of another shape than expected";
+        for body in [
+            format!(r#""{MARKER}""#),
+            format!(r#"{{"access_token":"a","token_type":"b","expires_in":"{MARKER}"}}"#),
+        ] {
+            let error = token_answering(raw_response_with_body("200 OK", &json, &body)).await;
+            assert_body_free(&error);
+            assert_eq!(format!("{error:#}"), format!("/token {wrong_shape}"));
+
+            let (base, served) =
+                serve_in_order(vec![raw_response_with_body("200 OK", &json, &body)]);
+            let error = refresh(&base, "client", "rt-1", "did:key:zFixture")
+                .await
+                .expect_err("not a token answer");
+            served.join().unwrap();
+            assert_body_free(&error);
+            assert_eq!(
+                format!("{error:#}"),
+                format!("/token refresh {wrong_shape}")
+            );
+        }
+
+        let body = format!(
+            r#"{{"device_code":"d","user_code":"u","verification_uri":"v",
+                "verification_uri_complete":"c","expires_in":"{MARKER}","interval":5}}"#
+        );
+        let (base, served) = serve_in_order(vec![raw_response_with_body("200 OK", &json, &body)]);
+        let error = authenticate_device_flow(&base, "client")
+            .await
+            .expect_err("not a device authorization");
+        served.join().unwrap();
+        assert_body_free(&error);
+        assert_eq!(
+            format!("{error:#}"),
+            format!("/device_authorization {wrong_shape}")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_success_answer_over_the_cap_is_refused_unread() {
+        let mut body = String::from(r#"{"access_token":""#);
+        body.push_str(&"a".repeat(2 * 1024 * 1024));
+        body.push_str(MARKER);
+        let error = token_answering(raw_response_with_body(
+            "200 OK",
+            &["content-type: application/json"],
+            &body,
+        ))
+        .await;
+        assert_body_free(&error);
+        assert!(
+            format!("{error:#}").starts_with("/token JSON parse failed: response body exceeds"),
+            "{error:#}"
         );
     }
 

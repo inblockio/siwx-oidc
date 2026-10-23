@@ -465,6 +465,12 @@ There is no age check, because there is no expiry.
   **signed** value is returned and a warning is printed. The plain member is
   not covered by the signature.
 - A failed profile read (for example a 500) is an error, never "field absent".
+- Neither verifier prints a response body. A failed fetch (discovery, key set or
+  profile) is reported by its status and, when the body is JSON with a short
+  `errcode` or `error`, that code (`GET <url> returned 500 Internal Server Error
+  (M_UNKNOWN)`); a 2xx body that is not the expected JSON says so without
+  quoting it. Every body is read under a 256 KiB cap: one that declares more is
+  refused before it is read, and one that does not is cut off while streaming.
 
 ### How the two sides are kept compatible
 

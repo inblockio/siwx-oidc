@@ -45,7 +45,12 @@ after a deployment.
 
 The client reports an error answer by its status and, when the body names one,
 its OAuth `error` code, and never the body: a proxy or a hostile server decides
-what a body says. The reason a request was refused is in the server's log.
+what a body says. The reason a request was refused is in the server's log. The
+same holds for the answers the client accepts: one that is not the expected JSON
+is reported as such (`/token JSON parse failed: the body is JSON of another shape
+than expected`), and a body over 256 KiB is refused unread. The DID verifier
+(`fetch_and_verify_did`, `verify_did_assertion`) reports a failed fetch the same
+way, for example `GET <url> returned 500 Internal Server Error (M_UNKNOWN)`.
 
 | Error printed by the client | Cause | Fix |
 |---|---|---|

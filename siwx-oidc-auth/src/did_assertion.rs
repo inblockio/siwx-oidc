@@ -640,8 +640,8 @@ impl IssuerKeys {
 
 /// Steps 3 to 5 of [`verify_did_assertion`], up to and including the fetch of
 /// the key set: discovery, the issuer pin, the same-origin rule for `jwks_uri`,
-/// and the JWKS. `body_cap` bounds each response body when given; the public
-/// verifier passes `None` and keeps its behaviour.
+/// and the JWKS. `body_cap` bounds each response body; the public verifier
+/// passes `None` and gets [`DEFAULT_BODY_CAP`].
 pub(crate) async fn fetch_issuer_keys(
     http: &reqwest::Client,
     issuer_base_url: &str,
@@ -911,9 +911,10 @@ pub async fn fetch_and_verify_did(
     // 404 is the healthy "no such field" answer. Note that a 500 here is NOT
     // simply an error: element-hq/synapse#19702 is still present in 1.159.0 and
     // makes a row-less account (a `users` row with no `profiles` row) 500 where
-    // a healthy account 404s. It is surfaced as an error with the body attached
-    // rather than silently folded into FieldAbsent, because "state unknown" and
-    // "definitely absent" are different answers.
+    // a healthy account 404s. It is surfaced as an error with the status (and
+    // the Matrix `errcode`, if the body has one) rather than silently folded
+    // into FieldAbsent, because "state unknown" and "definitely absent" are
+    // different answers. Never the body: it is whatever the homeserver wrote.
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(DidAssertionError::FieldAbsent {
             mxid: mxid.to_string(),
@@ -921,17 +922,17 @@ pub async fn fetch_and_verify_did(
         .into());
     }
     if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let refusal = crate::Refusal::of(resp)
+            .await
+            .into_error(&format!("GET {url}"));
         bail!(
-            "GET {url} returned {status}: {body}. (A 500 on this route can mean the account has a \
-             `users` row but no `profiles` row — element-hq/synapse#19702, unfixed in 1.159.0 — so \
-             the field state is UNKNOWN, not absent.)"
+            "{refusal}. (A 500 on this route can mean the account has a `users` row but no \
+             `profiles` row, element-hq/synapse#19702, unfixed in 1.159.0, so the field state \
+             is UNKNOWN, not absent.)"
         );
     }
 
-    let parsed: ProfileFieldResponse = resp
-        .json()
+    let parsed: ProfileFieldResponse = read_json(resp, DEFAULT_BODY_CAP)
         .await
         .with_context(|| format!("GET {url} did not return the expected JSON object"))?;
 
@@ -960,8 +961,11 @@ pub async fn fetch_and_verify_did(
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string()),
         ),
+        // The kind, not the value: the value is whatever the homeserver wrote.
         other => bail!(
-            "the `{DID_PROFILE_FIELD}` field of {mxid} is neither an object nor a string: {other}"
+            "the `{DID_PROFILE_FIELD}` field of {mxid} is neither an object nor a string (it is \
+             {})",
+            json_kind(other)
         ),
     };
 
@@ -1183,45 +1187,66 @@ fn verifying_key_from_jwk(jwk: &Jwk, kid: &str) -> Result<VerifyingKey> {
         .map_err(|e| anyhow!("JWK `{kid}` coordinates are not a point on P-256: {e}"))
 }
 
-async fn get_json<T: serde::de::DeserializeOwned>(http: &reqwest::Client, url: &str) -> Result<T> {
-    let resp = http
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("GET {url} failed"))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        bail!("GET {url} returned {status}: {body}");
-    }
-    resp.json()
-        .await
-        .with_context(|| format!("GET {url} did not return the expected JSON"))
-}
-
-/// [`get_json`] when `cap` is `None`; with a cap, the same fetch with the body
-/// read through [`read_capped`]. Only the directory client sets a cap.
+/// GET `url` and parse the answer as JSON, with the body read under a cap:
+/// `cap`, or [`DEFAULT_BODY_CAP`] when it is `None` (the public verifier). An
+/// error status is reported by the status and a short error code, a body that is
+/// not the expected JSON by saying so; neither quotes the body.
 async fn fetch_json<T: serde::de::DeserializeOwned>(
     http: &reqwest::Client,
     url: &str,
     cap: Option<usize>,
 ) -> Result<T> {
-    let Some(cap) = cap else {
-        return get_json(http, url).await;
-    };
+    let cap = cap.unwrap_or(DEFAULT_BODY_CAP);
     let resp = http
         .get(url)
         .send()
         .await
         .with_context(|| format!("GET {url} failed"))?;
     if !resp.status().is_success() {
-        bail!("GET {url} returned {}", resp.status());
+        return Err(crate::Refusal::within(resp, cap)
+            .await
+            .into_error(&format!("GET {url}")));
     }
     let body = read_capped(resp, cap)
         .await
         .with_context(|| format!("GET {url} body"))?;
-    serde_json::from_slice(&body)
-        .with_context(|| format!("GET {url} did not return the expected JSON"))
+    parse_json(&body).with_context(|| format!("GET {url} did not return the expected JSON"))
+}
+
+/// Read a response body under `cap` and parse it as JSON; see [`parse_json`] for
+/// what a failure says.
+pub(crate) async fn read_json<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+    cap: usize,
+) -> Result<T> {
+    let body = read_capped(resp, cap).await?;
+    parse_json(&body)
+}
+
+/// Parse `body` as `T`. A failure says only whether the body is not JSON at all
+/// or is JSON of another shape: serde's own message can quote a value from the
+/// body (`invalid type: string "..."`), and the body is whatever the server
+/// wrote.
+fn parse_json<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T> {
+    serde_json::from_slice(body).map_err(|e| {
+        if e.is_data() {
+            anyhow!("the body is JSON of another shape than expected")
+        } else {
+            anyhow!("the body is not valid JSON")
+        }
+    })
+}
+
+/// What kind of JSON value `value` is, for an error that must not quote it.
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
 }
 
 /// Read a response body, failing with [`BodyTooLarge`] as soon as it passes
@@ -2555,5 +2580,347 @@ mod tests {
         // by a Synapse denylist entry, and read by every consumer. A rename is
         // a migration (dual-read for a full upgrade cycle), never an edit.
         assert_eq!(DID_PROFILE_FIELD, "io.inblock.did");
+    }
+
+    // -- Response bodies are read under a cap and never echoed --------------
+    //
+    // Whatever answers at an issuer or a homeserver URL writes the body, and an
+    // error that quotes it hands that text to every log the error reaches. An
+    // error carries the status, and the short error code if the body is JSON
+    // with one, never the body.
+
+    /// A string a hostile or merely chatty server puts in a body.
+    const MARKER: &str = "MARKER-7f3a9c-echoed-by-the-server";
+
+    /// Everything an error can print.
+    fn printed(error: &anyhow::Error) -> String {
+        format!("{error} | {error:#} | {error:?} | {error:#?}")
+    }
+
+    fn assert_body_free(error: &anyhow::Error) {
+        let text = printed(error);
+        assert!(!text.contains(MARKER), "the body was echoed: {text}");
+    }
+
+    /// A key and a proof from it, so a verification gets as far as the fetches.
+    fn proof_for(base_of_issuer: &str) -> String {
+        let key = SigningKey::random(&mut OsRng);
+        mint(
+            &key,
+            &header_of(KID),
+            &payload_of(base_of_issuer, DID, ALICE),
+        )
+    }
+
+    /// The discovery and JWKS routes of a working issuer, with the JWKS route
+    /// replaced by `status` and `body`.
+    fn issuer_with_jwks_answer(base: &str, status: u16, body: &str) -> Vec<(String, u16, String)> {
+        let mut routes = discovery_and_jwks(base, base, json!({ "keys": [] }));
+        routes.retain(|(path, _, _)| path != "/jwk");
+        routes.push(("/jwk".to_string(), status, body.to_string()));
+        routes
+    }
+
+    #[tokio::test]
+    async fn a_discovery_answer_is_reported_by_its_status_and_code_and_never_its_body() {
+        for (status, body, expected) in [
+            (
+                500u16,
+                format!("<html>{MARKER}</html>"),
+                "GET {url} returned 500 Internal Server Error",
+            ),
+            (
+                503,
+                format!(r#"{{"error":"temporarily_unavailable","error_description":"{MARKER}"}}"#),
+                "GET {url} returned 503 Service Unavailable (temporarily_unavailable)",
+            ),
+            // A code is a short token; anything else is body text.
+            (
+                400,
+                format!(r#"{{"error":"{MARKER} <b>x</b>"}}"#),
+                "GET {url} returned 400 Bad Request",
+            ),
+            (
+                403,
+                format!(r#"{{"errcode":"M_FORBIDDEN","error":"{MARKER}"}}"#),
+                "GET {url} returned 403 Forbidden (M_FORBIDDEN)",
+            ),
+            // Shapes the parser quotes from: a JSON string where an object is
+            // expected, a number where a string is.
+            (
+                200,
+                format!(r#""{MARKER}""#),
+                "GET {url} did not return the expected JSON",
+            ),
+            (
+                200,
+                format!(r#"{{"issuer":"{MARKER}","jwks_uri":[]}}"#),
+                "GET {url} did not return the expected JSON",
+            ),
+        ] {
+            let base = spawn_mock_http(move |_| {
+                vec![(
+                    "/.well-known/openid-configuration".to_string(),
+                    status,
+                    body,
+                )]
+            })
+            .await;
+            let url = format!("{base}/.well-known/openid-configuration");
+            let jws = proof_for(&base);
+            let err = verify_did_assertion(&base, &jws, ALICE)
+                .await
+                .expect_err("a broken discovery answer verifies nothing");
+            assert_body_free(&err);
+            let message = format!("{err:#}");
+            let expected = expected.replace("{url}", &url);
+            assert!(
+                message.contains(&expected),
+                "expected `{expected}` in `{message}`"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_jwks_answer_is_reported_by_its_status_and_code_and_never_its_body() {
+        for (status, body, expected) in [
+            (
+                500u16,
+                format!("<html>{MARKER}</html>"),
+                "GET {url} returned 500 Internal Server Error",
+            ),
+            (
+                502,
+                format!(r#"{{"error":"bad_gateway","error_description":"{MARKER}"}}"#),
+                "GET {url} returned 502 Bad Gateway (bad_gateway)",
+            ),
+            (
+                404,
+                format!(r#"{{"error":["{MARKER}"]}}"#),
+                "GET {url} returned 404 Not Found",
+            ),
+            // A JSON string where the key set is an object, and where its
+            // `keys` is an array.
+            (
+                200,
+                format!(r#""{MARKER}""#),
+                "GET {url} did not return the expected JSON",
+            ),
+            (
+                200,
+                format!(r#"{{"keys":"{MARKER}"}}"#),
+                "GET {url} did not return the expected JSON",
+            ),
+        ] {
+            let base = spawn_mock_http(move |b| issuer_with_jwks_answer(b, status, &body)).await;
+            let url = format!("{base}/jwk");
+            let jws = proof_for(&base);
+            let err = verify_did_assertion(&base, &jws, ALICE)
+                .await
+                .expect_err("a broken key set verifies nothing");
+            assert_body_free(&err);
+            let message = format!("{err:#}");
+            let expected = expected.replace("{url}", &url);
+            assert!(
+                message.contains(&expected),
+                "expected `{expected}` in `{message}`"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_profile_answer_is_reported_by_its_status_and_code_and_never_its_body() {
+        for (status, body, expected) in [
+            (
+                500u16,
+                format!("<html>{MARKER}</html>"),
+                "returned 500 Internal Server Error.",
+            ),
+            (
+                500,
+                format!(r#"{{"errcode":"M_UNKNOWN","error":"{MARKER}"}}"#),
+                "returned 500 Internal Server Error (M_UNKNOWN).",
+            ),
+            (
+                403,
+                format!(r#"{{"errcode":"{MARKER} <b>x</b>"}}"#),
+                "returned 403 Forbidden.",
+            ),
+            (
+                429,
+                format!(
+                    r#"{{"errcode":"M_LIMIT_EXCEEDED","retry_after_ms":1,"error":"{MARKER}"}}"#
+                ),
+                "returned 429 Too Many Requests (M_LIMIT_EXCEEDED).",
+            ),
+            // A JSON string where the profile object is expected.
+            (
+                200,
+                format!(r#""{MARKER}""#),
+                "did not return the expected JSON object",
+            ),
+            // The field holds something that is neither an object nor a string.
+            (
+                200,
+                format!(r#"{{"{DID_PROFILE_FIELD}":["{MARKER}"]}}"#),
+                "neither an object nor a string (it is an array)",
+            ),
+            (
+                200,
+                format!(
+                    r#"{{"{DID_PROFILE_FIELD}":{{"nested":["{MARKER}"]}},"other":"{MARKER}"}}"#
+                ),
+                "", // An object with no proof: typed, and it quotes no body.
+            ),
+        ] {
+            let result = {
+                let base = spawn_mock_http(move |_| vec![profile_route(ALICE, status, body)]).await;
+                fetch_and_verify_did(&base, ALICE, &base).await
+            };
+            let err = result.expect_err("none of these publishes a verified DID");
+            assert_body_free(&err);
+            let message = format!("{err:#}");
+            assert!(
+                message.contains(expected),
+                "expected `{expected}` in `{message}`"
+            );
+            if status >= 500 {
+                // The reason for the 500 stays in the message: the field state
+                // is unknown, not absent.
+                assert!(message.contains("synapse#19702"), "{message}");
+            }
+        }
+    }
+
+    /// A server that answers `stalled_path` with `status` and `sent` bytes of
+    /// body, no length, then goes quiet without closing the connection, and every
+    /// other path from `routes`. A reader that goes on past its cap waits for an
+    /// end that never comes; one that stops at the cap returns at once.
+    async fn spawn_stalling_http<F>(
+        routes: F,
+        stalled_path: String,
+        status: u16,
+        sent: usize,
+    ) -> String
+    where
+        F: FnOnce(&str) -> Vec<(String, u16, String)>,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let table: HashMap<String, (u16, String)> = routes(&base)
+            .into_iter()
+            .map(|(path, status, body)| (path, (status, body)))
+            .collect();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let table = table.clone();
+                let stalled_path = stalled_path.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf).into_owned();
+                    let raw_path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let path = urlencoding::decode(&raw_path)
+                        .map(|c| c.into_owned())
+                        .unwrap_or(raw_path);
+                    if path == stalled_path {
+                        let head = format!("HTTP/1.1 {status} X\r\nConnection: close\r\n\r\n");
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        let _ = sock.write_all(&vec![b' '; sent]).await;
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        return;
+                    }
+                    let (status, body) = table
+                        .get(&path)
+                        .cloned()
+                        .unwrap_or((404, r#"{"errcode":"M_NOT_FOUND"}"#.to_string()));
+                    let resp = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        base
+    }
+
+    /// Run `future`, failing the test if it waits for the end of a body it
+    /// should have stopped reading at the cap.
+    async fn without_waiting_for_the_rest<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), future)
+            .await
+            .expect("the body was read past the cap: the reader is still waiting for its end")
+    }
+
+    #[tokio::test]
+    async fn no_answer_is_read_past_the_cap() {
+        let over = DEFAULT_BODY_CAP + 64 * 1024;
+        let profile_path = format!("/_matrix/client/v3/profile/{ALICE}/{DID_PROFILE_FIELD}");
+        for status in [200u16, 500] {
+            // Discovery.
+            let base = spawn_stalling_http(
+                |_| vec![],
+                "/.well-known/openid-configuration".to_string(),
+                status,
+                over,
+            )
+            .await;
+            let jws = proof_for(&base);
+            let err = without_waiting_for_the_rest(verify_did_assertion(&base, &jws, ALICE))
+                .await
+                .expect_err("an oversized discovery answer verifies nothing");
+            assert_body_free(&err);
+            assert_over_the_cap(&err, status);
+
+            // The key set, behind a working discovery document.
+            let base = spawn_stalling_http(
+                |b| discovery_and_jwks(b, b, json!({ "keys": [] })),
+                "/jwk".to_string(),
+                status,
+                over,
+            )
+            .await;
+            let jws = proof_for(&base);
+            let err = without_waiting_for_the_rest(verify_did_assertion(&base, &jws, ALICE))
+                .await
+                .expect_err("an oversized key set verifies nothing");
+            assert_body_free(&err);
+            assert_over_the_cap(&err, status);
+
+            // The profile read.
+            let base = spawn_stalling_http(|_| vec![], profile_path.clone(), status, over).await;
+            let err = without_waiting_for_the_rest(fetch_and_verify_did(&base, ALICE, &base))
+                .await
+                .expect_err("an oversized profile answer yields no DID");
+            assert_body_free(&err);
+            assert_over_the_cap(&err, status);
+        }
+    }
+
+    /// A success over the cap is a [`BodyTooLarge`]; an error status over it
+    /// still counts by its status.
+    fn assert_over_the_cap(err: &anyhow::Error, status: u16) {
+        let message = format!("{err:#}");
+        if status == 200 {
+            assert!(err.downcast_ref::<BodyTooLarge>().is_some(), "{message}");
+        } else {
+            assert!(message.contains(&format!("returned {status}")), "{message}");
+            assert!(
+                err.downcast_ref::<DidAssertionError>().is_none(),
+                "{message}"
+            );
+        }
     }
 }
