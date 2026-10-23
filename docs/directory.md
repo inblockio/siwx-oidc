@@ -249,8 +249,10 @@ yields the key but no grant. Rotate the key and register the new DID as the
 admitted service.
 
 A person's DID that stops being valid (the issuer drops a signing key, a
-compromised key is rotated out) stops verifying within the verified-cache time,
-ten minutes, and within five when the proof was not cached.
+compromised key is rotated out) stops verifying within the key-cache time plus
+the verified-cache time, fifteen minutes with the defaults: a proof first checked
+against a key set fetched just before the drop is then kept for the full
+verified-cache time. It stops within five minutes when the proof was not cached.
 
 ## Errors
 
@@ -325,8 +327,8 @@ DIRECTORY_VECTORS_OUT=siwx-oidc-auth/tests/vectors/directory \
   for five minutes and an unknown `kid` is `invalid`, as in `verify_did_assertion`;
   there is no refetch on an unknown `kid`. After a rotation, accounts whose proof
   was re-signed show `invalid` until the cache turns over. Proofs signed by the
-  retired key are `invalid` from the moment the issuer drops it, which is the
-  point of a rotation.
+  retired key are `invalid` once the cached key set and any cached verdict for
+  them have expired (at most fifteen minutes with the defaults, see above).
 - **One unreadable profile fails a `search_as_user`.** A profile read that answers
   500 (an account with a `users` row and no `profiles` row, element-hq/synapse#19702)
   has an unknown state, and the result type has no state for "unknown". The whole

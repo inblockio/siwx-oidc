@@ -298,7 +298,7 @@ pub struct Tuning {
     /// How long discovery and the key set are kept.
     pub keys_ttl: Duration,
     /// How long a verified `(mxid, proof)` is kept. A key dropped from the key
-    /// set stops verifying within this time.
+    /// set stops verifying within `keys_ttl` plus this time.
     pub verified_ttl: Duration,
     /// The most entries each cache holds.
     pub max_cache_entries: usize,
@@ -552,8 +552,9 @@ impl fmt::Debug for ServiceSessionConfig {
 /// [`access_token`](Self::access_token) is the one call a user of this type
 /// makes: it returns a token that is good now, renewing it first when it is
 /// about to expire. Renewal is single flight (callers that arrive while one is
-/// running wait for it and share its result), tries the refresh token first, and
-/// signs in again with the key when that fails.
+/// running wait for it; a successful renewal is shared, a failed one is not, so
+/// each waiter then tries on its own), tries the refresh token first, and signs
+/// in again with the key when that fails.
 ///
 /// Tokens live in this struct's memory and nowhere else: not on disk, not in a
 /// log, not in `Debug` output. On a restart the service signs in again; there is
