@@ -19,7 +19,7 @@
 		"postcss-load-config": "^6.0.0",
 		"postcss-loader": "^8.0.0",
 		"prettier": "^3.0.0",
-		"prettier-plugin-svelte": "^3.5.0",
+		"prettier-plugin-svelte": "^4.1.1",
 		"process": "^0.11.10",
 		"stream-browserify": "^3.0.0",
 		"stream-http": "^3.2.0",
