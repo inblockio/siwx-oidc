@@ -557,15 +557,20 @@ pub(crate) fn flow_client(request_timeout: Duration) -> Result<reqwest::Client> 
 /// state and code challenge.
 pub(crate) fn request_failed(err: impl Into<anyhow::Error>, what: &'static str) -> anyhow::Error {
     let err: anyhow::Error = err.into();
-    let timed_out = err.chain().any(|cause| {
-        cause
-            .downcast_ref::<reqwest::Error>()
-            .is_some_and(reqwest::Error::is_timeout)
-    });
-    if timed_out {
+    if is_timeout(&err) {
         return anyhow::Error::new(AuthError::TimedOut).context(what);
     }
     err.context(what)
+}
+
+/// Whether a timeout is anywhere in `err`'s chain: the request, or the read of
+/// the answer's body (the client's timeout covers both).
+fn is_timeout(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+    })
 }
 
 /// A sign-in that siwx-oidc refused: at `/sign_in` with the authorization error
@@ -811,12 +816,19 @@ struct Refusal {
     code: Option<String>,
     /// The bounded `Retry-After` of the answer, read for a 429 only.
     retry_after: Option<Duration>,
+    /// The body read timed out: the status line arrived and the rest did not. It
+    /// is the transient [`AuthError::TimedOut`], whatever the status said (a 400
+    /// is terminal to a caller, a stall is retried). Never set for a 429, whose
+    /// status and header already say all its body could: that stays the rate
+    /// limit, with its hint.
+    body_timed_out: bool,
 }
 
 impl Refusal {
     /// Read an error answer. At most [`ERROR_BODY_CAP`] bytes are read and kept;
     /// a longer body, or one that cannot be read, has no code and the status
-    /// still stands.
+    /// still stands. A body read that times out is a timeout, not that status
+    /// (see [`Refusal::body_timed_out`]).
     async fn of(resp: reqwest::Response) -> Refusal {
         Refusal::within(resp, ERROR_BODY_CAP).await
     }
@@ -827,8 +839,10 @@ impl Refusal {
         let retry_after = (status == StatusCode::TOO_MANY_REQUESTS)
             .then(|| retry_after_hint(resp.headers()))
             .flatten();
-        let code = did_assertion::read_at_most(resp, cap)
-            .await
+        let read = did_assertion::read_at_most(resp, cap).await;
+        let body_timed_out =
+            status != StatusCode::TOO_MANY_REQUESTS && read.as_ref().err().is_some_and(is_timeout);
+        let code = read
             .ok()
             .flatten()
             .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
@@ -843,6 +857,7 @@ impl Refusal {
             status,
             code,
             retry_after,
+            body_timed_out,
         }
     }
 
@@ -852,7 +867,19 @@ impl Refusal {
         if let Some(limited) = self.rate_limited() {
             return limited.into();
         }
+        if let Some(timed_out) = self.stalled(endpoint) {
+            return timed_out;
+        }
         not_the_redirect(endpoint, self.status, self.code.as_deref())
+    }
+
+    /// The transient [`AuthError::TimedOut`] when the body of this answer timed
+    /// out, naming `what` and no status, URL or body text.
+    fn stalled(&self, what: &str) -> Option<anyhow::Error> {
+        self.body_timed_out.then(|| {
+            anyhow::Error::new(AuthError::TimedOut)
+                .context(format!("{what} stopped answering after its status line"))
+        })
     }
 
     /// [`AuthError::RateLimited`] when the answer is a 429.
@@ -874,6 +901,9 @@ impl Refusal {
 
     /// `{what} returned {status}`, then `({code})` when there is one.
     fn into_error(self, what: &str) -> anyhow::Error {
+        if let Some(timed_out) = self.stalled(what) {
+            return timed_out;
+        }
         match self.code {
             Some(code) => anyhow!("{what} returned {} ({code})", self.status),
             None => anyhow!("{what} returned {}", self.status),
@@ -1239,10 +1269,19 @@ fn extract_did_from_id_token(id_token: &str) -> Option<String> {
 /// held to [`FLOW_REQUEST_TIMEOUT`]; one that gets no answer ends the flow with
 /// the transient [`AuthError::TimedOut`].
 pub async fn authenticate_device_flow(server_url: &str, client_id: &str) -> Result<AuthTokens> {
+    authenticate_device_flow_within(FLOW_REQUEST_TIMEOUT, server_url, client_id).await
+}
+
+/// [`authenticate_device_flow`] with a request timeout the caller sets.
+pub(crate) async fn authenticate_device_flow_within(
+    request_timeout: Duration,
+    server_url: &str,
+    client_id: &str,
+) -> Result<AuthTokens> {
     let base = Url::parse(server_url).context("invalid server_url")?;
     // Redirects are followed as before; each request is held to the timeout.
     let client = reqwest::Client::builder()
-        .timeout(FLOW_REQUEST_TIMEOUT)
+        .timeout(request_timeout)
         .build()
         .context("failed to build HTTP client")?;
 
@@ -3018,5 +3057,156 @@ mod tests {
         ] {
             assert!(!other.is_timed_out(), "{other:?}");
         }
+    }
+
+    // ---- A body that stalls after the status line is a timeout, not that status ----
+
+    /// The head of a 400 whose body then stops: it promises 1000 bytes, sends 14
+    /// and goes silent.
+    const STALLED_400: &str = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 1000\r\n\r\n{\"error\":\"inv";
+    /// The same for a 429 with a hint in its header.
+    const STALLED_429: &str = "HTTP/1.1 429 Too Many Requests\r\nretry-after: 3\r\ncontent-type: application/json\r\ncontent-length: 1000\r\n\r\n{\"error\":\"slo";
+
+    /// Run the flow that reaches `endpoint` over a 300 ms request timeout against
+    /// a server that answers everything before it, then sends `partial` there
+    /// and goes silent. Returns what the flow ends with and when.
+    async fn refusal_stalled_at(
+        endpoint: Endpoint,
+        partial: &'static str,
+    ) -> (anyhow::Error, Duration) {
+        let timeout = Duration::from_millis(300);
+        let key = SiwxKey::generate_ed25519();
+        let (authorize, sign_in, device_authorization) = flow_fixtures();
+        let before = match endpoint {
+            Endpoint::Authorize | Endpoint::Refresh | Endpoint::DeviceAuthorization => vec![],
+            Endpoint::SignIn => vec![authorize],
+            Endpoint::Token => vec![authorize, sign_in],
+            Endpoint::DevicePoll => vec![device_authorization],
+        };
+        let (base, hold, reached) = serve_then_stall(before, partial);
+        let started = std::time::Instant::now();
+        let outcome = match endpoint {
+            Endpoint::Authorize | Endpoint::SignIn | Endpoint::Token => {
+                let client = flow_client(timeout).unwrap();
+                authenticate_with_scope_using(
+                    &client,
+                    &base,
+                    "client",
+                    REDIRECT_URI,
+                    &key,
+                    "openid",
+                )
+                .await
+                .map(drop)
+            }
+            Endpoint::Refresh => {
+                refresh_within(timeout, &base, "client", "rt-1", "did:key:zFixture")
+                    .await
+                    .map(drop)
+            }
+            Endpoint::DeviceAuthorization | Endpoint::DevicePoll => {
+                authenticate_device_flow_within(timeout, &base, "client")
+                    .await
+                    .map(drop)
+            }
+        };
+        let elapsed = started.elapsed();
+        drop(hold);
+        reached
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("{endpoint:?}: the flow never reached the silent request"));
+        (outcome.expect_err("the body never arrived"), elapsed)
+    }
+
+    /// The registration over a 300 ms request timeout, against a server that
+    /// answers with `partial` and goes silent.
+    async fn registration_stalled(partial: &'static str) -> (anyhow::Error, Duration) {
+        let tuning = directory::Tuning {
+            flow_request_timeout: Duration::from_millis(300),
+            ..directory::Tuning::default()
+        };
+        let (base, hold, reached) = serve_then_stall(vec![], partial);
+        let started = std::time::Instant::now();
+        let outcome =
+            directory::register_with(&tuning, &base, "https://service.example.org/cb", "svc").await;
+        let elapsed = started.elapsed();
+        drop(hold);
+        reached
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("the registration never reached the silent request"));
+        (outcome.expect_err("the body never arrived"), elapsed)
+    }
+
+    fn assert_timed_out_not_the_status(error: &anyhow::Error, elapsed: Duration, context: &str) {
+        assert!(
+            elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(5),
+            "{context}: gave up after {elapsed:?}: {error:#}"
+        );
+        assert_eq!(
+            error.downcast_ref::<AuthError>(),
+            Some(&AuthError::TimedOut),
+            "{context}: {error:#}"
+        );
+        assert!(is_transient(error) && !is_rate_limited(error), "{context}");
+        let text = printed(error);
+        assert!(!text.contains("127.0.0.1"), "{context}: {text}");
+        assert!(!text.contains("inv"), "no body text, {context}: {text}");
+    }
+
+    /// An error answer whose status arrived and whose body then stalled is the
+    /// transient `TimedOut` at every endpoint, not that status (a 400 is
+    /// terminal to a caller, a timeout is retried).
+    #[tokio::test]
+    async fn an_error_body_that_stalls_is_a_timeout_at_every_endpoint() {
+        for endpoint in ENDPOINTS {
+            let (error, elapsed) = refusal_stalled_at(endpoint, STALLED_400).await;
+            assert_timed_out_not_the_status(&error, elapsed, &format!("{endpoint:?}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registration_body_that_stalls_is_a_timeout() {
+        let (error, elapsed) = registration_stalled(STALLED_400).await;
+        assert_timed_out_not_the_status(&error, elapsed, "registration");
+    }
+
+    /// A 429 is known by its status and its header: a body that stalls behind
+    /// it changes nothing, the hint is kept.
+    #[tokio::test]
+    async fn a_429_whose_body_stalls_is_still_the_rate_limit_with_its_hint() {
+        for endpoint in ENDPOINTS {
+            let (error, _) = refusal_stalled_at(endpoint, STALLED_429).await;
+            assert_eq!(
+                error.downcast_ref::<AuthError>(),
+                Some(&AuthError::RateLimited {
+                    retry_after: Some(Duration::from_secs(3))
+                }),
+                "{endpoint:?}: {error:#}"
+            );
+        }
+        let (error, _) = registration_stalled(STALLED_429).await;
+        assert_eq!(
+            error.downcast_ref::<AuthError>(),
+            Some(&AuthError::RateLimited {
+                retry_after: Some(Duration::from_secs(3))
+            }),
+            "registration: {error:#}"
+        );
+    }
+
+    /// A body that fails for another reason than the clock (the connection is
+    /// cut) still leaves the status standing, as before.
+    #[tokio::test]
+    async fn an_error_body_cut_off_keeps_its_status() {
+        let (base, served) = serve_in_order(vec![
+            "HTTP/1.1 400 Bad Request\r\ncontent-length: 1000\r\nconnection: close\r\n\r\n{\"error\":\"inv"
+                .to_string(),
+        ]);
+        let error = refresh(&base, "client", "rt-1", "did:key:zFixture")
+            .await
+            .expect_err("refused");
+        served.join().unwrap();
+        assert_eq!(error.downcast_ref::<AuthError>(), None, "{error:#}");
+        assert!(format!("{error:#}").contains("returned 400"), "{error:#}");
     }
 }

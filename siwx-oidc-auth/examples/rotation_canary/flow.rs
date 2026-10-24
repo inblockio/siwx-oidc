@@ -208,6 +208,9 @@ pub async fn sign_in(
             Some(AuthError::TemporarilyUnavailable) => Reason::SignInUnavailable,
             // Silence, not a refusal: the same reason as before the error was typed.
             Some(AuthError::TimedOut) => Reason::SignInFailed,
+            // A 429 is the server asking for fewer requests, not turning this
+            // identity down: `sign_in_refused` would say the latter.
+            Some(AuthError::RateLimited { .. }) => Reason::SignInFailed,
             Some(_) => Reason::SignInRefused,
             None => Reason::SignInFailed,
         }),

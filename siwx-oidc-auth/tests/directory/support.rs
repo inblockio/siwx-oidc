@@ -81,6 +81,12 @@ pub struct Resp {
     /// Send the body with `Transfer-Encoding: chunked` and no `Content-Length`,
     /// so a client cannot know its size before it has read it.
     pub chunked: bool,
+    /// Declare a `Content-Length` this many bytes longer than the body and hang
+    /// up after it: the head arrives and then reading the body fails.
+    pub short_by: usize,
+    /// Send the head, then wait this long before the first byte of the body: an
+    /// answer whose status arrives and whose body then stalls.
+    pub stall_body: Duration,
 }
 
 impl Resp {
@@ -91,6 +97,8 @@ impl Resp {
             body: body.to_string().into_bytes(),
             delay: Duration::ZERO,
             chunked: false,
+            short_by: 0,
+            stall_body: Duration::ZERO,
         }
     }
     pub fn bytes(status: u16, body: Vec<u8>) -> Resp {
@@ -100,6 +108,8 @@ impl Resp {
             body,
             delay: Duration::ZERO,
             chunked: false,
+            short_by: 0,
+            stall_body: Duration::ZERO,
         }
     }
     /// A plain-text answer, as the server's own error pages are.
@@ -110,6 +120,8 @@ impl Resp {
             body: body.as_bytes().to_vec(),
             delay: Duration::ZERO,
             chunked: false,
+            short_by: 0,
+            stall_body: Duration::ZERO,
         }
     }
     pub fn redirect(location: String, cookie: Option<&str>) -> Resp {
@@ -123,6 +135,8 @@ impl Resp {
             body: Vec::new(),
             delay: Duration::ZERO,
             chunked: false,
+            short_by: 0,
+            stall_body: Duration::ZERO,
         }
     }
     /// A 302, the redirect a misdirected key fetch would meet.
@@ -131,6 +145,15 @@ impl Resp {
             status: 302,
             ..Resp::redirect(location, None)
         }
+    }
+    /// The body is cut short: the head promises 100 more bytes than arrive.
+    pub fn truncated(mut self) -> Resp {
+        self.short_by = 100;
+        self
+    }
+    pub fn body_stalled(mut self, d: Duration) -> Resp {
+        self.stall_body = d;
+        self
     }
     pub fn chunked(mut self) -> Resp {
         self.chunked = true;
@@ -286,7 +309,7 @@ async fn serve<F>(
         format!(
             "HTTP/1.1 {} X\r\nContent-Length: {}\r\nConnection: close\r\n",
             resp.status,
-            resp.body.len()
+            resp.body.len() + resp.short_by
         )
     };
     for (k, v) in &resp.headers {
@@ -294,6 +317,10 @@ async fn serve<F>(
     }
     out.push_str("\r\n");
     let _ = sock.write_all(out.as_bytes()).await;
+    if !resp.stall_body.is_zero() {
+        let _ = sock.flush().await;
+        tokio::time::sleep(resp.stall_body).await;
+    }
     if resp.chunked {
         // 16 KiB chunks. A client that has read enough and hangs up makes a
         // write fail, which ends the answer: that is the point of the cap.
@@ -405,6 +432,9 @@ pub struct IssuerState {
     pub issue_refresh: bool,
     pub refresh_status: u16,
     pub refresh_delay: Duration,
+    /// A `Retry-After` header to put on a refused refresh, as a rate limiter's
+    /// 429 would have it.
+    pub refresh_retry_after: Option<String>,
     /// `error` code to put on the `/sign_in` redirect instead of a code.
     pub sign_in_error: Option<String>,
     pub register_status: u16,
@@ -447,6 +477,7 @@ impl Issuer {
             issue_refresh: true,
             refresh_status: 200,
             refresh_delay: Duration::ZERO,
+            refresh_retry_after: None,
             sign_in_error: None,
             register_status: 201,
             register_retry_after: None,
@@ -623,8 +654,12 @@ fn issuer_route(st: &Arc<Mutex<IssuerState>>, r: &Req) -> Resp {
                         } else {
                             400
                         };
-                        return Resp::json(status, json!({"error": "invalid_grant"}))
-                            .delayed(delay);
+                        let mut refused =
+                            Resp::json(status, json!({"error": "invalid_grant"})).delayed(delay);
+                        if let Some(wait) = &s.refresh_retry_after {
+                            refused = refused.header("Retry-After", wait);
+                        }
+                        return refused;
                     }
                     token_answer(&mut s).delayed(delay)
                 }
@@ -821,6 +856,8 @@ fn hs_route(st: &Arc<Mutex<HsState>>, r: &Req) -> Resp {
                     body: p.body.clone(),
                     delay,
                     chunked: p.chunked,
+                    short_by: p.short_by,
+                    stall_body: p.stall_body,
                 },
                 None => Resp::json(404, json!({"errcode": "M_NOT_FOUND"})).delayed(delay),
             };

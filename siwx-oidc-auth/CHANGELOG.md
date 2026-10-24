@@ -86,8 +86,41 @@ matches error text should match the types named here instead.
   `error_description`. A failed request is now reported as "OIDC client
   registration request failed" with the cause after it (`{:#}`).
 
+- **A refresh answered 429 keeps its refresh token** and fails with the typed
+  `AuthError::RateLimited` and its hint (shared by the callers that waited, then
+  answered for the cooldown), instead of signing in at once and losing the hint.
+  The server did not process the request, so the token is unspent: the first call
+  after the cooldown sends the same one. A refresh refused as invalid (400 or 401
+  `invalid_grant`) or that gets no answer in time still falls back to a sign-in.
+- **One clock for a refresh.** `ServiceSession` wrapped the refresh in
+  `Tuning::request_timeout` (5 s), shorter than the 10 s per-request timeout
+  inside it, so a refresh the server answered in time by the flow's clock could be
+  abandoned for a sign-in (with the token already consumed). It is now held to
+  `Tuning::flow_request_timeout` alone. `Tuning::sign_in_timeout` is raised to
+  `flow_request_timeout` when it is smaller, so an outer bound is never shorter
+  than the request it wraps.
+- **A stalled error body is `AuthError::TimedOut`.** The status line of an error
+  answer arrived and the body then timed out: this was reported as that status
+  (a 400 reads as final), and is now the transient timeout at `/authorize`,
+  `/sign_in`, `/token`, the refresh, the device flow and the registration. A 429
+  stays `AuthError::RateLimited` with its header's hint.
+- **A 429 from the directory whose body cannot be read is `RateLimited`** with the
+  `Retry-After` header's hint (it was `Unavailable`, with the status and the hint
+  dropped). Other statuses with an unreadable body are still `Unavailable`.
+- **The rotation canary reports a rate-limited sign-in as `sign_in_failed`**, as it
+  does a timeout, not as `sign_in_refused` (which says the server turned the
+  identity down).
+
 ### Added
 
+- **`DirectoryConfig::sign_in_again_on_401`** (default `true`) and
+  `DirectoryConfig::with_sign_in_again_on_401(bool)`: a host that owns the sign-in
+  retries sets it to `false`, and `DirectoryClient::search_for_asker` then returns
+  `DirectoryError::Unauthorized` on a module 401 instead of signing in and
+  retrying itself. **`ServiceSession::invalidate_access_token(rejected)`** makes
+  the next `access_token()` renew (a fresh sign-in with the key) when the access
+  token is `rejected`, and does nothing when another caller has renewed already.
+  See "A host that owns the sign-in retries" in `docs/directory.md`.
 - **`AuthError::RateLimited { retry_after }`**, `AuthError::is_rate_limited()`,
   `AuthError::retry_after()`, `siwx_oidc_auth::is_rate_limited` and
   `DirectoryError::is_rate_limited()` / `DirectoryError::retry_after()`: a 429 at
@@ -132,3 +165,5 @@ matches error text should match the types named here instead.
   `#[non_exhaustive]`.)
 - `Tuning` has a new public field, `flow_request_timeout`. Code that builds it
   with a struct literal and no `..Tuning::default()` must name it.
+- `DirectoryConfig` is `#[non_exhaustive]`, so its new field
+  `sign_in_again_on_401` breaks no caller that builds it with `DirectoryConfig::new`.

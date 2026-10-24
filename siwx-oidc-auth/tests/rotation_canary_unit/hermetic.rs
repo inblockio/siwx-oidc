@@ -104,6 +104,8 @@ struct Quirks {
     whoami_user_id: Option<String>,
     /// The code exchange fails after `/sign_in` made the device.
     token_fails: bool,
+    /// The code exchange answers this status (with `Retry-After: 7`) instead.
+    token_status: Option<u16>,
     /// `/oauth2/revoke` answers 200 and revokes nothing.
     revoke_is_noop: bool,
     /// `/account/wallet` refuses with this status.
@@ -145,6 +147,7 @@ impl Default for Quirks {
             delete_device_status: 200,
             whoami_user_id: None,
             token_fails: false,
+            token_status: None,
             revoke_is_noop: false,
             erase_refused: None,
             whoami_status: None,
@@ -627,6 +630,13 @@ impl Fake {
                 }
                 if s.quirks.token_fails {
                     return reply(500, json!({"error": "server_error"}));
+                }
+                if let Some(status) = s.quirks.token_status {
+                    let mut limited = reply(status, json!({"error": "slow_down"}));
+                    limited
+                        .headers
+                        .push(("Retry-After".to_string(), "7".to_string()));
+                    return limited;
                 }
                 let body = self.mint_session(s);
                 s.device = s.signed_in_device.clone();
@@ -1171,6 +1181,28 @@ async fn a_proven_matrix_logout_takes_the_device_off_the_ledger_and_a_revoke_log
         identity::read_ledger(&dir).pending,
         BTreeSet::from([device]),
         "`/oauth2/revoke` may leave the device: it stays until a run sees it gone"
+    );
+}
+
+/// A 429 at the sign-in is silence about the account, not a refusal of it: the
+/// reason is the same `sign_in_failed` as for a timeout (never `sign_in_refused`,
+/// which says the server turned this identity down).
+#[tokio::test]
+async fn a_rate_limited_sign_in_is_sign_in_failed_and_not_sign_in_refused() {
+    let (fake, scratch) = (Fake::start().await, Scratch::new("rate-limited"));
+    let _dir = identity_for(&scratch.0, &fake, LogoutRoute::Matrix);
+    fake.quirks(|q| q.token_status = Some(429));
+    let run = run_check(check_cfg(&fake, true), &scratch.0).await;
+    assert_eq!(run.code, 1, "{:#?}", run.lines);
+    assert!(
+        run.has("sign_in", "reason=sign_in_failed"),
+        "{:#?}",
+        run.lines
+    );
+    assert!(
+        !run.has("sign_in", "reason=sign_in_refused"),
+        "{:#?}",
+        run.lines
     );
 }
 
