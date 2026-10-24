@@ -1,5 +1,5 @@
 {
-  "description": "A user of another homeserver is not_yet_published even when a field with a valid proof for that MXID is present.",
+  "description": "A user of another homeserver is not_yet_published when their profile gives no claim, even though the module's own did_field for the row carries a valid proof for that MXID (it is not read for a remote row).",
   "expected": {
     "limited": false,
     "results": [

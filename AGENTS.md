@@ -118,7 +118,7 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   helpers and the 169 unit and hermetic tests of the rotation canary
   (`siwx-oidc-auth/tests/rotation_canary_unit.rs`, which compiles the modules of
   `examples/rotation_canary.rs`; the hermetic ones talk to a fake server inside the test process),
-  and the directory client's suites: `siwx-oidc-auth/tests/directory.rs` (87 tests through the
+  and the directory client's suites: `siwx-oidc-auth/tests/directory.rs` (99 tests through the
   public API against a fake siwx-oidc and a fake homeserver on local sockets, `tests/directory/support.rs`,
   with a clock the tests move by hand) and the shared vectors in `siwx-oidc-auth/tests/vectors/directory/`
   (`every_vector_gives_its_expected_result`; the `#[ignore]`d `regenerate_directory_vectors` makes them
@@ -335,7 +335,10 @@ doc; read it before changing the code the rule covers.
   only a proof that was read and fails is `invalid` (a failed refetch for an unknown `kid` with a
   set held is that proof's `invalid` alone). `DidState::Verified` can only be made inside `directory.rs` and the result
   types derive `Serialize` only, like `VerifiedDid`. The verified cache is keyed by `(mxid, proof)`
-  and lives at most 10 minutes. Tokens stay in memory: no file API and no output macro in the module
+  and lives at most 10 minutes. A person on another homeserver is never `Verified`: a well-formed DID in
+  their profile is `DidState::Unconfirmed` (a `ClaimedDid`, the wire form `{"state":"unconfirmed","value":…}`),
+  kept at most 5 minutes in a cache of its own, read under a 3 s bound each and 6 s in all, and never
+  failing a search; the claimed value and the search term are never logged. Tokens stay in memory: no file API and no output macro in the module
   outside its tests. The key set is fetched by one request pair at a time and a waiter shares the
   fetch's outcome; a proof with a `kid` the cached set lacks refetches it, at most once per 30 s; a
   failed renewal of the service session is shared by its waiters and answered for 5 s; an error

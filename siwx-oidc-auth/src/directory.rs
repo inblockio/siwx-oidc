@@ -34,6 +34,18 @@
 //! [`crate::VerifiedDid`] does: a deserializable "verified" value is an entrance
 //! that skips the check. A `Verified` state can only be made by this module.
 //!
+//! # People of other homeservers
+//!
+//! No proof of this issuer can stand for a user of another homeserver, so such a
+//! person is **never** `Verified`. Their `io.inblock.did` profile field is read
+//! through our homeserver (Synapse asks theirs over federation) and a
+//! well-formed DID in it is reported as [`DidState::Unconfirmed`]: what they
+//! claim, which nobody checked. Anything else (no field, an unreadable one, a
+//! value that is not a DID, a server too slow) is `NotYetPublished`, and a
+//! remote read never fails a search. A claim is kept briefly and apart from
+//! the verified cache. The claimed DID is never logged (this module logs
+//! nothing).
+//!
 //! # Errors
 //!
 //! An answer that could not be checked is an error, never a state: a network,
@@ -78,8 +90,10 @@ const TERM_MIN: usize = 1;
 const TERM_MAX: usize = 64;
 /// The largest number of rows one search may ask for.
 const LIMIT_MAX: u32 = 20;
-/// Profile reads in flight at once on the user transport.
+/// Profile reads in flight at once, local and remote together.
 const PROFILE_READS_AT_ONCE: usize = 8;
+/// The longest DID taken from anything: an asker's, or a remote person's claim.
+const DID_MAX: usize = 2048;
 
 // ---------------------------------------------------------------------------
 // The result (plan 4.1)
@@ -118,28 +132,60 @@ pub struct DirectoryEntry {
 }
 
 /// What is known of one person's DID. Serializes as
-/// `{"state":"verified","value":"did:..."}`, `{"state":"not_yet_published"}` or
-/// `{"state":"invalid"}`. Only `Verified` can be picked as a recipient.
+/// `{"state":"verified","value":"did:..."}`,
+/// `{"state":"unconfirmed","value":"did:..."}`, `{"state":"not_yet_published"}`
+/// or `{"state":"invalid"}`. Only `Verified` is confirmed; an `Unconfirmed` DID
+/// is what another server's user claims, and a caller that offers it as a
+/// recipient must say so.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", content = "value", rename_all = "snake_case")]
 pub enum DidState {
     /// A proof from this issuer verified and names this MXID. The value is the
     /// proof's signed `sub`.
     Verified(VerifiedSubject),
+    /// A user of ANOTHER homeserver whose `io.inblock.did` profile field, read
+    /// through this homeserver, holds a well-formed DID. The value is what the
+    /// field says and nothing vouches for it: a foreign issuer is not ours to
+    /// trust, so such a row is never `Verified`, whatever proof it carries.
+    Unconfirmed(ClaimedDid),
     /// No proof from this issuer: the person has no `io.inblock.did` field, the
-    /// field has no proof, or the person is on another homeserver.
+    /// field has no proof, or the person is on another homeserver and gave no
+    /// usable claim (no field, an unreadable one, a value that is not a DID, a
+    /// server too slow to answer).
     NotYetPublished,
     /// A proof is there and does not verify.
     Invalid,
 }
 
 impl DidState {
-    /// The DID of a `Verified` state; `None` for the other two.
+    /// The DID of a `Verified` state; `None` for the others, an `Unconfirmed`
+    /// one included.
     pub fn verified_did(&self) -> Option<&str> {
         match self {
             DidState::Verified(subject) => Some(&subject.0),
-            DidState::NotYetPublished | DidState::Invalid => None,
+            DidState::Unconfirmed(_) | DidState::NotYetPublished | DidState::Invalid => None,
         }
+    }
+
+    /// The DID of an `Unconfirmed` state; `None` for the others.
+    pub fn unconfirmed_did(&self) -> Option<&str> {
+        match self {
+            DidState::Unconfirmed(claim) => Some(&claim.0),
+            DidState::Verified(_) | DidState::NotYetPublished | DidState::Invalid => None,
+        }
+    }
+}
+
+/// The DID another server's user claims. It passed [`is_did`] and nothing else:
+/// no proof of ours stands behind it. Like [`VerifiedSubject`] it has a private
+/// field, so a value of this type comes from a profile read in this module.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ClaimedDid(String);
+
+impl ClaimedDid {
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -369,6 +415,24 @@ pub struct Tuning {
     /// How long a verified `(mxid, proof)` is kept. A key dropped from the key
     /// set stops verifying within `keys_ttl` plus this time.
     pub verified_ttl: Duration,
+    /// One read of a user-of-another-server's profile, connect to the last byte.
+    /// A foreign server that is slower costs a search this and no more: that
+    /// person is `not_yet_published`. Held below `request_timeout`, which still
+    /// ends a read that is somehow not ended by this.
+    pub remote_profile_timeout: Duration,
+    /// All the remote profile reads of one search together, the wait for one of
+    /// the [`PROFILE_READS_AT_ONCE`] places included. A read that has not ended
+    /// by then is dropped and its person is `not_yet_published`, so many slow
+    /// foreign servers cannot stretch a search past this.
+    pub remote_profiles_timeout: Duration,
+    /// How long a remote person's claimed DID is kept. Short, because a claim
+    /// can change and nothing confirms it; it is kept apart from the verified
+    /// cache and never enters it.
+    pub unconfirmed_ttl: Duration,
+    /// How long "no usable claim" of a remote person is kept (no field, a value
+    /// that is not a DID, a server that failed or was too slow), so that a dead
+    /// foreign server costs one wait and not one per search.
+    pub remote_miss_ttl: Duration,
     /// The most entries each cache holds.
     pub max_cache_entries: usize,
     /// The most bytes of any one response body.
@@ -388,6 +452,10 @@ impl Default for Tuning {
             keys_ttl: Duration::from_secs(5 * 60),
             keys_refetch_interval: Duration::from_secs(30),
             verified_ttl: Duration::from_secs(10 * 60),
+            remote_profile_timeout: Duration::from_secs(3),
+            remote_profiles_timeout: Duration::from_secs(6),
+            unconfirmed_ttl: Duration::from_secs(5 * 60),
+            remote_miss_ttl: Duration::from_secs(60),
             max_cache_entries: 4096,
             max_body_bytes: DEFAULT_BODY_CAP,
         }
@@ -434,10 +502,10 @@ fn check_limit(limit: u32) -> Result<(), DirectoryError> {
     Ok(())
 }
 
-/// A DID is at most 2048 bytes (the `/resolve` bound) and has no control
+/// A DID is at most [`DID_MAX`] bytes (the `/resolve` bound) and has no control
 /// characters.
 fn check_asker(did: &str) -> Result<(), DirectoryError> {
-    if did.is_empty() || did.len() > 2048 || did.chars().any(char::is_control) {
+    if did.is_empty() || did.len() > DID_MAX || did.chars().any(char::is_control) {
         return Err(invalid(
             "the asker DID is empty, too long, or not printable",
         ));
@@ -478,6 +546,57 @@ fn is_mxid(s: &str) -> bool {
     s.strip_prefix('@')
         .and_then(|rest| rest.split_once(':'))
         .is_some_and(|(local, server)| !local.is_empty() && !server.is_empty())
+}
+
+/// Whether `s` is a DID in the W3C syntax: `did:`, a method name of lowercase
+/// letters and digits, `:`, and a method-specific id of letters, digits,
+/// `. - _ :` and `%XX` that does not end in `:`. ASCII only, at most
+/// [`DID_MAX`] bytes.
+///
+/// The verified path asks only that a signed `sub` starts with `did:`: it was
+/// signed by the issuer. A claim is text another server's user chose, shown to a
+/// person and pasted into a grant, so it is held to the whole grammar: no
+/// space, control character, markup or look-alike letter gets through.
+fn is_did(s: &str) -> bool {
+    if s.len() > DID_MAX {
+        return false;
+    }
+    let Some((method, id)) = s.strip_prefix("did:").and_then(|r| r.split_once(':')) else {
+        return false;
+    };
+    if method.is_empty()
+        || !method
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        || id.is_empty()
+        || id.ends_with(':')
+    {
+        return false;
+    }
+    let id = id.as_bytes();
+    let mut i = 0;
+    while i < id.len() {
+        match id[i] {
+            b if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':') => i += 1,
+            b'%' if id
+                .get(i + 1..i + 3)
+                .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit)) =>
+            {
+                i += 3
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// The DID a remote person's `io.inblock.did` value claims: its `did` member,
+/// when that is a well-formed DID. The proof beside it is not looked at (a
+/// foreign issuer is not ours to trust), and a bare string, which is the legacy
+/// shape without even a member, is no claim.
+fn claim_from_field(field: &Value) -> Option<ClaimedDid> {
+    let did = field.get("did")?.as_str()?;
+    is_did(did).then(|| ClaimedDid(did.to_string()))
 }
 
 fn http_client(tuning: &Tuning) -> Result<reqwest::Client, DirectoryError> {
@@ -1001,6 +1120,9 @@ struct Caches {
     resolved: TtlCache<String, Option<String>>,
     /// `(mxid, proof)` to the verified `sub`.
     verified: TtlCache<(String, String), String>,
+    /// A remote person's MXID to the DID they claim; `None` is "no usable
+    /// claim". Not the verified cache: nothing in here was ever checked.
+    claims: TtlCache<String, Option<ClaimedDid>>,
     keys: Option<(Arc<IssuerKeys>, Instant)>,
 }
 
@@ -1009,6 +1131,9 @@ struct Caches {
 pub struct CacheStats {
     pub resolved: usize,
     pub verified: usize,
+    /// Remote people's claims (and their "no usable claim"), kept apart from
+    /// `verified`.
+    pub remote_claims: usize,
     pub keys_cached: bool,
 }
 
@@ -1025,8 +1150,10 @@ pub struct DirectoryConfig {
     /// The homeserver's client-API base URL.
     pub homeserver_url: String,
     /// The homeserver's server name (`example.org` in `@alice:example.org`).
-    /// Only its own users carry a proof from this issuer; every other server's
-    /// users are `not_yet_published` and their profiles are not read.
+    /// Only its own users carry a proof from this issuer. Every other server's
+    /// users are never `verified`: their profile is read through this
+    /// homeserver and a well-formed DID in it is `unconfirmed`, otherwise
+    /// `not_yet_published`.
     pub server_name: String,
     /// Whether [`DirectoryClient::search_for_asker`] signs the service in again
     /// itself when the directory module answers 401 (once, then retries once).
@@ -1115,8 +1242,12 @@ impl fmt::Debug for DirectoryClient {
 struct Row {
     mxid: String,
     alias: Option<String>,
-    /// The raw `io.inblock.did` profile value, when there is one to check.
+    /// The raw `io.inblock.did` profile value, when there is one to check. Only
+    /// a local row has one: a remote row's field is never checked for a proof.
     field: Option<Value>,
+    /// What a remote row's profile claims, once it was read. Only a remote row
+    /// has one.
+    claim: Option<ClaimedDid>,
 }
 
 struct Rows {
@@ -1157,6 +1288,7 @@ impl DirectoryClient {
                 caches: Mutex::new(Caches {
                     resolved: TtlCache::new(),
                     verified: TtlCache::new(),
+                    claims: TtlCache::new(),
                     keys: None,
                 }),
                 key_fetch: AsyncMutex::new(KeyFetch::default()),
@@ -1172,6 +1304,7 @@ impl DirectoryClient {
         CacheStats {
             resolved: caches.resolved.live(now),
             verified: caches.verified.live(now),
+            remote_claims: caches.claims.live(now),
             keys_cached: caches
                 .keys
                 .as_ref()
@@ -1189,7 +1322,8 @@ impl DirectoryClient {
     /// the typed [`DirectoryError::Unauthorized`] at once, and the host renews
     /// with [`ServiceSession::invalidate_access_token`]); a 403 is
     /// [`DirectoryError::NotAdmitted`]; a 429 is [`DirectoryError::RateLimited`].
-    /// Every hit is then proof-checked.
+    /// Every local hit is then proof-checked; the profile of each hit on another
+    /// server is read for a claim ([`DidState::Unconfirmed`]).
     ///
     /// `session` must belong to the deployment this client was made for, so its
     /// token is never sent to a homeserver it was not issued for.
@@ -1226,11 +1360,13 @@ impl DirectoryClient {
 
     /// Search with the user's own Matrix token.
     ///
-    /// Synapse's standard `user_directory/search`, then each local hit's
+    /// Synapse's standard `user_directory/search`, then each hit's
     /// `io.inblock.did` profile field, read without a credential, at most eight
     /// at a time. A 401 is [`DirectoryError::Unauthorized`] (the token is the
-    /// caller's to renew). A profile that cannot be read fails the search: its
-    /// state is unknown, and `invalid` would be a claim about the person.
+    /// caller's to renew). A local profile that cannot be read fails the search:
+    /// its state is unknown, and `invalid` would be a claim about the person. A
+    /// profile of another server's user is read for a claim
+    /// ([`DidState::Unconfirmed`]) and never fails the search.
     pub async fn search_as_user(
         &self,
         user_token: &str,
@@ -1258,7 +1394,7 @@ impl DirectoryClient {
 
         let mut rows = parse_rows(&body)?;
         rows.cut(limit);
-        inner.read_profiles(&mut rows).await?;
+        inner.read_profiles(&mut rows, Reads::All).await?;
         inner.assemble(rows).await
     }
 }
@@ -1340,12 +1476,23 @@ fn parse_rows(body: &[u8]) -> Result<Rows, DirectoryError> {
             mxid: hit.user_id,
             alias: hit.display_name,
             field: hit.did_field,
+            claim: None,
         });
     }
     Ok(Rows {
         rows,
         limited: answer.limited,
     })
+}
+
+/// Which rows' profiles a search has to read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reads {
+    /// Every row's: the user transport, whose rows carry no field.
+    All,
+    /// Only the rows of other servers: the module already carries the field of
+    /// each local person.
+    RemoteOnly,
 }
 
 impl Rows {
@@ -1495,39 +1642,112 @@ impl Inner {
         }
     }
 
-    /// From a module answer to the 4.1 result.
+    /// From a module answer to the 4.1 result. The module carries the field of
+    /// each local person; the claim of a person on another server is read here.
     async fn build_results(
-        &self,
+        self: &Arc<Self>,
         body: &[u8],
         limit: u32,
     ) -> Result<DirectoryResults, DirectoryError> {
         let mut rows = parse_rows(body)?;
         rows.cut(limit);
+        self.read_profiles(&mut rows, Reads::RemoteOnly).await?;
         self.assemble(rows).await
     }
 
-    /// Read the `io.inblock.did` field of every local row, at most
-    /// [`PROFILE_READS_AT_ONCE`] at a time. The first failure ends the search and
-    /// aborts the reads still running.
-    async fn read_profiles(self: &Arc<Self>, rows: &mut Rows) -> Result<(), DirectoryError> {
+    /// Read the `io.inblock.did` profile of the rows, at most
+    /// [`PROFILE_READS_AT_ONCE`] at a time, local and remote together.
+    ///
+    /// - A **local** row's field is the proof to check. Its read can fail, and
+    ///   then the first failure ends the search and aborts the reads still
+    ///   running: that person's state is unknown.
+    /// - A **remote** row's profile is read through this homeserver (which asks
+    ///   the person's own, over federation) for a claimed DID. It never fails the
+    ///   search: no field, an unreadable one, a value that is not a DID, a server
+    ///   that is slow or down, all leave the row without a claim. Each read is
+    ///   held to [`Tuning::remote_profile_timeout`] and all of them together to
+    ///   [`Tuning::remote_profiles_timeout`], the wait for a place included.
+    async fn read_profiles(
+        self: &Arc<Self>,
+        rows: &mut Rows,
+        which: Reads,
+    ) -> Result<(), DirectoryError> {
+        enum Read {
+            Local(Result<Option<Value>, DirectoryError>),
+            Remote(Option<ClaimedDid>),
+        }
         let permits = Arc::new(Semaphore::new(PROFILE_READS_AT_ONCE));
+        let remote_deadline = tokio::time::Instant::now() + self.tuning.remote_profiles_timeout;
         let mut reads = JoinSet::new();
         for (index, row) in rows.rows.iter().enumerate() {
-            if !self.is_local(&row.mxid) {
+            let local = self.is_local(&row.mxid);
+            if local && which == Reads::RemoteOnly {
                 continue;
             }
             let (inner, permits, mxid) = (self.clone(), permits.clone(), row.mxid.clone());
-            reads.spawn(async move {
-                let _permit = permits.acquire_owned().await;
-                (index, inner.read_profile(&mxid).await)
-            });
+            if local {
+                reads.spawn(async move {
+                    let _permit = permits.acquire_owned().await;
+                    (index, Read::Local(inner.read_profile(&mxid).await))
+                });
+            } else {
+                reads.spawn(async move {
+                    let claim = tokio::time::timeout_at(remote_deadline, async {
+                        if let Some(kept) = inner.kept_claim(&mxid) {
+                            return kept;
+                        }
+                        let _permit = permits.acquire_owned().await;
+                        inner.read_claim(&mxid).await
+                    })
+                    .await
+                    .unwrap_or(None);
+                    (index, Read::Remote(claim))
+                });
+            }
         }
         while let Some(done) = reads.join_next().await {
-            let (index, field) =
+            let (index, read) =
                 done.map_err(|_| DirectoryError::Unavailable("a profile read was lost".into()))?;
-            rows.rows[index].field = field?;
+            match read {
+                Read::Local(field) => rows.rows[index].field = field?,
+                Read::Remote(claim) => rows.rows[index].claim = claim,
+            }
         }
         Ok(())
+    }
+
+    /// A remote person's claim still in the cache: `Some(None)` is "no usable
+    /// claim", kept for less time.
+    fn kept_claim(&self, mxid: &str) -> Option<Option<ClaimedDid>> {
+        let now = self.now();
+        let mut caches = self.caches.lock().unwrap();
+        caches.claims.get(&mxid.to_string(), now)
+    }
+
+    /// Read a remote person's profile for a claim, and keep what came of it. It
+    /// never fails: anything but a well-formed DID in the field, or no answer
+    /// within [`Tuning::remote_profile_timeout`], is "no usable claim". A read
+    /// cut off by the caller keeps nothing, so the next search asks again.
+    async fn read_claim(&self, mxid: &str) -> Option<ClaimedDid> {
+        let read =
+            tokio::time::timeout(self.tuning.remote_profile_timeout, self.read_profile(mxid)).await;
+        let claim = match read {
+            Ok(Ok(Some(field))) => claim_from_field(&field),
+            _ => None,
+        };
+        let ttl = if claim.is_some() {
+            self.tuning.unconfirmed_ttl
+        } else {
+            self.tuning.remote_miss_ttl
+        };
+        self.caches.lock().unwrap().claims.put(
+            mxid.to_string(),
+            claim.clone(),
+            self.now(),
+            ttl,
+            self.tuning.max_cache_entries,
+        );
+        claim
     }
 
     /// `GET /profile/{mxid}/io.inblock.did`, with no credential: the route is
@@ -1556,7 +1776,9 @@ impl Inner {
     async fn assemble(&self, rows: Rows) -> Result<DirectoryResults, DirectoryError> {
         let mut results = Vec::with_capacity(rows.rows.len());
         for row in rows.rows {
-            let did = self.did_state(&row.mxid, row.field.as_ref()).await?;
+            let did = self
+                .did_state(&row.mxid, row.field.as_ref(), row.claim.as_ref())
+                .await?;
             results.push(DirectoryEntry {
                 mxid: row.mxid,
                 alias: row.alias,
@@ -1571,7 +1793,10 @@ impl Inner {
 
     /// The proof check (plan 4.3).
     ///
-    /// - another server's user, no field, no proof (a bare string, an object
+    /// - another server's user: never `verified`, whatever their field carries.
+    ///   `unconfirmed` with the DID they claim (`claim`, read by
+    ///   [`Inner::read_profiles`]), else `not_yet_published`;
+    /// - a local user with no field, no proof (a bare string, an object
     ///   without one, an empty one): `not_yet_published`;
     /// - a verified `(mxid, proof)` still in the cache: `verified`, no key needed;
     /// - a proof that is malformed, or that does not verify under the issuer's
@@ -1584,9 +1809,12 @@ impl Inner {
         &self,
         mxid: &str,
         field: Option<&Value>,
+        claim: Option<&ClaimedDid>,
     ) -> Result<DidState, DirectoryError> {
         if !self.is_local(mxid) {
-            return Ok(DidState::NotYetPublished);
+            return Ok(claim.map_or(DidState::NotYetPublished, |claim| {
+                DidState::Unconfirmed(claim.clone())
+            }));
         }
         let Some(proof) = field
             .and_then(|f| f.get("proof"))
@@ -1783,35 +2011,35 @@ mod tests {
         client
     }
 
-    /// Run one vector through the same code the two transports end in.
+    /// Run one vector through the same code the two transports end in, minus the
+    /// profile reads: `profiles` says what they would have left.
+    ///
+    /// - a local user's stored `io.inblock.did` value (`null` is a 404), which on
+    ///   the `user_directory` transport is the field to check;
+    /// - a remote user's, which is read for a claim on both transports (`null` or
+    ///   a missing entry is a 404).
     async fn run(vector: &Value) -> Value {
         let client = client_for(vector);
         let inner = &client.inner;
         let limit = vector["limit"].as_u64().unwrap() as u32;
-        let results = match vector["transport"].as_str().unwrap() {
-            "module" => {
-                let body = serde_json::to_vec(&vector["module_response"]).unwrap();
-                inner.build_results(&body, limit).await.unwrap()
-            }
-            "user_directory" => {
-                let body = serde_json::to_vec(&vector["user_directory_response"]).unwrap();
-                let mut rows = parse_rows(&body).unwrap();
-                rows.cut(limit);
-                // What the profile reads would have left: the stored field of a
-                // local user, `null` meaning the route answered 404.
-                for row in &mut rows.rows {
-                    if inner.is_local(&row.mxid) {
-                        row.field = vector["profiles"]
-                            .get(&row.mxid)
-                            .cloned()
-                            .filter(|v| !v.is_null());
-                    }
-                }
-                inner.assemble(rows).await.unwrap()
-            }
+        let (body, reads_local) = match vector["transport"].as_str().unwrap() {
+            "module" => (&vector["module_response"], false),
+            "user_directory" => (&vector["user_directory_response"], true),
             other => panic!("unknown transport {other}"),
         };
-        serde_json::to_value(&results).unwrap()
+        let mut rows = parse_rows(&serde_json::to_vec(body).unwrap()).unwrap();
+        rows.cut(limit);
+        for row in &mut rows.rows {
+            let stored = vector["profiles"].get(&row.mxid).filter(|v| !v.is_null());
+            if inner.is_local(&row.mxid) {
+                if reads_local {
+                    row.field = stored.cloned();
+                }
+            } else {
+                row.claim = stored.and_then(claim_from_field);
+            }
+        }
+        serde_json::to_value(inner.assemble(rows).await.unwrap()).unwrap()
     }
 
     #[tokio::test]
@@ -1839,6 +2067,7 @@ mod tests {
             "not-yet-published-no-field",
             "not-yet-published-no-proof",
             "not-yet-published-remote-user",
+            "unconfirmed-remote-user",
             "invalid-proof-for-another-mxid",
             "invalid-tampered-payload",
             "unsigned-did-disagrees-with-sub",
@@ -1849,6 +2078,79 @@ mod tests {
                 names.iter().any(|n| n == required),
                 "missing vector {required}"
             );
+        }
+    }
+
+    // -- the DID syntax of a claim -------------------------------------------
+
+    #[test]
+    fn is_did_takes_the_w3c_syntax_and_nothing_wider() {
+        for good in [
+            "did:key:z6MkjB72DotVCvtnuvPGeoDY5ejJTk5AkwQCBLUkVUwZpFY4",
+            "did:pkh:eip155:1:0x4B23da593596D94035c57Adf6C2454216449B1B2",
+            "did:web:example.com:user:alice",
+            "did:web:example.com%3A8443",
+            "did:ethr:0x1.2-3_4",
+            "did:a:b",
+        ] {
+            assert!(is_did(good), "{good}");
+        }
+        let at_the_bound = format!("did:key:{}", "z".repeat(DID_MAX - "did:key:".len()));
+        assert!(is_did(&at_the_bound));
+        assert!(
+            !is_did(&format!("{at_the_bound}z")),
+            "one byte over the bound"
+        );
+        for bad in [
+            "",
+            "did:",
+            "did:key",
+            "did:key:",
+            "did::abc",
+            "did:KEY:abc",
+            "did:ke y:abc",
+            "did:key:ab c",
+            "did:key:abc:",
+            "did:key:abc\n",
+            "did:key:<script>",
+            "did:key:\"x\"",
+            "did:key:a/b",
+            "did:key:a%2",
+            "did:key:a%zz",
+            "did:key:zÄbc",
+            "DID:key:abc",
+            " did:key:abc",
+            "did:key:abc ",
+            "not a did",
+            "https://example.org/did:key:abc",
+        ] {
+            assert!(!is_did(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_claim_is_the_did_member_and_only_that() {
+        let claim = |v: Value| claim_from_field(&v).map(|c| c.as_str().to_string());
+        assert_eq!(
+            claim(json!({"did": "did:key:zA"})).as_deref(),
+            Some("did:key:zA")
+        );
+        assert_eq!(
+            claim(json!({"did": "did:key:zA", "proof": "x.y.z"})).as_deref(),
+            Some("did:key:zA"),
+            "a proof beside it is not looked at"
+        );
+        for none in [
+            json!("did:key:zA"),
+            json!(["did:key:zA"]),
+            json!({"proof": "x.y.z"}),
+            json!({"did": 7}),
+            json!({"did": ["did:key:zA"]}),
+            json!({"did": null}),
+            json!({"did": "nope"}),
+            json!(null),
+        ] {
+            assert_eq!(claim(none.clone()), None, "{none}");
         }
     }
 
@@ -1969,7 +2271,7 @@ mod tests {
             )),
             ("not-yet-published-remote-user".into(), module(
                 "not-yet-published-remote-user",
-                "A user of another homeserver is not_yet_published even when a field with a valid proof for that MXID is present.",
+                "A user of another homeserver is not_yet_published when their profile gives no claim, even though the module's own did_field for the row carries a valid proof for that MXID (it is not read for a remote row).",
                 vec![json!({"user_id": remote_user, "display_name": "Remote", "did_field": remote_field})],
                 vec![json!({"mxid": remote_user, "alias": "Remote", "did": not_yet()})],
             )),
@@ -1992,6 +2294,46 @@ mod tests {
                 vec![entry("Bob", Some("Bob"), verified("Bob"))],
             )),
         ];
+
+        // Other servers' people: an unconfirmed claim, or nothing. `profiles` is
+        // what their profile reads leave (null is a 404).
+        let claimed_pkh = "did:pkh:eip155:1:0x4B23da593596D94035c57Adf6C2454216449B1B2";
+        let remote_entry = |name: &str, state: Value| json!({"mxid": format!("@{name}:other.example"), "alias": name[..1].to_uppercase() + &name[1..], "did": state});
+        let remote_hit = |name: &str, field: Option<Value>| {
+            let mut h = json!({"user_id": format!("@{name}:other.example"), "display_name": name[..1].to_uppercase() + &name[1..]});
+            if let Some(f) = field {
+                h["did_field"] = f;
+            }
+            h
+        };
+        let mut unconfirmed = module(
+            "unconfirmed-remote-user",
+            "People of another homeserver are never verified. Their io.inblock.did profile field, read through the homeserver, gives an unconfirmed DID when its did member is a well-formed DID (a proof beside it is not looked at, and the module's own did_field for the row is not the source); no field, a bare string, a value that is not a DID, or a member that is not a string leaves not_yet_published. A local user is judged as before.",
+            vec![
+                remote_hit("remote", Some(remote_field.clone())),
+                remote_hit("claimed", None),
+                remote_hit("garbage", None),
+                remote_hit("bare", None),
+                remote_hit("nofield", None),
+                hit("Alice", Some("Alice Example"), Some(field("Alice"))),
+            ],
+            vec![
+                remote_entry("remote", json!({"state": "unconfirmed", "value": did("Remote")})),
+                remote_entry("claimed", json!({"state": "unconfirmed", "value": claimed_pkh})),
+                remote_entry("garbage", not_yet()),
+                remote_entry("bare", not_yet()),
+                remote_entry("nofield", not_yet()),
+                entry("Alice", Some("Alice Example"), verified("Alice")),
+            ],
+        );
+        unconfirmed["profiles"] = json!({
+            "@remote:other.example": remote_field,
+            "@claimed:other.example": {"did": claimed_pkh},
+            "@garbage:other.example": {"did": "not a did"},
+            "@bare:other.example": did("Bare"),
+            "@nofield:other.example": null,
+        });
+        files.push(("unconfirmed-remote-user".into(), unconfirmed));
 
         // Everything at once, in the order the homeserver gave it, with `limited` set.
         let mut mixed = module(
@@ -2022,7 +2364,7 @@ mod tests {
         // field of each local user from the profile route (null is a 404).
         let ud = json!({
             "format": FORMAT, "name": "user-directory-mixed",
-            "description": "Rows of the standard user directory plus the profile field of each local user; a remote user's profile is not read.",
+            "description": "Rows of the standard user directory plus the profile field of each local user; a remote user's profile is read for a claim, and this one has none.",
             "transport": "user_directory",
             "issuer": ISSUER, "server_name": "example.org", "jwks": jwks, "limit": 10,
             "user_directory_response": {"results": [

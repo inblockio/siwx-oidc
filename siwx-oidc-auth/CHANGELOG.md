@@ -113,6 +113,21 @@ matches error text should match the types named here instead.
 
 ### Added
 
+- **`DidState::Unconfirmed(ClaimedDid)`**, wire form
+  `{"state":"unconfirmed","value":"did:..."}`, for a person on ANOTHER homeserver
+  whose `io.inblock.did` profile field, read through our homeserver (Synapse asks
+  theirs over federation), holds a well-formed DID. It is what they claim and
+  nobody has checked: such a person is never `Verified`, proof or no proof. No
+  field, a bare string, a value that is not a DID, an unreadable profile or a
+  slow server leaves `NotYetPublished`, as before. A client may offer an
+  `unconfirmed` person behind a strong warning; one that does not know the state
+  must treat it as not selectable. `DidState::unconfirmed_did()`, `ClaimedDid`,
+  `CacheStats::remote_claims`, and the `Tuning` fields `remote_profile_timeout`
+  (3 s per read), `remote_profiles_timeout` (6 s for all of them of one search),
+  `unconfirmed_ttl` (5 min) and `remote_miss_ttl` (1 min). Both transports read
+  remote profiles, sharing the eight places of the local reads; a remote read never
+  fails a search. Claims are kept apart from the verified cache. See "People of
+  other homeservers" in `docs/directory.md`.
 - **`DirectoryConfig::sign_in_again_on_401`** (default `true`) and
   `DirectoryConfig::with_sign_in_again_on_401(bool)`: a host that owns the sign-in
   retries sets it to `false`, and `DirectoryClient::search_for_asker` then returns
@@ -158,6 +173,14 @@ matches error text should match the types named here instead.
 
 ### Breaking
 
+- `DidState` has a new variant, `Unconfirmed`: a `match` on it that has no
+  wildcard arm must handle it. A caller that offers recipients should keep
+  offering `Verified` ones only unless it warns for `Unconfirmed`.
+  `CacheStats` has a new public field (`remote_claims`), and `Tuning` four
+  (above): code that builds `Tuning` with a struct literal and no
+  `..Tuning::default()` must name them.
+- `search_as_user` and `search_for_asker` now make one profile read per person of
+  another homeserver (they made none), through our homeserver, with no credential.
 - `AuthError` variants no longer carry the server's `error_description`:
   `DeviceRefused`, `AccessDenied` and `TemporarilyUnavailable` are unit variants,
   `SignInRefused` has only `error`, and `AuthError::description()` is removed.

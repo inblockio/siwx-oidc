@@ -45,6 +45,8 @@ the users it serves.
     { "mxid": "@k3f9x2q7ab4d8m1p:example.org",
       "alias": "Ada Lovelace",
       "did": { "state": "verified", "value": "did:key:zDn…" } },
+    { "mxid": "@…:other.example", "alias": "…",
+      "did": { "state": "unconfirmed", "value": "did:pkh:eip155:1:0x…" } },
     { "mxid": "@…:example.org", "alias": "…", "did": { "state": "not_yet_published" } },
     { "mxid": "@…:example.org", "alias": "…", "did": { "state": "invalid" } } ],
   "limited": false }
@@ -52,13 +54,21 @@ the users it serves.
 
 - `alias` is the Synapse display name and may be absent. It is a search term and a
   label, never a key.
-- Only `verified` carries a DID, and only a `verified` entry should be offered as a
-  recipient. `value` is the `sub` of the verified proof, never the unsigned `did`
-  member next to it.
+- `verified` and `unconfirmed` carry a DID in `value`; the others carry none.
+  Only a `verified` entry is confirmed. `value` is the `sub` of the verified
+  proof, never the unsigned `did` member next to it.
+- `unconfirmed`: a person on **another homeserver** whose `io.inblock.did` profile
+  field holds a well-formed DID, and `value` is that claim. Nobody has checked it:
+  a foreign issuer is not ours to trust, so such a person is never `verified`,
+  proof or no proof (see [People of other homeservers](#people-of-other-homeservers)).
+  A client may let the sharer pick one **behind a strong warning**: a grant to a
+  DID gives access to whoever holds that DID, the same as pasting a DID into the
+  dialog, and the claimed one may not be the person's. A client that does not know
+  the state must treat it as not selectable.
 - `not_yet_published`: no proof from this issuer. The person has no
   `io.inblock.did` field (they have not signed in since the field shipped), the
   field has no proof (the issuer's key was ephemeral, or the value is the old bare
-  string), or the person is on another homeserver.
+  string), or the person is on another homeserver and gave no usable claim.
 - `invalid`: a proof is there and does not verify (a bad signature, an unknown
   `kid`, a proof for another MXID, a malformed token).
 - `limited` is true when the homeserver says more people matched, or when this
@@ -269,9 +279,12 @@ so a consumer that matched that text keeps working until it matches the type.)
    rule is Element's: public-room members, people who share a private room with
    the asker, minus locked users. It returns each hit as
    `{"user_id", "display_name", "did_field"}`; `did_field` is the raw
-   `io.inblock.did` object, absent for remote users and for users without it.
+   `io.inblock.did` object, absent for remote users and for users without it
+   (and never read for a remote user if it is there).
    `{}` (the homeserver's directory is switched off) is an empty result.
-3. The proof check, per hit.
+3. The claim read, for each hit on another homeserver
+   ([below](#people-of-other-homeservers)).
+4. The proof check, per local hit.
 
 The status codes: 401 signs the service in again once and retries once (a second
 401 is `Unauthorized`; with `sign_in_again_on_401` off the first one is, and
@@ -282,13 +295,56 @@ header or Synapse's `retry_after_ms` when it gave one (at most one hour).
 ### `search_as_user(user_token, term, limit)`
 
 `POST {homeserver}/_matrix/client/v3/user_directory/search` with the user's own
-token and `{"search_term", "limit"}`, then, for each **local** hit,
+token and `{"search_term", "limit"}`, then, for each hit,
 `GET {homeserver}/_matrix/client/v3/profile/{mxid}/io.inblock.did` with **no
 credential** (the route is public by default; a token would tell every
-homeserver polled who is asking), at most eight at a time, then the proof check.
-A user of another homeserver is `not_yet_published` and their profile is not
-read. The user's token is never renewed here: a 401 is `Unauthorized` and the
-caller, who owns the session, renews it.
+homeserver polled who is asking), at most eight at a time, local and remote
+together, then the proof check for the local ones. A local profile that cannot
+be read fails the search; a remote one only costs that person their claim
+([below](#people-of-other-homeservers)). The user's token is never renewed
+here: a 401 is `Unauthorized` and the caller, who owns the session, renews it.
+
+## People of other homeservers
+
+A person whose MXID is on another homeserver has no proof from this issuer, and
+none from them would count. Their `io.inblock.did` field is still readable: it is
+a profile field, and Synapse answers `GET /_matrix/client/v3/profile/{mxid}/io.inblock.did`
+for a remote user by asking their homeserver over federation (checked on
+Synapse 1.163, dev, 2026-10-25: 200 with the field for a remote user who has
+one, 404 for one who has none, 502 for a homeserver that does not answer). The
+client reads it the same way on both transports, with no credential, and reports
+what the field *claims*.
+
+| The remote person's profile | State |
+|---|---|
+| `{"did": "<a well-formed DID>", …}`, with a proof or without | `unconfirmed`, value = the `did` member |
+| no field, `null`, a bare string, no `did` member, a `did` that is not a string or not a DID | `not_yet_published` |
+| a 404, any other status, a body that is not JSON, no answer in time | `not_yet_published` |
+
+- **Never `verified`.** The proof beside the claim is not looked at, and no key
+  set is fetched for it. Verifying a foreign proof against a list of trusted
+  foreign issuers is a separate, configured step that does not exist yet.
+- **A well-formed DID** is the W3C syntax: `did:`, a method name of lowercase
+  letters and digits, `:`, and an id of letters, digits, `. - _ :` and `%XX`, at
+  most 2048 bytes, ASCII only. This is stricter than the `did:` prefix check that
+  a signed `sub` gets, because a claim is text a stranger chose, shown to a
+  person and pasted into a grant.
+- **Bounded, and never failing the search.** Each remote read is held to
+  `Tuning::remote_profile_timeout` (3 s) and all of them together, the wait for a
+  place included, to `Tuning::remote_profiles_timeout` (6 s). A slow or dead
+  foreign server leaves that one person `not_yet_published`; the rest of the
+  answer is unaffected and arrives in time. Remote reads share the eight places
+  of the local reads.
+- **Kept briefly, apart from the verified cache.** A claim is kept for
+  `Tuning::unconfirmed_ttl` (5 minutes) so that a search as you type does not
+  ask a foreign server on every keystroke; "no usable claim" (including a server
+  that was too slow) for `Tuning::remote_miss_ttl` (1 minute), so that a dead
+  server costs one wait, not one per search. A claim can change, so it is never
+  kept as long as a verified DID, and it never enters the verified cache
+  (`CacheStats::verified` does not count it, `CacheStats::remote_claims` does).
+  A read cut off by the total bound keeps nothing.
+- **Nothing is logged.** Neither the claimed DID nor the search term appears in
+  any output of this module.
 
 ## How a proof is checked
 
@@ -303,7 +359,7 @@ Per hit:
 
 | Input | State |
 |---|---|
-| user of another homeserver | `not_yet_published`, whatever the field says |
+| user of another homeserver | never `verified`: `unconfirmed` when the profile claims a well-formed DID, else `not_yet_published`; whatever the proof says ([above](#people-of-other-homeservers)) |
 | no field, a bare string, an object with no `proof`, an empty `proof` | `not_yet_published` |
 | a verified `(mxid, proof)` still cached | `verified`, no key needed |
 | a malformed proof, a bad signature, an `alg` other than ES256, a `kid` the issuer's current key set lacks (after one refetch, see below), an `iss` other than the issuer, a proof for another MXID | `invalid` |
@@ -465,13 +521,16 @@ Rust client and the TypeScript package. Each file is self-describing:
 An implementation takes the `issuer` as its trust anchor and `jwks` as the key
 set the issuer serves, runs the response through its proof check and compares the
 output with `expected`. For `user_directory`, `profiles` holds the stored
-`io.inblock.did` value of each local user (`null` is a 404). The proofs inside
+`io.inblock.did` value of each local user (`null` is a 404). On both transports it
+also holds the value a profile read of each **remote** user would return, from
+which the claim is taken (`null` or a missing entry is a 404); a local user's entry
+is not used on the `module` transport, whose answer carries the field. The proofs inside
 were signed once, in a test that creates its key in memory and prints only the
 public key and the finished proofs: no private key is stored, so the files can
 live in this public repository.
 
 They cover: a verified DID, no field, no proof (absent, empty, bare string), a
-remote user, a proof for another MXID, a tampered payload, an unsigned `did`
+remote user (with no claim, and with each kind of claim: `unconfirmed-remote-user`), a proof for another MXID, a tampered payload, an unsigned `did`
 member that disagrees with the signed `sub`, and a mixed answer for each
 transport. To regenerate:
 
@@ -498,9 +557,13 @@ DIRECTORY_VECTORS_OUT=siwx-oidc-auth/tests/vectors/directory \
 - **`search_as_user` needs the profile route to be public.** A homeserver that sets
   `require_auth_for_profile_requests` refuses the anonymous read; use
   `search_for_asker`.
-- **Remote users are never looked up.** They are `not_yet_published`; a foreign
-  user's DID is read from their own homeserver and verified against that
-  homeserver's issuer ([identity-model.md](identity-model.md#looking-up-an-identity-get-resolve)).
+- **A remote person's DID is never verified.** It is read through our homeserver and
+  reported as `unconfirmed`. Verifying it against the foreign homeserver's issuer
+  ([identity-model.md](identity-model.md#looking-up-an-identity-get-resolve)), for
+  an operator-configured list of trusted foreign issuers, is a later step.
+- **A remote read depends on federation.** A homeserver that does not federate with
+  the person's, or that refuses profile lookups over federation
+  (`allow_profile_lookup_over_federation` off), leaves them `not_yet_published`.
 - **The service states who is asking.** The module trusts an admitted service's
   `asker`. Forwarding the user's own signed sign-in message for siwx-oidc to check
   is the upgrade that removes that trust; it needs siwx-oidc to keep the proof.

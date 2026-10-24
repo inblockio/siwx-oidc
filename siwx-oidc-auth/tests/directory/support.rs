@@ -854,7 +854,9 @@ fn hs_route(st: &Arc<Mutex<HsState>>, r: &Req) -> Resp {
                     status: p.status,
                     headers: p.headers.clone(),
                     body: p.body.clone(),
-                    delay,
+                    // The answer's own delay (one slow server), or the
+                    // homeserver-wide one, whichever is longer.
+                    delay: p.delay.max(delay),
                     chunked: p.chunked,
                     short_by: p.short_by,
                     stall_body: p.stall_body,
