@@ -142,6 +142,55 @@ async fn a_refused_registration_is_an_error_naming_the_status() {
     assert!(format!("{err:#}").contains("400"), "{err:#}");
 }
 
+#[tokio::test]
+async fn a_429_at_registration_is_the_typed_rate_limit_with_the_hint() {
+    for (header, expected) in [
+        (Some("12"), Some(Duration::from_secs(12))),
+        (None, None),
+        (Some("86400"), Some(Duration::from_secs(3600))),
+        (Some("Wed, 21 Oct 2026 07:28:00 GMT"), None),
+        (Some("garbage"), None),
+    ] {
+        let issuer = Issuer::start().await;
+        issuer.with(|s| {
+            s.register_status = 429;
+            s.register_retry_after = header.map(str::to_string);
+        });
+        let err = register_public_client(&issuer.mock.base, REDIRECT_URI, "x")
+            .await
+            .unwrap_err();
+        let case = format!("{header:?}: {err:#}");
+        assert_eq!(
+            err.downcast_ref::<siwx_oidc_auth::AuthError>(),
+            Some(&siwx_oidc_auth::AuthError::RateLimited {
+                retry_after: expected
+            }),
+            "{case}"
+        );
+        assert!(siwx_oidc_auth::is_rate_limited(&err), "{case}");
+        assert!(siwx_oidc_auth::is_transient(&err), "{case}");
+        // The text keeps the status; neither the hint nor the server's words.
+        let text = format!("{err} | {err:#} | {err:?}");
+        assert!(text.contains("429"), "{text}");
+        assert!(!text.contains(REGISTER_DESCRIPTION), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn a_refused_registration_names_the_status_and_code_and_never_the_description() {
+    let issuer = Issuer::start().await;
+    issuer.with(|s| s.register_status = 400);
+    let err = register_public_client(&issuer.mock.base, REDIRECT_URI, "x")
+        .await
+        .unwrap_err();
+    let text = format!("{err} | {err:#} | {err:?}");
+    assert!(text.contains("400"), "{text}");
+    assert!(text.contains("invalid_client_metadata"), "{text}");
+    assert!(!text.contains(REGISTER_DESCRIPTION), "{text}");
+    assert!(!siwx_oidc_auth::is_transient(&err), "{text}");
+    assert!(!siwx_oidc_auth::is_rate_limited(&err), "{text}");
+}
+
 // ---------------------------------------------------------------------------
 // ServiceSession
 // ---------------------------------------------------------------------------
@@ -1437,6 +1486,69 @@ async fn waiters_share_one_failed_renewal_instead_of_signing_in_one_after_anothe
             "one attempt in flight, its outcome shared"
         );
     }
+}
+
+/// A server that goes silent at one request of the sign-in costs the request
+/// timeout, not the whole sign-in cap (30 s here): the failure is the typed,
+/// transient timeout, the same for every caller that waited.
+#[tokio::test]
+async fn a_silent_issuer_fails_the_sign_in_after_the_request_timeout_not_the_cap() {
+    for endpoint in ["/authorize", "/sign_in", "/token"] {
+        let w = World::new().await;
+        let silence = Duration::from_secs(60);
+        w.issuer.with(|s| match endpoint {
+            "/authorize" => s.authorize_delay = silence,
+            "/sign_in" => s.sign_in_delay = silence,
+            _ => s.token_delay = silence,
+        });
+        let tuning = Tuning {
+            flow_request_timeout: Duration::from_millis(300),
+            ..Tuning::default()
+        };
+        assert_eq!(tuning.sign_in_timeout, Duration::from_secs(30));
+        let session = Arc::new(w.session_with(tuning));
+        let started = std::time::Instant::now();
+        for got in eight_callers(session.clone()).await {
+            let err = got.unwrap_err();
+            let case = format!("{endpoint}: {err:?}");
+            let DirectoryError::SignIn { source } = &err else {
+                panic!("{case}");
+            };
+            assert_eq!(
+                source.downcast_ref::<siwx_oidc_auth::AuthError>(),
+                Some(&siwx_oidc_auth::AuthError::TimedOut),
+                "{case}"
+            );
+            assert!(siwx_oidc_auth::is_transient(source), "{case}");
+            assert!(err.is_retryable() && !err.is_rate_limited(), "{case}");
+            assert!(!err.is_unknown_client(), "{case}");
+            let text = format!("{err} | {err:?}");
+            assert!(!text.contains("127.0.0.1"), "no URL: {text}");
+            assert!(!text.contains(CLIENT_ID), "no client id: {text}");
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(5),
+            "{endpoint}: eight callers waited {elapsed:?}, about the request timeout"
+        );
+        assert_eq!(
+            w.issuer.mock.count("GET", "/authorize"),
+            1,
+            "{endpoint}: one attempt in flight, its outcome shared"
+        );
+    }
+}
+
+#[test]
+fn the_request_timeout_is_a_tuning_and_defaults_to_ten_seconds() {
+    assert_eq!(
+        Tuning::default().flow_request_timeout,
+        Duration::from_secs(10)
+    );
+    assert_eq!(
+        Tuning::default().flow_request_timeout,
+        siwx_oidc_auth::FLOW_REQUEST_TIMEOUT
+    );
 }
 
 #[tokio::test]

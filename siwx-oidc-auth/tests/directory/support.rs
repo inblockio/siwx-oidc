@@ -364,6 +364,9 @@ pub fn mint(key: &SigningKey, kid: &str, payload: &Value) -> String {
 // The fake siwx-oidc
 // ---------------------------------------------------------------------------
 
+/// What a refused registration says in free text, which no error may repeat.
+pub const REGISTER_DESCRIPTION: &str = "REGISTER-DESCRIPTION-written-by-the-server";
+
 pub struct IssuerState {
     pub proof_key: SigningKey,
     /// What `/jwk` serves.
@@ -375,6 +378,10 @@ pub struct IssuerState {
     pub jwks_redirect: Option<String>,
     /// How long `/sign_in` takes to answer.
     pub sign_in_delay: Duration,
+    /// How long `/authorize` takes to answer.
+    pub authorize_delay: Duration,
+    /// How long the code exchange at `/token` takes to answer.
+    pub token_delay: Duration,
     /// Answer `/authorize` with this status and the server's own plain-text
     /// body for an unregistered client, instead of the redirect.
     pub authorize_status: Option<u16>,
@@ -401,6 +408,9 @@ pub struct IssuerState {
     /// `error` code to put on the `/sign_in` redirect instead of a code.
     pub sign_in_error: Option<String>,
     pub register_status: u16,
+    /// A `Retry-After` header to put on a refused registration, as a rate
+    /// limiter's 429 would have it.
+    pub register_retry_after: Option<String>,
 }
 
 pub struct Issuer {
@@ -422,6 +432,8 @@ impl Issuer {
             jwks_delay: Duration::ZERO,
             jwks_redirect: None,
             sign_in_delay: Duration::ZERO,
+            authorize_delay: Duration::ZERO,
+            token_delay: Duration::ZERO,
             authorize_status: None,
             authorize_challenge: None,
             authorize_retry_after: None,
@@ -437,6 +449,7 @@ impl Issuer {
             refresh_delay: Duration::ZERO,
             sign_in_error: None,
             register_status: 201,
+            register_retry_after: None,
         }));
         let shared = st.clone();
         let mock = Mock::start(move |r| issuer_route(&shared, r)).await;
@@ -527,10 +540,19 @@ fn issuer_route(st: &Arc<Mutex<IssuerState>>, r: &Req) -> Resp {
         }
         ("POST", "/register") => {
             if s.register_status != 201 {
-                return Resp::json(
+                // The code is a short token and may be repeated; the description
+                // is the server's free text and must not be.
+                let mut resp = Resp::json(
                     s.register_status,
-                    json!({"error": "invalid_client_metadata"}),
+                    json!({
+                        "error": "invalid_client_metadata",
+                        "error_description": REGISTER_DESCRIPTION,
+                    }),
                 );
+                if let Some(wait) = &s.register_retry_after {
+                    resp = resp.header("Retry-After", wait);
+                }
+                return resp;
             }
             Resp::json(
                 201,
@@ -561,6 +583,7 @@ fn issuer_route(st: &Arc<Mutex<IssuerState>>, r: &Req) -> Resp {
                 ),
                 Some("session=fixture-session"),
             )
+            .delayed(s.authorize_delay)
         }
         ("GET", "/sign_in") => {
             let cookie = r.headers.get("cookie").cloned().unwrap_or_default();
@@ -585,7 +608,10 @@ fn issuer_route(st: &Arc<Mutex<IssuerState>>, r: &Req) -> Resp {
         ("POST", "/token") => {
             let form = r.form();
             match form.get("grant_type").map(String::as_str) {
-                Some("authorization_code") => token_answer(&mut s),
+                Some("authorization_code") => {
+                    let delay = s.token_delay;
+                    token_answer(&mut s).delayed(delay)
+                }
                 Some("refresh_token") => {
                     let delay = s.refresh_delay;
                     if s.refresh_status != 200

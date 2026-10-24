@@ -68,8 +68,9 @@ use crate::did_assertion::{
     DEFAULT_BODY_CAP, DID_PROFILE_FIELD,
 };
 use crate::{
-    authenticate_with_device, refresh, AuthError, SiwxKey, TOKEN_LIFETIME_DEFAULT_SECS,
-    TOKEN_LIFETIME_MAX_SECS, TOKEN_LIFETIME_MIN_SECS,
+    authenticate_with_device_within, refresh_within, request_failed, AuthError, Refusal, SiwxKey,
+    FLOW_REQUEST_TIMEOUT, TOKEN_LIFETIME_DEFAULT_SECS, TOKEN_LIFETIME_MAX_SECS,
+    TOKEN_LIFETIME_MIN_SECS,
 };
 
 /// The shortest and longest search term, in characters after trimming.
@@ -334,6 +335,13 @@ pub struct Tuning {
     pub request_timeout: Duration,
     /// The whole headless sign-in, which is several requests.
     pub sign_in_timeout: Duration,
+    /// Per request of the headless sign-in (`/authorize`, `/sign_in`, `/token`)
+    /// and of the refresh, connect to the last byte of the answer. A request
+    /// that gets no answer in this time fails the sign-in at once as the
+    /// transient [`AuthError::TimedOut`], so a server that goes silent costs
+    /// this, not `sign_in_timeout`. The session still holds a refresh to
+    /// `request_timeout` as a whole.
+    pub flow_request_timeout: Duration,
     /// A token is renewed this long before it expires (at most half its life).
     pub token_refresh_margin: Duration,
     /// How long an asker's DID to MXID mapping is kept once found.
@@ -365,6 +373,7 @@ impl Default for Tuning {
         Tuning {
             request_timeout: Duration::from_secs(5),
             sign_in_timeout: Duration::from_secs(30),
+            flow_request_timeout: FLOW_REQUEST_TIMEOUT,
             token_refresh_margin: Duration::from_secs(30),
             resolve_hit_ttl: Duration::from_secs(10 * 60),
             resolve_miss_ttl: Duration::from_secs(60),
@@ -465,8 +474,12 @@ fn is_mxid(s: &str) -> bool {
 }
 
 fn http_client(tuning: &Tuning) -> Result<reqwest::Client, DirectoryError> {
+    http_client_within(tuning.request_timeout)
+}
+
+fn http_client_within(timeout: Duration) -> Result<reqwest::Client, DirectoryError> {
     reqwest::Client::builder()
-        .timeout(tuning.request_timeout)
+        .timeout(timeout)
         // A redirect would carry a bearer token to wherever it points.
         .redirect(Policy::none())
         .build()
@@ -499,7 +512,7 @@ pub async fn register_public_client(
 
     let tuning = Tuning::default();
     let base = clean_base("issuer_url", issuer_url)?;
-    let resp = http_client(&tuning)?
+    let resp = http_client_within(tuning.flow_request_timeout)?
         .post(format!("{base}/register"))
         .json(&json!({
             "redirect_uris": [redirect_uri],
@@ -509,25 +522,17 @@ pub async fn register_public_client(
         }))
         .send()
         .await
-        .map_err(|e| {
-            anyhow!(
-                "OIDC client registration request failed: {}",
-                e.without_url()
-            )
-        })?;
+        .map_err(|e| request_failed(e.without_url(), "OIDC client registration request failed"))?;
 
-    let status = resp.status();
-    // An error answer counts by its status even when its body is over the cap.
-    let body = read_at_most(resp, tuning.max_body_bytes).await?;
-    if !status.is_success() {
-        let code = body
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-            .and_then(|v| short_code(v.get("error")?.as_str()?));
-        return Err(match code {
-            Some(code) => anyhow!("OIDC registration returned {status} ({code})"),
-            None => anyhow!("OIDC registration returned {status}"),
-        });
+    // An error answer is its status and, when the body names one, a short code;
+    // a 429 is the typed rate limit of the other endpoints. The body is read
+    // under the cap, and its status still counts when it is over.
+    if !resp.status().is_success() {
+        return Err(Refusal::of(resp).await.into_flow_error("OIDC registration"));
     }
+    let body = read_at_most(resp, tuning.max_body_bytes)
+        .await
+        .map_err(|e| request_failed(e, "reading the OIDC registration answer failed"))?;
     let body = body.ok_or(BodyTooLarge {
         cap: tuning.max_body_bytes,
     })?;
@@ -804,7 +809,13 @@ impl ServiceSession {
         if let Some(refresh_token) = tokens.refresh.take() {
             let attempt = tokio::time::timeout(
                 self.tuning.request_timeout,
-                refresh(&self.issuer_url, &self.client_id, &refresh_token, &self.did),
+                refresh_within(
+                    self.tuning.flow_request_timeout,
+                    &self.issuer_url,
+                    &self.client_id,
+                    &refresh_token,
+                    &self.did,
+                ),
             )
             .await;
             if let Ok(Ok(issued)) = attempt {
@@ -817,7 +828,8 @@ impl ServiceSession {
     async fn sign_in(&self, tokens: &mut Tokens) -> Result<String, Fault> {
         let attempt = tokio::time::timeout(
             self.tuning.sign_in_timeout,
-            authenticate_with_device(
+            authenticate_with_device_within(
+                self.tuning.flow_request_timeout,
                 &self.issuer_url,
                 &self.client_id,
                 &self.redirect_uri,

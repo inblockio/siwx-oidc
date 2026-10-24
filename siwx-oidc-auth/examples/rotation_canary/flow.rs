@@ -206,6 +206,8 @@ pub async fn sign_in(
             Some(AuthError::AccessDenied) => Reason::IdentityUnusable,
             Some(AuthError::DeviceRefused) => Reason::DeviceRefused,
             Some(AuthError::TemporarilyUnavailable) => Reason::SignInUnavailable,
+            // Silence, not a refusal: the same reason as before the error was typed.
+            Some(AuthError::TimedOut) => Reason::SignInFailed,
             Some(_) => Reason::SignInRefused,
             None => Reason::SignInFailed,
         }),

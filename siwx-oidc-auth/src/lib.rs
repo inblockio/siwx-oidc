@@ -418,7 +418,28 @@ pub async fn authenticate_with_device(
     key: &SiwxKey,
     device_id: Option<&str>,
 ) -> Result<AuthTokens> {
-    let client = flow_client()?;
+    authenticate_with_device_within(
+        FLOW_REQUEST_TIMEOUT,
+        server_url,
+        client_id,
+        redirect_uri,
+        key,
+        device_id,
+    )
+    .await
+}
+
+/// [`authenticate_with_device`] with a request timeout the caller sets (the
+/// directory session takes it from its tuning).
+pub(crate) async fn authenticate_with_device_within(
+    request_timeout: Duration,
+    server_url: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    key: &SiwxKey,
+    device_id: Option<&str>,
+) -> Result<AuthTokens> {
+    let client = flow_client(request_timeout)?;
     code_flow(
         &client,
         server_url,
@@ -465,9 +486,10 @@ pub async fn authenticate_with_device(
 /// one) is reported with the reason it gave:
 /// `/authorize refused the request: invalid_scope: ...`.
 ///
-/// Builds its own HTTP client, which does not follow redirects. To use your own
-/// (a proxy, a timeout, a root certificate), call
-/// [`authenticate_with_scope_using`].
+/// Builds its own HTTP client, which does not follow redirects and gives up on
+/// a request that gets no answer within [`FLOW_REQUEST_TIMEOUT`] (a transient
+/// [`AuthError::TimedOut`]). To use your own (a proxy, a different timeout, a
+/// root certificate), call [`authenticate_with_scope_using`].
 pub async fn authenticate_with_scope(
     server_url: &str,
     client_id: &str,
@@ -475,7 +497,7 @@ pub async fn authenticate_with_scope(
     key: &SiwxKey,
     scope: &str,
 ) -> Result<AuthTokens> {
-    let client = flow_client()?;
+    let client = flow_client(FLOW_REQUEST_TIMEOUT)?;
     authenticate_with_scope_using(&client, server_url, client_id, redirect_uri, key, scope).await
 }
 
@@ -491,7 +513,11 @@ pub async fn authenticate_with_scope(
 ///
 /// The flow sends its cookies itself, so `client` should carry no cookie store.
 /// Timeouts, proxies and root certificates set on `client` apply to every
-/// request of the flow.
+/// request of the flow. The flow adds no timeout of its own to a client it did
+/// not build: set one (`ClientBuilder::timeout`, [`FLOW_REQUEST_TIMEOUT`] is
+/// what the other entry points use), or a server that accepts the connection
+/// and never answers holds the call. A request that hits the client's timeout
+/// is the transient [`AuthError::TimedOut`], as for the other entry points.
 pub async fn authenticate_with_scope_using(
     client: &reqwest::Client,
     server_url: &str,
@@ -503,13 +529,43 @@ pub async fn authenticate_with_scope_using(
     code_flow(client, server_url, client_id, redirect_uri, key, scope).await
 }
 
+/// The longest one request of a flow may take, from connecting to the last byte
+/// of the answer: ten seconds. The entry points that build their own HTTP client
+/// (`authenticate*`, [`refresh`], [`authenticate_device_flow`]) and
+/// [`directory::register_public_client`] give up on a request after this long,
+/// so a server that accepts the connection and never answers costs one request
+/// timeout, not the caller's whole sign-in. The give-up is the transient
+/// [`AuthError::TimedOut`]. The directory session takes the value from
+/// [`directory::Tuning::flow_request_timeout`].
+pub const FLOW_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The HTTP client the flows build for themselves. It must not follow
-/// redirects: the code flow reads the `Location` header of two of them.
-fn flow_client() -> Result<reqwest::Client> {
+/// redirects: the code flow reads the `Location` header of two of them. Every
+/// request it sends is held to `request_timeout`.
+pub(crate) fn flow_client(request_timeout: Duration) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .redirect(Policy::none())
+        .timeout(request_timeout)
         .build()
         .context("failed to build HTTP client")
+}
+
+/// `err` with `what` as its context, where a timeout anywhere in `err` (the
+/// request, or the answer's body) is the typed, transient
+/// [`AuthError::TimedOut`] instead of the HTTP client's error. Callers strip
+/// the URL from a `reqwest::Error` first: it holds the client id, redirect URI,
+/// state and code challenge.
+pub(crate) fn request_failed(err: impl Into<anyhow::Error>, what: &'static str) -> anyhow::Error {
+    let err: anyhow::Error = err.into();
+    let timed_out = err.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+    });
+    if timed_out {
+        return anyhow::Error::new(AuthError::TimedOut).context(what);
+    }
+    err.context(what)
 }
 
 /// A sign-in that siwx-oidc refused: at `/sign_in` with the authorization error
@@ -534,6 +590,9 @@ fn flow_client() -> Result<reqwest::Client> {
 ///   `/sign_in`, `/token` for the code and the refresh, `/device_authorization`
 ///   and the device poll). Transient: retry as after an outage, but not before
 ///   the server's hint, when it gave one ([`AuthError::retry_after`]).
+/// - [`AuthError::TimedOut`]: a request of a flow got no answer within the request
+///   timeout ([`FLOW_REQUEST_TIMEOUT`] unless the caller's client sets another).
+///   Transient: retry as after an outage.
 /// - [`AuthError::SignInRefused`]: any other `error` code.
 /// - [`AuthError::UnknownClient`]: the one that is not a `/sign_in` redirect. The
 ///   server does not know the client id, which it answers at `/authorize` with a
@@ -574,6 +633,12 @@ pub enum AuthError {
     /// `None`. [`AuthError::error_code`] is `rate_limited`, which is not the
     /// server's.
     RateLimited { retry_after: Option<Duration> },
+    /// A request of a flow got no answer within the request timeout: the server
+    /// was reached (or not even that) and went silent, in the answer's head or
+    /// its body. The text names no URL, which holds the client id, redirect URI
+    /// and state. [`AuthError::error_code`] is `timed_out`, which is not the
+    /// server's.
+    TimedOut,
     /// Any other `error` code at `/sign_in`.
     SignInRefused { error: String },
 }
@@ -618,6 +683,7 @@ impl AuthError {
             AuthError::UnknownClient => "invalid_client",
             AuthError::Unauthorized => "unauthorized",
             AuthError::RateLimited { .. } => "rate_limited",
+            AuthError::TimedOut => "timed_out",
             AuthError::DeviceRefused => "invalid_scope",
             AuthError::AccessDenied => "access_denied",
             AuthError::TemporarilyUnavailable => "temporarily_unavailable",
@@ -641,6 +707,12 @@ impl AuthError {
         matches!(self, AuthError::RateLimited { .. })
     }
 
+    /// Whether this is [`AuthError::TimedOut`]. Match this (or the type), not the
+    /// text.
+    pub fn is_timed_out(&self) -> bool {
+        matches!(self, AuthError::TimedOut)
+    }
+
     /// The wait the server asked for, when this is [`AuthError::RateLimited`]
     /// and the answer carried a numeric `Retry-After` (at most
     /// [`RETRY_AFTER_MAX`]). `None` for every other error, and for a rate limit
@@ -653,13 +725,14 @@ impl AuthError {
     }
 
     /// Whether the same call may succeed later, unchanged: a
-    /// [`AuthError::TemporarilyUnavailable`] (retry as after an outage) and an
+    /// [`AuthError::TemporarilyUnavailable`] (retry as after an outage), an
     /// [`AuthError::RateLimited`] (retry after [`AuthError::retry_after`], when
-    /// there is one). Every other refusal needs something to change first.
+    /// there is one) and an [`AuthError::TimedOut`] request. Every other refusal
+    /// needs something to change first.
     pub fn is_transient(&self) -> bool {
         matches!(
             self,
-            AuthError::TemporarilyUnavailable | AuthError::RateLimited { .. }
+            AuthError::TemporarilyUnavailable | AuthError::RateLimited { .. } | AuthError::TimedOut
         )
     }
 }
@@ -689,6 +762,10 @@ impl std::fmt::Display for AuthError {
                     "the server returned 429 Too Many Requests (rate limited)"
                 )
             }
+            // No endpoint (one type serves all of them) and no URL.
+            AuthError::TimedOut => {
+                write!(f, "the server did not answer within the request timeout")
+            }
             _ => write!(f, "/sign_in refused the request: {}", self.error_code()),
         }
     }
@@ -708,9 +785,9 @@ pub fn is_device_refused(err: &anyhow::Error) -> bool {
         .is_some_and(AuthError::is_device_refused)
 }
 
-/// Whether `err` is an [`AuthError::TemporarilyUnavailable`] or an
-/// [`AuthError::RateLimited`] from a flow entry point (see
-/// [`AuthError::is_transient`]). An untyped error (a network fault, say) answers
+/// Whether `err` is an [`AuthError::TemporarilyUnavailable`], an
+/// [`AuthError::RateLimited`] or an [`AuthError::TimedOut`] from a flow entry
+/// point (see [`AuthError::is_transient`]). An untyped error (a network fault, say) answers
 /// `false`: the caller decides for those as before.
 pub fn is_transient(err: &anyhow::Error) -> bool {
     err.downcast_ref::<AuthError>()
@@ -905,8 +982,7 @@ async fn code_flow(
         ])
         .send()
         .await
-        .map_err(reqwest::Error::without_url)
-        .context("GET /authorize failed")?;
+        .map_err(|e| request_failed(e.without_url(), "GET /authorize failed"))?;
 
     if resp.status() != StatusCode::SEE_OTHER {
         // The server answers an unregistered client id with a 401 here (and
@@ -989,8 +1065,7 @@ async fn code_flow(
         .header(header::COOKIE, &cookie_header)
         .send()
         .await
-        .map_err(reqwest::Error::without_url)
-        .context("GET /sign_in failed")?;
+        .map_err(|e| request_failed(e.without_url(), "GET /sign_in failed"))?;
 
     if resp.status() != StatusCode::SEE_OTHER {
         if resp.status().is_success() {
@@ -1036,8 +1111,7 @@ async fn code_flow(
         ])
         .send()
         .await
-        .map_err(reqwest::Error::without_url)
-        .context("POST /token failed")?;
+        .map_err(|e| request_failed(e.without_url(), "POST /token failed"))?;
 
     if !resp.status().is_success() {
         return Err(Refusal::of(resp).await.into_flow_error("/token"));
@@ -1045,7 +1119,7 @@ async fn code_flow(
 
     let raw: TokenResponseRaw = did_assertion::read_json(resp, did_assertion::DEFAULT_BODY_CAP)
         .await
-        .context("/token JSON parse failed")?;
+        .map_err(|e| request_failed(e, "/token JSON parse failed"))?;
     Ok(AuthTokens {
         expires_in: Some(raw.lifetime_secs()),
         access_token: raw.access_token,
@@ -1071,14 +1145,36 @@ async fn code_flow(
 /// - `did`: The DID associated with this session, copied into the returned
 ///   `AuthTokens::did` for the caller. It is not sent: the refresh request
 ///   carries no signature and needs no key, and its response has no ID token.
+///
+/// The request is held to [`FLOW_REQUEST_TIMEOUT`]; no answer in that time is the
+/// transient [`AuthError::TimedOut`].
 pub async fn refresh(
     server_url: &str,
     client_id: &str,
     refresh_token: &str,
     did: &str,
 ) -> Result<AuthTokens> {
+    refresh_within(
+        FLOW_REQUEST_TIMEOUT,
+        server_url,
+        client_id,
+        refresh_token,
+        did,
+    )
+    .await
+}
+
+/// [`refresh`] with a request timeout the caller sets (the directory session
+/// takes it from its tuning).
+pub(crate) async fn refresh_within(
+    request_timeout: Duration,
+    server_url: &str,
+    client_id: &str,
+    refresh_token: &str,
+    did: &str,
+) -> Result<AuthTokens> {
     let base = Url::parse(server_url).context("invalid server_url")?;
-    let client = flow_client()?;
+    let client = flow_client(request_timeout)?;
 
     let token_url = base.join("/token")?;
     let resp = client
@@ -1090,8 +1186,7 @@ pub async fn refresh(
         ])
         .send()
         .await
-        .map_err(reqwest::Error::without_url)
-        .context("POST /token (refresh) failed")?;
+        .map_err(|e| request_failed(e.without_url(), "POST /token (refresh) failed"))?;
 
     if !resp.status().is_success() {
         return Err(Refusal::of(resp).await.into_flow_error("/token refresh"));
@@ -1099,7 +1194,7 @@ pub async fn refresh(
 
     let raw: TokenResponseRaw = did_assertion::read_json(resp, did_assertion::DEFAULT_BODY_CAP)
         .await
-        .context("/token refresh JSON parse failed")?;
+        .map_err(|e| request_failed(e, "/token refresh JSON parse failed"))?;
     Ok(AuthTokens {
         expires_in: Some(raw.lifetime_secs()),
         access_token: raw.access_token,
@@ -1140,10 +1235,16 @@ fn extract_did_from_id_token(id_token: &str) -> Option<String> {
 /// tokens are used against a Matrix homeserver and refreshed.
 ///
 /// Prints the user code and verification URI to stderr, then polls until
-/// approved, denied, or expired.
+/// approved, denied, or expired. Each request (not the wait for the approval) is
+/// held to [`FLOW_REQUEST_TIMEOUT`]; one that gets no answer ends the flow with
+/// the transient [`AuthError::TimedOut`].
 pub async fn authenticate_device_flow(server_url: &str, client_id: &str) -> Result<AuthTokens> {
     let base = Url::parse(server_url).context("invalid server_url")?;
-    let client = reqwest::Client::new();
+    // Redirects are followed as before; each request is held to the timeout.
+    let client = reqwest::Client::builder()
+        .timeout(FLOW_REQUEST_TIMEOUT)
+        .build()
+        .context("failed to build HTTP client")?;
 
     // Step 1: POST /device_authorization
     let device_auth_url = base.join("/device_authorization")?;
@@ -1155,8 +1256,7 @@ pub async fn authenticate_device_flow(server_url: &str, client_id: &str) -> Resu
         ])
         .send()
         .await
-        .map_err(reqwest::Error::without_url)
-        .context("POST /device_authorization failed")?;
+        .map_err(|e| request_failed(e.without_url(), "POST /device_authorization failed"))?;
 
     if !resp.status().is_success() {
         return Err(Refusal::of(resp)
@@ -1167,7 +1267,7 @@ pub async fn authenticate_device_flow(server_url: &str, client_id: &str) -> Resu
     let device_auth: DeviceAuthResponseRaw =
         did_assertion::read_json(resp, did_assertion::DEFAULT_BODY_CAP)
             .await
-            .context("/device_authorization JSON parse failed")?;
+            .map_err(|e| request_failed(e, "/device_authorization JSON parse failed"))?;
 
     // Step 2: Display instructions. These are the one place the library prints
     // what the server wrote, because the person has to read the address and the
@@ -1213,14 +1313,13 @@ pub async fn authenticate_device_flow(server_url: &str, client_id: &str) -> Resu
             ])
             .send()
             .await
-            .map_err(reqwest::Error::without_url)
-            .context("POST /token (device poll) failed")?;
+            .map_err(|e| request_failed(e.without_url(), "POST /token (device poll) failed"))?;
 
         if resp.status().is_success() {
             let raw: TokenResponseRaw =
                 did_assertion::read_json(resp, did_assertion::DEFAULT_BODY_CAP)
                     .await
-                    .context("/token JSON parse failed")?;
+                    .map_err(|e| request_failed(e, "/token JSON parse failed"))?;
             let did = raw
                 .id_token
                 .as_ref()
@@ -2477,11 +2576,9 @@ mod tests {
         Endpoint::DevicePoll,
     ];
 
-    /// Run the flow that reaches `endpoint` against a server whose answer there is
-    /// `response` (everything before it succeeds as far as it must), and return
-    /// the error the flow ends with.
-    async fn rate_limited_at(endpoint: Endpoint, response: String) -> anyhow::Error {
-        let key = SiwxKey::generate_ed25519();
+    /// The answers a flow gets before the endpoint under test: `/authorize`,
+    /// `/sign_in` and `/device_authorization`.
+    fn flow_fixtures() -> (String, String, String) {
         let authorize_redirect = format!(
             "location: /login?nonce=n1&state=headless&client_id=client&redirect_uri={}",
             urlencoding::encode(REDIRECT_URI)
@@ -2499,6 +2596,15 @@ mod tests {
             &["content-type: application/json"],
             r#"{"device_code":"d","user_code":"U-1","verification_uri":"https://idp.example/device","verification_uri_complete":"https://idp.example/device?c=U-1","expires_in":60,"interval":0}"#,
         );
+        (authorize, sign_in, device_authorization)
+    }
+
+    /// Run the flow that reaches `endpoint` against a server whose answer there is
+    /// `response` (everything before it succeeds as far as it must), and return
+    /// the error the flow ends with.
+    async fn rate_limited_at(endpoint: Endpoint, response: String) -> anyhow::Error {
+        let key = SiwxKey::generate_ed25519();
+        let (authorize, sign_in, device_authorization) = flow_fixtures();
         let (served, error) = match endpoint {
             Endpoint::Authorize => {
                 let (base, served) = serve_in_order(vec![response]);
@@ -2679,5 +2785,238 @@ mod tests {
         }
         assert!(AuthError::TemporarilyUnavailable.is_transient());
         assert!(!AuthError::TemporarilyUnavailable.is_rate_limited());
+    }
+
+    // ---- A server that never answers costs one request timeout ----
+
+    /// Answer `responses` in order, then take one more connection, read its
+    /// request and never answer it: the server accepted the connection and
+    /// went silent. (`partial` is written first, for a server that sends the
+    /// head of an answer or part of its body and then goes silent.) The
+    /// connection stays open until the returned sender is dropped; the receiver
+    /// gets the request line of the request left unanswered.
+    fn serve_then_stall(
+        responses: Vec<String>,
+        partial: &'static str,
+    ) -> (
+        String,
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<String>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (hold, held) = std::sync::mpsc::channel::<()>();
+        let (reached_tx, reached) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                read_request(&mut stream);
+                let _ = stream.write_all(response.as_bytes());
+            }
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            let _ = reached_tx.send(request.request_line().to_string());
+            let _ = stream.write_all(partial.as_bytes());
+            let _ = stream.flush();
+            // Silent until the test lets go.
+            let _ = held.recv();
+            drop(stream);
+        });
+        (base, hold, reached)
+    }
+
+    /// Run the flow that reaches `endpoint` against a server that answers
+    /// everything before it and then goes silent. Returns the error the flow
+    /// ends with, how long it took, and the request left unanswered.
+    async fn stalled_at(endpoint: Endpoint) -> (anyhow::Error, Duration, String) {
+        let key = SiwxKey::generate_ed25519();
+        let (authorize, sign_in, device_authorization) = flow_fixtures();
+        let before = match endpoint {
+            Endpoint::Authorize | Endpoint::Refresh | Endpoint::DeviceAuthorization => vec![],
+            Endpoint::SignIn => vec![authorize],
+            Endpoint::Token => vec![authorize, sign_in],
+            Endpoint::DevicePoll => vec![device_authorization],
+        };
+        let (base, hold, reached) = serve_then_stall(before, "");
+        let started = std::time::Instant::now();
+        let outcome = match endpoint {
+            Endpoint::Authorize | Endpoint::SignIn | Endpoint::Token => {
+                authenticate_with_scope(&base, "client", REDIRECT_URI, &key, "openid")
+                    .await
+                    .map(drop)
+            }
+            Endpoint::Refresh => refresh(&base, "client", "rt-1", "did:key:zFixture")
+                .await
+                .map(drop),
+            Endpoint::DeviceAuthorization | Endpoint::DevicePoll => {
+                authenticate_device_flow(&base, "client").await.map(drop)
+            }
+        };
+        let elapsed = started.elapsed();
+        drop(hold);
+        let unanswered = reached
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("{endpoint:?}: the flow never reached the silent request"));
+        (
+            outcome.expect_err("the server never answered"),
+            elapsed,
+            unanswered,
+        )
+    }
+
+    /// The entry points that build their own client give up on a request after
+    /// ten seconds, at each of their endpoints, and say so as a transient
+    /// error; none of them waits for the whole sign-in.
+    #[tokio::test]
+    async fn a_server_that_never_answers_fails_each_flow_after_the_request_timeout() {
+        let all = tokio::time::timeout(Duration::from_secs(25), async {
+            tokio::join!(
+                stalled_at(Endpoint::Authorize),
+                stalled_at(Endpoint::SignIn),
+                stalled_at(Endpoint::Token),
+                stalled_at(Endpoint::Refresh),
+                stalled_at(Endpoint::DeviceAuthorization),
+                stalled_at(Endpoint::DevicePoll),
+            )
+        })
+        .await
+        .expect("still waiting after 25 s: a request has no timeout");
+        let all = [all.0, all.1, all.2, all.3, all.4, all.5];
+        for (endpoint, (error, elapsed, unanswered)) in ENDPOINTS.into_iter().zip(all) {
+            let context = format!("{endpoint:?} ({unanswered}): {error:#}");
+            assert!(
+                elapsed >= Duration::from_secs(9) && elapsed < Duration::from_secs(20),
+                "{context}: gave up after {elapsed:?}, not after about 10 s"
+            );
+            assert_eq!(
+                error.downcast_ref::<AuthError>(),
+                Some(&AuthError::TimedOut),
+                "{context}"
+            );
+            assert!(is_transient(&error), "{context}");
+            assert!(!is_rate_limited(&error), "{context}");
+            // No URL (it carries the client id, redirect URI, state), no body.
+            let text = printed(&error);
+            assert!(!text.contains("127.0.0.1"), "{context}: {text}");
+            assert!(!text.contains("client_id"), "{context}: {text}");
+        }
+    }
+
+    /// The answers before `endpoint` in the code flow.
+    fn code_flow_before(endpoint: Endpoint) -> Vec<String> {
+        let (authorize, sign_in, _) = flow_fixtures();
+        match endpoint {
+            Endpoint::Authorize => vec![],
+            Endpoint::SignIn => vec![authorize],
+            Endpoint::Token => vec![authorize, sign_in],
+            other => panic!("{other:?} is not a code-flow endpoint"),
+        }
+    }
+
+    /// Run the code flow over `client` against a server that goes silent at
+    /// `endpoint` after `partial`, and return what it ended with and when.
+    async fn silent_over(
+        client: &reqwest::Client,
+        endpoint: Endpoint,
+        partial: &'static str,
+    ) -> (anyhow::Error, Duration) {
+        let key = SiwxKey::generate_ed25519();
+        let (base, hold, reached) = serve_then_stall(code_flow_before(endpoint), partial);
+        let started = std::time::Instant::now();
+        let outcome =
+            authenticate_with_scope_using(client, &base, "client", REDIRECT_URI, &key, "openid")
+                .await;
+        let elapsed = started.elapsed();
+        drop(hold);
+        reached
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("{endpoint:?}: the flow never reached the silent request"));
+        (outcome.expect_err("the server went silent"), elapsed)
+    }
+
+    /// A request that times out is the typed, transient error, at each endpoint
+    /// of the code flow, and its text names no URL.
+    #[tokio::test]
+    async fn a_request_timeout_is_a_typed_transient_error_that_names_no_url() {
+        let client = flow_client(Duration::from_millis(300)).unwrap();
+        for endpoint in [Endpoint::Authorize, Endpoint::SignIn, Endpoint::Token] {
+            let (error, elapsed) = silent_over(&client, endpoint, "").await;
+            let context = format!("{endpoint:?}: {error:#}");
+            assert!(
+                elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(5),
+                "{context}: gave up after {elapsed:?}"
+            );
+            assert_eq!(
+                error.downcast_ref::<AuthError>(),
+                Some(&AuthError::TimedOut),
+                "{context}"
+            );
+            let typed = error.downcast_ref::<AuthError>().unwrap();
+            assert!(typed.is_timed_out() && typed.is_transient(), "{context}");
+            assert!(is_transient(&error), "{context}");
+            assert_eq!(typed.error_code(), "timed_out", "{context}");
+            assert!(
+                !is_rate_limited(&error)
+                    && !is_device_refused(&error)
+                    && !is_unknown_client(&error),
+                "{context}"
+            );
+            let text = printed(&error);
+            for url_part in [
+                "127.0.0.1",
+                "state=headless",
+                "code_challenge",
+                "redirect_uri",
+            ] {
+                assert!(!text.contains(url_part), "{context}: {text}");
+            }
+        }
+    }
+
+    /// An answer whose head arrived and whose body then stops is the same
+    /// timeout.
+    #[tokio::test]
+    async fn a_body_that_stops_midway_is_a_timeout_too() {
+        let client = flow_client(Duration::from_millis(300)).unwrap();
+        let partial = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1000\r\n\r\n{\"access_token\":\"a\"";
+        let (error, elapsed) = silent_over(&client, Endpoint::Token, partial).await;
+        assert!(
+            elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(5),
+            "gave up after {elapsed:?}: {error:#}"
+        );
+        assert_eq!(
+            error.downcast_ref::<AuthError>(),
+            Some(&AuthError::TimedOut),
+            "{error:#}"
+        );
+        assert!(is_transient(&error), "{error:#}");
+        assert!(!printed(&error).contains("127.0.0.1"), "{error:#}");
+    }
+
+    #[test]
+    fn the_request_timeout_defaults_to_ten_seconds() {
+        assert_eq!(FLOW_REQUEST_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn timed_out_is_a_transient_error_and_no_other_kind() {
+        let timed_out = AuthError::TimedOut;
+        assert!(timed_out.is_timed_out() && timed_out.is_transient());
+        assert!(!timed_out.is_rate_limited() && !timed_out.is_device_refused());
+        assert!(!timed_out.is_unknown_client());
+        assert_eq!(timed_out.retry_after(), None);
+        for other in [
+            AuthError::RateLimited { retry_after: None },
+            AuthError::TemporarilyUnavailable,
+            AuthError::DeviceRefused,
+            AuthError::AccessDenied,
+            AuthError::UnknownClient,
+            AuthError::Unauthorized,
+            AuthError::SignInRefused {
+                error: "timed_out".into(),
+            },
+        ] {
+            assert!(!other.is_timed_out(), "{other:?}");
+        }
     }
 }
