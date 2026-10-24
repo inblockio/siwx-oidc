@@ -203,9 +203,9 @@ pub async fn sign_in(
         // The error is typed where the library types it and otherwise opaque:
         // its text can embed a response body, so it is never read.
         Err(e) => Err(match e.downcast_ref::<AuthError>() {
-            Some(AuthError::AccessDenied { .. }) => Reason::IdentityUnusable,
-            Some(AuthError::DeviceRefused { .. }) => Reason::DeviceRefused,
-            Some(AuthError::TemporarilyUnavailable { .. }) => Reason::SignInUnavailable,
+            Some(AuthError::AccessDenied) => Reason::IdentityUnusable,
+            Some(AuthError::DeviceRefused) => Reason::DeviceRefused,
+            Some(AuthError::TemporarilyUnavailable) => Reason::SignInUnavailable,
             Some(_) => Reason::SignInRefused,
             None => Reason::SignInFailed,
         }),

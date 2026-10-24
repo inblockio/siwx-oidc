@@ -3525,3 +3525,129 @@ mod signer_fault_tests {
         drop(service);
     }
 }
+
+#[cfg(test)]
+mod headless_client_interop_tests {
+    //! The headless client (`siwx-oidc-auth`) against this server's own `/authorize`
+    //! handler, over a socket: what the server answers for a client id it does not
+    //! know is what `AuthError::UnknownClient` is made from. The client's own tests
+    //! stub that answer; this pins the stub to the real thing, so a change of the
+    //! status or of the route breaks here and not in a consumer that re-registers on
+    //! it.
+    use super::*;
+    use openidconnect::core::CoreClientAuthMethod;
+    use openidconnect::RedirectUrl;
+    use siwx_oidc_auth::{authenticate_with_scope, is_unknown_client, AuthError, SiwxKey};
+
+    const REDIRECT: &str = "https://rp.example.org/cb";
+
+    fn state(redis: RedisClient) -> AppState {
+        let base = url::Url::parse("http://localhost:8000").unwrap();
+        let (wa_config, rp_dispatch) =
+            wa::build_rp_dispatch(&base, None, None, None).expect("build rp dispatch");
+        AppState {
+            signing_key: Arc::new(EcdsaSigningKey::generate()),
+            retired_verification_keys: Arc::new(Vec::new()),
+            config: config::Config {
+                base_url: base,
+                ens_api_url: None,
+                eth_provider: None,
+                ..config::Config::default()
+            },
+            redis_client: redis,
+            webauthn: Arc::new(wa_config.webauthn),
+            rp_id: wa_config.rp_id,
+            rp_origin: wa_config.rp_origin,
+            rp_dispatch: Arc::new(rp_dispatch),
+            synapse_client: None,
+        }
+    }
+
+    /// `/authorize` as the server routes it, with its real error rendering.
+    async fn serve(state: AppState) -> String {
+        let app = Router::new()
+            .route("/authorize", get(authorize))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        base
+    }
+
+    fn public_client() -> ClientEntry {
+        ClientEntry::new(
+            "client-secret",
+            SiwxClientMetadata::new(
+                vec![RedirectUrl::new(REDIRECT.into()).unwrap()],
+                LogoutClientMetadata::default(),
+            )
+            .set_token_endpoint_auth_method(Some(CoreClientAuthMethod::None)),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_client_id_is_the_typed_unknown_client_error() {
+        let Some(redis) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let base = serve(state(redis.clone())).await;
+        let key = SiwxKey::generate_ed25519();
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+
+        let unknown = format!("no-such-client-{tag}");
+        let error = authenticate_with_scope(&base, &unknown, REDIRECT, &key, "openid")
+            .await
+            .expect_err("the server does not know this client");
+        assert_eq!(
+            error.downcast_ref::<AuthError>(),
+            Some(&AuthError::UnknownClient),
+            "{error:#}"
+        );
+        assert!(is_unknown_client(&error));
+
+        // What `UnknownClient` is told from a proxy's auth wall by: the server's
+        // own 401 carries no `WWW-Authenticate` header (a wall's does, and the
+        // client types that as `AuthError::Unauthorized`). If this server ever
+        // challenges here, `UnknownClient` would stop being recognised.
+        let raw = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+            .get(format!("{base}/authorize"))
+            .query(&[
+                ("client_id", unknown.as_str()),
+                ("redirect_uri", REDIRECT),
+                ("scope", "openid"),
+                ("response_type", "code"),
+                ("state", "s"),
+                ("code_challenge", "c"),
+                ("code_challenge_method", "S256"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(raw.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            raw.headers().get(header::WWW_AUTHENTICATE).is_none(),
+            "{:?}",
+            raw.headers()
+        );
+
+        // A client the server knows is not that, with its redirect URI or with
+        // one that is not registered: the answers differ from the 401.
+        let known = format!("known-client-{tag}");
+        redis
+            .set_client(known.clone(), public_client())
+            .await
+            .unwrap();
+        for redirect in [REDIRECT, "https://elsewhere.example.org/cb"] {
+            let error = authenticate_with_scope(&base, &known, redirect, &key, "openid")
+                .await
+                .expect_err("the stub server has no /sign_in");
+            assert!(!is_unknown_client(&error), "{redirect}: {error:#}");
+        }
+    }
+}

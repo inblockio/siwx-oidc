@@ -102,6 +102,12 @@ enum KeyTypeArg {
     P256,
 }
 
+/// What `--verify-did` tells the user when the profile's unsigned `did` member
+/// names another DID than the signed `sub`. The member is the homeserver's text
+/// and is not repeated; the printed DID is the signed one.
+const PLAIN_DID_NOTICE: &str = "warning: the profile's unsigned `did` member disagrees with the \
+signed `sub`; the unsigned member is UNTRUSTED and the verified (signed) DID is the one printed";
+
 fn load_key(cli: &Cli) -> Result<SiwxKey> {
     if let Some(path) = &cli.key_file {
         let key = SiwxKey::from_pem_file(path)?;
@@ -201,6 +207,9 @@ async fn main() -> Result<()> {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--homeserver is required with --verify-did"))?;
         let verified = fetch_and_verify_did(homeserver, mxid, server).await?;
+        if verified.plain_did_disagrees() {
+            eprintln!("{PLAIN_DID_NOTICE}");
+        }
         println!("{}", serde_json::to_string_pretty(&verified)?);
         return Ok(());
     }

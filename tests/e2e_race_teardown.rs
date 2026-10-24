@@ -5389,9 +5389,7 @@ async fn authenticate_with_device_deleted_id_returns_device_refused() {
         assert!(
             matches!(
                 error.downcast_ref::<AuthError>(),
-                Some(AuthError::DeviceRefused {
-                    description: Some(_)
-                })
+                Some(AuthError::DeviceRefused)
             ),
             "{error:?}"
         );

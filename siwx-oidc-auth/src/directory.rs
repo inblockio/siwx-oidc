@@ -51,6 +51,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -63,10 +64,13 @@ use tokio::task::JoinSet;
 use url::Url;
 
 use crate::did_assertion::{
-    fetch_issuer_keys, parse_proof, read_capped, verify_parsed, BodyTooLarge, IssuerKeys,
-    DID_PROFILE_FIELD,
+    fetch_issuer_keys, parse_proof, read_at_most, verify_parsed, BodyTooLarge, IssuerKeys,
+    DEFAULT_BODY_CAP, DID_PROFILE_FIELD,
 };
-use crate::{authenticate_with_device, refresh, AuthError, SiwxKey};
+use crate::{
+    authenticate_with_device, refresh, AuthError, SiwxKey, TOKEN_LIFETIME_DEFAULT_SECS,
+    TOKEN_LIFETIME_MAX_SECS, TOKEN_LIFETIME_MIN_SECS,
+};
 
 /// The shortest and longest search term, in characters after trimming.
 const TERM_MIN: usize = 1;
@@ -75,8 +79,6 @@ const TERM_MAX: usize = 64;
 const LIMIT_MAX: u32 = 20;
 /// Profile reads in flight at once on the user transport.
 const PROFILE_READS_AT_ONCE: usize = 8;
-/// What a token with no `expires_in` is assumed to live, in seconds.
-const UNKNOWN_LIFETIME_SECS: u64 = 60;
 
 // ---------------------------------------------------------------------------
 // The result (plan 4.1)
@@ -174,7 +176,9 @@ pub enum DirectoryError {
     /// The token was refused, and (for the service transport) a fresh sign-in
     /// did not help. For `search_as_user`, the user's token is stale.
     Unauthorized,
-    /// The service could not sign in. See [`DirectoryError::is_retryable`].
+    /// The service could not sign in. See [`DirectoryError::is_retryable`]. A
+    /// refusal the server made is an [`AuthError`] in `source`; a client id the
+    /// server does not know is [`DirectoryError::is_unknown_client`].
     SignIn { source: anyhow::Error },
     /// A network, timeout, discovery, key-set or 5xx failure: the state is
     /// unknown, try again later.
@@ -186,11 +190,23 @@ pub enum DirectoryError {
         errcode: Option<String>,
     },
     /// An answer that is not what the contract says (malformed JSON, a row
-    /// without a user id, a body over the size cap).
+    /// without a user id, a success body over the size cap).
     Protocol(String),
 }
 
 impl DirectoryError {
+    /// Whether the service could not sign in because the server does not know its
+    /// client id: a dynamic client lapses after 30 days without a use (see
+    /// [`register_public_client`]). The remedy is to register again and keep the
+    /// new id, not to retry, so this is never [`is_retryable`](Self::is_retryable).
+    /// Match this (or [`AuthError::UnknownClient`] in the `source`), not the text.
+    pub fn is_unknown_client(&self) -> bool {
+        match self {
+            DirectoryError::SignIn { source } => crate::is_unknown_client(source),
+            _ => false,
+        }
+    }
+
     /// Whether the same call may succeed later without a change on the caller's
     /// side. A sign-in is retryable unless the server refused the account
     /// (`access_denied`), the device id (`invalid_scope`) or the request for
@@ -295,8 +311,17 @@ pub struct Tuning {
     pub resolve_hit_ttl: Duration,
     /// How long "no such account" is kept, so a new account is found soon.
     pub resolve_miss_ttl: Duration,
+    /// How long a failed sign-in is answered with the same failure before the
+    /// service tries again. Callers that wait for an attempt share its outcome
+    /// whatever this is; it bounds how often a service hammers an issuer that is
+    /// down. Zero tries on every call that finds the token stale.
+    pub failed_sign_in_cooldown: Duration,
     /// How long discovery and the key set are kept.
     pub keys_ttl: Duration,
+    /// The least time between two fetches of the key set when a proof names a
+    /// `kid` the cached set lacks. A rotation is picked up at once; a stream of
+    /// proofs with made-up kids costs the issuer one fetch per interval.
+    pub keys_refetch_interval: Duration,
     /// How long a verified `(mxid, proof)` is kept. A key dropped from the key
     /// set stops verifying within `keys_ttl` plus this time.
     pub verified_ttl: Duration,
@@ -314,10 +339,12 @@ impl Default for Tuning {
             token_refresh_margin: Duration::from_secs(30),
             resolve_hit_ttl: Duration::from_secs(10 * 60),
             resolve_miss_ttl: Duration::from_secs(60),
+            failed_sign_in_cooldown: Duration::from_secs(5),
             keys_ttl: Duration::from_secs(5 * 60),
+            keys_refetch_interval: Duration::from_secs(30),
             verified_ttl: Duration::from_secs(10 * 60),
             max_cache_entries: 4096,
-            max_body_bytes: 256 * 1024,
+            max_body_bytes: DEFAULT_BODY_CAP,
         }
     }
 }
@@ -330,13 +357,26 @@ fn invalid(why: impl Into<String>) -> DirectoryError {
     DirectoryError::InvalidInput(why.into())
 }
 
-/// The term as it goes out: trimmed, and 1 to 64 characters (not bytes).
+/// What the directory module trims from a term: Python's `str.strip()`, which
+/// removes every character `str.isspace()` accepts. That is Rust's whitespace
+/// and the four information separators U+001C to U+001F, which Python counts as
+/// whitespace and Rust does not.
+fn module_trims(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// The term as it goes out, held to the module's rules so that a term it would
+/// answer with a 400 never costs a request: trimmed as the module trims, then 1
+/// to 64 characters (not bytes) and no control character (Unicode category Cc)
+/// anywhere. The module strips first and checks after, so a control character
+/// that is whitespace at an end is trimmed and one that is not is refused.
 fn check_term(term: &str) -> Result<&str, DirectoryError> {
-    let term = term.trim();
+    let term = term.trim_matches(module_trims);
     let n = term.chars().count();
-    if !(TERM_MIN..=TERM_MAX).contains(&n) {
+    if !(TERM_MIN..=TERM_MAX).contains(&n) || term.chars().any(char::is_control) {
         return Err(invalid(format!(
-            "the search term must be {TERM_MIN} to {TERM_MAX} characters after trimming"
+            "the search term must be {TERM_MIN} to {TERM_MAX} characters after trimming, \
+             without control characters"
         )));
     }
     Ok(term)
@@ -448,16 +488,20 @@ pub async fn register_public_client(
         })?;
 
     let status = resp.status();
-    let body = read_capped(resp, tuning.max_body_bytes).await?;
+    // An error answer counts by its status even when its body is over the cap.
+    let body = read_at_most(resp, tuning.max_body_bytes).await?;
     if !status.is_success() {
-        let code = serde_json::from_slice::<Value>(&body)
-            .ok()
-            .and_then(|v| v.get("error").and_then(Value::as_str).map(short_code));
-        return Err(match code.flatten() {
+        let code = body
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|v| short_code(v.get("error")?.as_str()?));
+        return Err(match code {
             Some(code) => anyhow!("OIDC registration returned {status} ({code})"),
             None => anyhow!("OIDC registration returned {status}"),
         });
     }
+    let body = body.ok_or(BodyTooLarge {
+        cap: tuning.max_body_bytes,
+    })?;
     let registered: Registered = serde_json::from_slice(&body)
         .map_err(|_| anyhow!("the OIDC registration answer has no client_id"))?;
     if registered.client_id.is_empty() {
@@ -470,7 +514,7 @@ pub async fn register_public_client(
 
 /// An error code from a server, if it looks like one: short, and only the
 /// characters of the OAuth and Matrix error vocabularies.
-fn short_code(s: &str) -> Option<String> {
+pub(crate) fn short_code(s: &str) -> Option<String> {
     let ok = !s.is_empty()
         && s.len() <= 64
         && s.bytes()
@@ -551,10 +595,13 @@ impl fmt::Debug for ServiceSessionConfig {
 ///
 /// [`access_token`](Self::access_token) is the one call a user of this type
 /// makes: it returns a token that is good now, renewing it first when it is
-/// about to expire. Renewal is single flight (callers that arrive while one is
-/// running wait for it; a successful renewal is shared, a failed one is not, so
-/// each waiter then tries on its own), tries the refresh token first, and signs
-/// in again with the key when that fails.
+/// about to expire. Renewal is single flight: callers that arrive while an
+/// attempt is running wait for it and share its outcome, a failure as much as a
+/// success, so k callers behind a hanging issuer wait for one timeout, not k. A
+/// failed attempt is answered again, without a request, for
+/// [`Tuning::failed_sign_in_cooldown`]; after that the next call tries. An
+/// attempt tries the refresh token first, and signs in again with the key when
+/// that fails.
 ///
 /// Tokens live in this struct's memory and nowhere else: not on disk, not in a
 /// log, not in `Debug` output. On a restart the service signs in again; there is
@@ -570,6 +617,11 @@ pub struct ServiceSession {
     tuning: Tuning,
     clock: Clock,
     tokens: AsyncMutex<Tokens>,
+    /// Renewal attempts that have finished. Kept outside the lock, so that a
+    /// caller can read it before it waits and tell, once it holds the lock,
+    /// whether an attempt finished in between: that attempt's outcome is its
+    /// own.
+    settled: AtomicU64,
 }
 
 #[derive(Default)]
@@ -578,6 +630,36 @@ struct Tokens {
     refresh: Option<String>,
     /// From here on the access token is renewed.
     renew_at: Option<Instant>,
+    /// The latest attempt, when it failed, and when it ended. A success clears it.
+    failed: Option<(Instant, Fault)>,
+}
+
+/// A failed sign-in, kept to answer every caller that waited for the attempt.
+/// [`DirectoryError`] cannot be cloned (its `source` is an `anyhow::Error`), so
+/// what the failure said is kept: the server's typed refusal when there was one,
+/// and the text.
+#[derive(Clone)]
+struct Fault {
+    typed: Option<AuthError>,
+    text: String,
+}
+
+impl Fault {
+    fn of(source: &anyhow::Error) -> Fault {
+        Fault {
+            typed: source.downcast_ref::<AuthError>().cloned(),
+            text: format!("{source:#}"),
+        }
+    }
+
+    fn error(&self) -> DirectoryError {
+        DirectoryError::SignIn {
+            source: match &self.typed {
+                Some(typed) => anyhow::Error::new(typed.clone()),
+                None => anyhow!("{}", self.text),
+            },
+        }
+    }
 }
 
 impl ServiceSession {
@@ -609,6 +691,7 @@ impl ServiceSession {
             tuning,
             clock,
             tokens: AsyncMutex::new(Tokens::default()),
+            settled: AtomicU64::new(0),
         })
     }
 
@@ -619,11 +702,7 @@ impl ServiceSession {
 
     /// A token that is good now. Signs in on the first call. Never log it.
     pub async fn access_token(&self) -> Result<String, DirectoryError> {
-        let mut tokens = self.tokens.lock().await;
-        if let Some(token) = self.fresh(&tokens) {
-            return Ok(token);
-        }
-        self.renew(&mut tokens).await
+        self.token(None).await
     }
 
     /// The token to use after the homeserver refused `rejected`. If another
@@ -633,14 +712,57 @@ impl ServiceSession {
         &self,
         rejected: &str,
     ) -> Result<String, DirectoryError> {
+        self.token(Some(rejected)).await
+    }
+
+    /// One call for both: a token that is good now, or after `rejected` was
+    /// refused. At most one attempt runs; a caller that waited for it takes its
+    /// outcome, and one that comes just after a failure takes the failure until
+    /// the cooldown has passed.
+    async fn token(&self, rejected: Option<&str>) -> Result<String, DirectoryError> {
+        let seen = self.settled.load(Ordering::SeqCst);
         let mut tokens = self.tokens.lock().await;
-        if tokens.access.as_deref() != Some(rejected) {
+        if rejected.is_none() || tokens.access.as_deref() != rejected {
             if let Some(token) = self.fresh(&tokens) {
                 return Ok(token);
             }
         }
-        tokens.refresh = None;
-        self.sign_in(&mut tokens).await
+        if self.settled.load(Ordering::SeqCst) != seen {
+            // An attempt ended while this caller waited: its outcome is the answer.
+            match (&tokens.failed, &tokens.access) {
+                (Some((_, fault)), _) => return Err(fault.error()),
+                (None, Some(token)) => return Ok(token.clone()),
+                (None, None) => {}
+            }
+        }
+        if let Some((at, fault)) = &tokens.failed {
+            let cooling = at
+                .checked_add(self.tuning.failed_sign_in_cooldown)
+                .is_none_or(|until| self.clock.now() < until);
+            if cooling {
+                return Err(fault.error());
+            }
+        }
+
+        let attempt = match rejected {
+            None => self.renew(&mut tokens).await,
+            Some(_) => {
+                tokens.refresh = None;
+                self.sign_in(&mut tokens).await
+            }
+        };
+        self.settled.fetch_add(1, Ordering::SeqCst);
+        match attempt {
+            Ok(token) => {
+                tokens.failed = None;
+                Ok(token)
+            }
+            Err(fault) => {
+                let error = fault.error();
+                tokens.failed = Some((self.clock.now(), fault));
+                Err(error)
+            }
+        }
     }
 
     fn fresh(&self, tokens: &Tokens) -> Option<String> {
@@ -648,7 +770,7 @@ impl ServiceSession {
         (self.clock.now() < tokens.renew_at?).then(|| token.clone())
     }
 
-    async fn renew(&self, tokens: &mut Tokens) -> Result<String, DirectoryError> {
+    async fn renew(&self, tokens: &mut Tokens) -> Result<String, Fault> {
         // A refresh token is single use: it is taken, and replaced by the answer.
         if let Some(refresh_token) = tokens.refresh.take() {
             let attempt = tokio::time::timeout(
@@ -663,7 +785,7 @@ impl ServiceSession {
         self.sign_in(tokens).await
     }
 
-    async fn sign_in(&self, tokens: &mut Tokens) -> Result<String, DirectoryError> {
+    async fn sign_in(&self, tokens: &mut Tokens) -> Result<String, Fault> {
         let attempt = tokio::time::timeout(
             self.tuning.sign_in_timeout,
             authenticate_with_device(
@@ -677,22 +799,33 @@ impl ServiceSession {
         .await;
         match attempt {
             Ok(Ok(issued)) => Ok(self.keep(tokens, issued)),
-            Ok(Err(source)) => Err(DirectoryError::SignIn { source }),
-            Err(_) => Err(DirectoryError::SignIn {
-                source: anyhow!(
-                    "the sign-in did not finish within {:?}",
-                    self.tuning.sign_in_timeout
-                ),
-            }),
+            Ok(Err(source)) => Err(Fault::of(&source)),
+            Err(_) => Err(Fault::of(&anyhow!(
+                "the sign-in did not finish within {:?}",
+                self.tuning.sign_in_timeout
+            ))),
         }
     }
 
+    /// Keep the new pair. The tokens are stored before anything is computed from
+    /// the lifetime, so no `expires_in` can lose them (the refresh token was
+    /// already taken to get them); a lifetime is held between
+    /// [`TOKEN_LIFETIME_MIN_SECS`] and [`TOKEN_LIFETIME_MAX_SECS`] (the flows
+    /// already do that; a caller-built `AuthTokens` may not), none is
+    /// [`TOKEN_LIFETIME_DEFAULT_SECS`], and a deadline the clock cannot
+    /// represent is "renew on the next call".
     fn keep(&self, tokens: &mut Tokens, issued: crate::AuthTokens) -> String {
-        let life = Duration::from_secs(issued.expires_in.unwrap_or(UNKNOWN_LIFETIME_SECS));
-        let margin = self.tuning.token_refresh_margin.min(life / 2);
-        tokens.renew_at = Some(self.clock.now() + life - margin);
         tokens.access = Some(issued.access_token.clone());
         tokens.refresh = issued.refresh_token;
+        let life = Duration::from_secs(
+            issued
+                .expires_in
+                .unwrap_or(TOKEN_LIFETIME_DEFAULT_SECS)
+                .clamp(TOKEN_LIFETIME_MIN_SECS, TOKEN_LIFETIME_MAX_SECS),
+        );
+        let margin = self.tuning.token_refresh_margin.min(life / 2);
+        let now = self.clock.now();
+        tokens.renew_at = Some(now.checked_add(life - margin).unwrap_or(now));
         issued.access_token
     }
 }
@@ -841,6 +974,17 @@ struct Inner {
     clock: Clock,
     http: reqwest::Client,
     caches: Mutex<Caches>,
+    /// Held across a fetch of the issuer's keys, so that only one runs.
+    key_fetch: AsyncMutex<KeyFetch>,
+    /// Fetches that have finished, read before waiting at `key_fetch`: a caller
+    /// that finds it changed knows a fetch ran while it waited.
+    key_fetches: AtomicU64,
+}
+
+#[derive(Default)]
+struct KeyFetch {
+    /// When the latest fetch began, and why it failed if it did.
+    last: Option<(Instant, Option<String>)>,
 }
 
 impl fmt::Debug for DirectoryClient {
@@ -899,6 +1043,8 @@ impl DirectoryClient {
                     verified: TtlCache::new(),
                     keys: None,
                 }),
+                key_fetch: AsyncMutex::new(KeyFetch::default()),
+                key_fetches: AtomicU64::new(0),
             }),
         })
     }
@@ -1098,13 +1244,17 @@ impl Inner {
         self.clock.now()
     }
 
+    /// Whether the MXID is on this homeserver. Compared exactly, as Synapse and
+    /// the MXID binding of a proof compare: `@x:EXAMPLE.org` is not on
+    /// `example.org`, and a proof is never looked for on its profile.
     fn is_local(&self, mxid: &str) -> bool {
         mxid.split_once(':')
-            .is_some_and(|(_, server)| server.eq_ignore_ascii_case(&self.server_name))
+            .is_some_and(|(_, server)| server == self.server_name)
     }
 
-    /// Send, read the body under the size cap, and map a transport failure to a
-    /// retryable error. The URL is left out of the message: it can hold an MXID.
+    /// Send, read the body under the size cap (a success over it is a protocol
+    /// fault, an error status over it keeps its status), and map a transport
+    /// failure to a retryable error. The URL is left out of the message: it can hold an MXID.
     async fn send(&self, request: reqwest::RequestBuilder) -> Result<Reply, DirectoryError> {
         let response = request.send().await.map_err(|e| {
             let e = e.without_url();
@@ -1121,12 +1271,20 @@ impl Inner {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(Duration::from_secs);
-        let body = read_capped(response, self.tuning.max_body_bytes)
-            .await
-            .map_err(|e| match e.downcast_ref::<BodyTooLarge>() {
-                Some(too_large) => DirectoryError::Protocol(too_large.to_string()),
-                None => DirectoryError::Unavailable("reading the answer failed".into()),
-            })?;
+        let cap = self.tuning.max_body_bytes;
+        let body = match read_at_most(response, cap).await {
+            Ok(Some(body)) => body,
+            // An error answer counts by its status however long its body: what
+            // classifies it (the status, and a code or a hint in a short body)
+            // does not need the rest, and a body that is not kept costs nothing.
+            Ok(None) if !(200..300).contains(&status) => Vec::new(),
+            Ok(None) => return Err(DirectoryError::Protocol(BodyTooLarge { cap }.to_string())),
+            Err(_) => {
+                return Err(DirectoryError::Unavailable(
+                    "reading the answer failed".into(),
+                ))
+            }
+        };
         Ok(Reply {
             status,
             body,
@@ -1300,7 +1458,10 @@ impl Inner {
     /// - a verified `(mxid, proof)` still in the cache: `verified`, no key needed;
     /// - a proof that is malformed, or that does not verify under the issuer's
     ///   keys, or that names another MXID: `invalid`, and nothing is kept;
-    /// - keys that cannot be had: an error, so the whole search fails.
+    /// - no key set at all (none cached and none to be fetched): an error, so
+    ///   the whole search fails. A proof whose `kid` the cached set lacks is
+    ///   `invalid` when the refetch for it is rate limited or fails; that is
+    ///   never an error, and the verdict is not kept.
     async fn did_state(
         &self,
         mxid: &str,
@@ -1332,7 +1493,13 @@ impl Inner {
         let Ok(parsed) = parse_proof(proof) else {
             return Ok(DidState::Invalid);
         };
-        let keys = self.keys().await?;
+        let mut keys = self.keys().await?;
+        if !keys.has_kid(parsed.kid()) {
+            // A key the issuer rotated in since the set was fetched: look again
+            // (rate limited) before judging the proof against a stale set. The
+            // look can fail, and then the stale set stands.
+            keys = self.keys_after_unknown_kid(&keys).await;
+        }
         match verify_parsed(&keys, &parsed, mxid) {
             Ok(verified) => {
                 let sub = verified.did().to_string();
@@ -1352,19 +1519,111 @@ impl Inner {
     /// Discovery and the key set, from the cache or fetched. A failure is never
     /// stored, so the next search asks again.
     async fn keys(&self) -> Result<Arc<IssuerKeys>, DirectoryError> {
-        if let Some((keys, expires)) = &self.caches.lock().unwrap().keys {
-            if self.now() < *expires {
-                return Ok(keys.clone());
+        if let Some(keys) = self.cached_keys() {
+            return Ok(keys);
+        }
+        self.fetch_keys(None).await
+    }
+
+    /// The key set after a proof named a `kid` that `stale` lacks. A newer set
+    /// than `stale` is returned as it is; otherwise the set is fetched again,
+    /// unless a fetch began less than [`Tuning::keys_refetch_interval`] ago, in
+    /// which case `stale` stands (and the proof is judged `invalid` against it).
+    ///
+    /// This never fails: `stale` is a set that was usable a moment ago, and a
+    /// refetch that fails (or whose failure an earlier caller stored) leaves it
+    /// standing, so one row with an unknown `kid` cannot fail a search or hold
+    /// the others' answers hostage for the length of the rate limit.
+    async fn keys_after_unknown_kid(&self, stale: &Arc<IssuerKeys>) -> Arc<IssuerKeys> {
+        match self.fetch_keys(Some(stale)).await {
+            Ok(keys) => keys,
+            Err(_) => stale.clone(),
+        }
+    }
+
+    fn cached_keys(&self) -> Option<Arc<IssuerKeys>> {
+        let caches = self.caches.lock().unwrap();
+        let (keys, expires) = caches.keys.as_ref()?;
+        (self.now() < *expires).then(|| keys.clone())
+    }
+
+    /// The one place the issuer's discovery document and key set are fetched,
+    /// and one fetch at a time.
+    ///
+    /// Callers queue at `key_fetch`. One that waited while a fetch ran takes that
+    /// fetch's outcome, a failure as much as a set (k searches behind a slow
+    /// issuer wait for one timeout, not k), and the fetches do not overlap, so
+    /// each stores a set that is newer than the one it replaces: an older fetch
+    /// cannot land after a newer one. Nothing of a failure is stored; the next
+    /// call that finds no usable set fetches again. `stale` is the set a proof's
+    /// `kid` was missing from, when that is why the call is made; such a call
+    /// is answered with `stale` (not an error) while the rate limit holds after
+    /// a failed fetch, and the failure is only ever the answer of a call that has
+    /// no set (`stale` is `None`).
+    async fn fetch_keys(
+        &self,
+        stale: Option<&Arc<IssuerKeys>>,
+    ) -> Result<Arc<IssuerKeys>, DirectoryError> {
+        let seen = self.key_fetches.load(Ordering::SeqCst);
+        let mut fetch = self.key_fetch.lock().await;
+
+        let stored = || {
+            self.caches
+                .lock()
+                .unwrap()
+                .keys
+                .as_ref()
+                .map(|(keys, _)| keys.clone())
+        };
+        if self.key_fetches.load(Ordering::SeqCst) != seen {
+            // A fetch ended while this caller waited: its outcome is the answer.
+            match (&fetch.last, stored(), stale) {
+                // The set a proof's `kid` was missing from is still the one to
+                // judge it by when the refetch that ended meanwhile failed.
+                (Some((_, Some(_))), current, Some(stale)) => {
+                    return Ok(current.unwrap_or_else(|| stale.clone()))
+                }
+                (Some((_, Some(why))), _, None) => {
+                    return Err(DirectoryError::Unavailable(why.clone()))
+                }
+                (_, Some(keys), _) => return Ok(keys),
+                (_, None, _) => {}
             }
         }
+        match stale {
+            None => {
+                if let Some(keys) = self.cached_keys() {
+                    return Ok(keys);
+                }
+            }
+            Some(stale) => {
+                if let Some(current) = stored().filter(|current| !Arc::ptr_eq(current, stale)) {
+                    return Ok(current);
+                }
+                if let Some((began, _)) = &fetch.last {
+                    let limited = began
+                        .checked_add(self.tuning.keys_refetch_interval)
+                        .is_none_or(|until| self.now() < until);
+                    if limited {
+                        // A failed fetch limits the next one just as a good
+                        // one does, and `stale` stands either way.
+                        return Ok(stale.clone());
+                    }
+                }
+            }
+        }
+
+        let began = self.now();
         let fetched = fetch_issuer_keys(
             &self.http,
             &self.issuer_url,
             Some(self.tuning.max_body_bytes),
         )
         .await
-        .map_err(|e| DirectoryError::Unavailable(format!("the issuer's keys: {e:#}")))?;
-        let keys = Arc::new(fetched);
+        .map_err(|e| format!("the issuer's keys: {e:#}"));
+        fetch.last = Some((began, fetched.as_ref().err().cloned()));
+        self.key_fetches.fetch_add(1, Ordering::SeqCst);
+        let keys = Arc::new(fetched.map_err(DirectoryError::Unavailable)?);
         self.caches.lock().unwrap().keys = Some((keys.clone(), self.now() + self.tuning.keys_ttl));
         Ok(keys)
     }
