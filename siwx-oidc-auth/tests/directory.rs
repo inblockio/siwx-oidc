@@ -142,6 +142,55 @@ async fn a_refused_registration_is_an_error_naming_the_status() {
     assert!(format!("{err:#}").contains("400"), "{err:#}");
 }
 
+#[tokio::test]
+async fn a_429_at_registration_is_the_typed_rate_limit_with_the_hint() {
+    for (header, expected) in [
+        (Some("12"), Some(Duration::from_secs(12))),
+        (None, None),
+        (Some("86400"), Some(Duration::from_secs(3600))),
+        (Some("Wed, 21 Oct 2026 07:28:00 GMT"), None),
+        (Some("garbage"), None),
+    ] {
+        let issuer = Issuer::start().await;
+        issuer.with(|s| {
+            s.register_status = 429;
+            s.register_retry_after = header.map(str::to_string);
+        });
+        let err = register_public_client(&issuer.mock.base, REDIRECT_URI, "x")
+            .await
+            .unwrap_err();
+        let case = format!("{header:?}: {err:#}");
+        assert_eq!(
+            err.downcast_ref::<siwx_oidc_auth::AuthError>(),
+            Some(&siwx_oidc_auth::AuthError::RateLimited {
+                retry_after: expected
+            }),
+            "{case}"
+        );
+        assert!(siwx_oidc_auth::is_rate_limited(&err), "{case}");
+        assert!(siwx_oidc_auth::is_transient(&err), "{case}");
+        // The text keeps the status; neither the hint nor the server's words.
+        let text = format!("{err} | {err:#} | {err:?}");
+        assert!(text.contains("429"), "{text}");
+        assert!(!text.contains(REGISTER_DESCRIPTION), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn a_refused_registration_names_the_status_and_code_and_never_the_description() {
+    let issuer = Issuer::start().await;
+    issuer.with(|s| s.register_status = 400);
+    let err = register_public_client(&issuer.mock.base, REDIRECT_URI, "x")
+        .await
+        .unwrap_err();
+    let text = format!("{err} | {err:#} | {err:?}");
+    assert!(text.contains("400"), "{text}");
+    assert!(text.contains("invalid_client_metadata"), "{text}");
+    assert!(!text.contains(REGISTER_DESCRIPTION), "{text}");
+    assert!(!siwx_oidc_auth::is_transient(&err), "{text}");
+    assert!(!siwx_oidc_auth::is_rate_limited(&err), "{text}");
+}
+
 // ---------------------------------------------------------------------------
 // ServiceSession
 // ---------------------------------------------------------------------------
@@ -514,6 +563,133 @@ async fn a_403_is_not_admitted_and_signs_in_no_more() {
     assert!(!err.is_retryable());
     assert_eq!(w.hs.module_calls(), 1);
     assert_eq!(w.issuer.sign_ins(), 1);
+}
+
+#[tokio::test]
+async fn a_429_from_the_module_exposes_the_check_and_a_bounded_hint() {
+    // The header wins over the body, and both are held to an hour.
+    for (header, body_ms, expected) in [
+        (Some("9"), Some(1500), Some(Duration::from_secs(9))),
+        (None, Some(1500), Some(Duration::from_millis(1500))),
+        (Some("86400"), None, Some(Duration::from_secs(3600))),
+        (None, Some(86_400_000), Some(Duration::from_secs(3600))),
+        (Some("Wed, 21 Oct 2026 07:28:00 GMT"), None, None),
+        (Some("soon"), None, None),
+    ] {
+        let w = World::new().await;
+        w.hs.on_module(move |_, _| {
+            let body = match body_ms {
+                Some(ms) => json!({"errcode": "M_LIMIT_EXCEEDED", "retry_after_ms": ms}),
+                None => json!({"errcode": "M_LIMIT_EXCEEDED"}),
+            };
+            let resp = Resp::json(429, body);
+            match header {
+                Some(value) => resp.header("Retry-After", value),
+                None => resp,
+            }
+        });
+        let err = w
+            .directory()
+            .search_for_asker(&w.session(), ASKER_DID, "ada", 5)
+            .await
+            .unwrap_err();
+        let case = format!("{header:?} {body_ms:?}: {err:?}");
+        assert!(err.is_rate_limited(), "{case}");
+        assert_eq!(err.retry_after(), expected, "{case}");
+        assert!(err.is_retryable(), "{case}");
+    }
+}
+
+#[tokio::test]
+async fn a_429_at_the_sign_in_is_rate_limited_and_retryable_after_the_hint() {
+    for (header, expected) in [
+        (Some("12"), Some(Duration::from_secs(12))),
+        (None, None),
+        (Some("86400"), Some(Duration::from_secs(3600))),
+        (
+            Some("99999999999999999999999999"),
+            Some(Duration::from_secs(3600)),
+        ),
+        (Some("Wed, 21 Oct 2026 07:28:00 GMT"), None),
+        (Some("garbage"), None),
+    ] {
+        let w = World::new().await;
+        w.issuer.with(|s| {
+            s.authorize_status = Some(429);
+            s.authorize_retry_after = header.map(str::to_string);
+        });
+        let session = w.session();
+        let err = session.access_token().await.unwrap_err();
+        let case = format!("{header:?}: {err:?}");
+        let DirectoryError::SignIn { source } = &err else {
+            panic!("{case}");
+        };
+        assert_eq!(
+            source.downcast_ref::<siwx_oidc_auth::AuthError>(),
+            Some(&siwx_oidc_auth::AuthError::RateLimited {
+                retry_after: expected
+            }),
+            "{case}"
+        );
+        assert!(siwx_oidc_auth::is_rate_limited(source), "{case}");
+        assert!(err.is_rate_limited(), "{case}");
+        assert_eq!(err.retry_after(), expected, "{case}");
+        assert!(err.is_retryable(), "{case}");
+        assert!(!err.is_unknown_client(), "{case}");
+        assert!(
+            err.to_string().contains("returned 429"),
+            "the status text stays readable: {err}"
+        );
+
+        // The next call inside the cooldown is answered with the same failure,
+        // type and hint included, and sends nothing.
+        w.clock.advance(Duration::from_millis(100));
+        let again = session.access_token().await.unwrap_err();
+        assert!(again.is_rate_limited(), "{again:?}");
+        assert_eq!(again.retry_after(), expected, "{case}");
+        assert_eq!(w.issuer.mock.count("GET", "/authorize"), 1, "{case}");
+    }
+}
+
+#[tokio::test]
+async fn a_search_that_cannot_sign_in_for_a_429_is_rate_limited() {
+    let w = World::new().await;
+    w.issuer.with(|s| {
+        s.authorize_status = Some(429);
+        s.authorize_retry_after = Some("30".to_string());
+    });
+    let err = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "ada", 5)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DirectoryError::SignIn { .. }), "{err:?}");
+    assert!(err.is_rate_limited(), "{err:?}");
+    assert_eq!(err.retry_after(), Some(Duration::from_secs(30)));
+    assert_eq!(w.hs.module_calls(), 0, "no search without a token");
+}
+
+#[tokio::test]
+async fn no_other_error_is_rate_limited_or_has_a_hint() {
+    // Sign-in faults that are not a 429, and errors that are not sign-ins.
+    for status in [401u16, 500] {
+        let w = World::new().await;
+        w.issuer.with(|s| s.authorize_status = Some(status));
+        let err = w.session().access_token().await.unwrap_err();
+        assert!(!err.is_rate_limited(), "{status}: {err:?}");
+        assert_eq!(err.retry_after(), None, "{status}: {err:?}");
+    }
+    let w = World::new().await;
+    w.hs.on_module(|_, _| Resp::json(503, json!({})).header("Retry-After", "30"));
+    let err = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "ada", 5)
+        .await
+        .unwrap_err();
+    assert!(!err.is_rate_limited(), "{err:?}");
+    assert_eq!(err.retry_after(), None, "{err:?}");
+    assert!(!DirectoryError::NotAdmitted.is_rate_limited());
+    assert_eq!(DirectoryError::Unauthorized.retry_after(), None);
 }
 
 #[tokio::test]
@@ -1288,7 +1464,10 @@ async fn waiters_share_one_failed_renewal_instead_of_signing_in_one_after_anothe
         let w = World::new().await;
         w.issuer.with(|s| s.sign_in_delay = Duration::from_secs(3));
         let tuning = Tuning {
+            // The outer bound is never shorter than the request it wraps, so the
+            // request's own timeout is what ends the attempt here.
             sign_in_timeout: Duration::from_millis(300),
+            flow_request_timeout: Duration::from_millis(300),
             failed_sign_in_cooldown: cooldown,
             ..Tuning::default()
         };
@@ -1310,6 +1489,69 @@ async fn waiters_share_one_failed_renewal_instead_of_signing_in_one_after_anothe
             "one attempt in flight, its outcome shared"
         );
     }
+}
+
+/// A server that goes silent at one request of the sign-in costs the request
+/// timeout, not the whole sign-in cap (30 s here): the failure is the typed,
+/// transient timeout, the same for every caller that waited.
+#[tokio::test]
+async fn a_silent_issuer_fails_the_sign_in_after_the_request_timeout_not_the_cap() {
+    for endpoint in ["/authorize", "/sign_in", "/token"] {
+        let w = World::new().await;
+        let silence = Duration::from_secs(60);
+        w.issuer.with(|s| match endpoint {
+            "/authorize" => s.authorize_delay = silence,
+            "/sign_in" => s.sign_in_delay = silence,
+            _ => s.token_delay = silence,
+        });
+        let tuning = Tuning {
+            flow_request_timeout: Duration::from_millis(300),
+            ..Tuning::default()
+        };
+        assert_eq!(tuning.sign_in_timeout, Duration::from_secs(30));
+        let session = Arc::new(w.session_with(tuning));
+        let started = std::time::Instant::now();
+        for got in eight_callers(session.clone()).await {
+            let err = got.unwrap_err();
+            let case = format!("{endpoint}: {err:?}");
+            let DirectoryError::SignIn { source } = &err else {
+                panic!("{case}");
+            };
+            assert_eq!(
+                source.downcast_ref::<siwx_oidc_auth::AuthError>(),
+                Some(&siwx_oidc_auth::AuthError::TimedOut),
+                "{case}"
+            );
+            assert!(siwx_oidc_auth::is_transient(source), "{case}");
+            assert!(err.is_retryable() && !err.is_rate_limited(), "{case}");
+            assert!(!err.is_unknown_client(), "{case}");
+            let text = format!("{err} | {err:?}");
+            assert!(!text.contains("127.0.0.1"), "no URL: {text}");
+            assert!(!text.contains(CLIENT_ID), "no client id: {text}");
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(5),
+            "{endpoint}: eight callers waited {elapsed:?}, about the request timeout"
+        );
+        assert_eq!(
+            w.issuer.mock.count("GET", "/authorize"),
+            1,
+            "{endpoint}: one attempt in flight, its outcome shared"
+        );
+    }
+}
+
+#[test]
+fn the_request_timeout_is_a_tuning_and_defaults_to_ten_seconds() {
+    assert_eq!(
+        Tuning::default().flow_request_timeout,
+        Duration::from_secs(10)
+    );
+    assert_eq!(
+        Tuning::default().flow_request_timeout,
+        siwx_oidc_auth::FLOW_REQUEST_TIMEOUT
+    );
 }
 
 #[tokio::test]
@@ -2174,4 +2416,318 @@ async fn fetch_and_verify_did_follows_up_to_three_redirects_for_the_profile_read
         .await
         .expect_err("a chain of four is refused");
     assert!(format!("{err:#}").contains("redirect"), "{err:#}");
+}
+
+// ---------------------------------------------------------------------------
+// A refresh the server did not process keeps its token (F1)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_refresh_answered_429_keeps_the_refresh_token_and_is_the_typed_rate_limit() {
+    use siwx_oidc_auth::AuthError;
+
+    let w = World::new().await;
+    let session = Arc::new(w.session());
+    assert_eq!(session.access_token().await.unwrap(), "access-1");
+    w.clock.advance(Duration::from_secs(280));
+    let hint = Duration::from_secs(17);
+    w.issuer.with(|s| {
+        s.refresh_status = 429;
+        s.refresh_retry_after = Some("17".to_string());
+        // Every caller arrives while the one refresh is in flight.
+        s.refresh_delay = Duration::from_millis(200);
+    });
+
+    for got in eight_callers(session.clone()).await {
+        let err = got.unwrap_err();
+        let case = format!("{err:?}");
+        let DirectoryError::SignIn { source } = &err else {
+            panic!("{case}");
+        };
+        assert_eq!(
+            source.downcast_ref::<AuthError>(),
+            Some(&AuthError::RateLimited {
+                retry_after: Some(hint)
+            }),
+            "{case}"
+        );
+        assert!(err.is_rate_limited() && err.is_retryable(), "{case}");
+        assert_eq!(err.retry_after(), Some(hint), "{case}");
+    }
+    assert_eq!(w.issuer.refreshes(), 1, "single flight, outcome shared");
+    assert_eq!(
+        w.issuer.sign_ins(),
+        1,
+        "the server did not process the refresh: no sign-in in its place"
+    );
+
+    // Inside the cooldown the same failure is answered, hint included, unsent.
+    w.clock.advance(Duration::from_millis(100));
+    let again = session.access_token().await.unwrap_err();
+    assert_eq!(again.retry_after(), Some(hint), "{again:?}");
+    assert_eq!(w.issuer.refreshes(), 1);
+
+    // After it, with the limit lifted, the refresh token the 429 left alone is
+    // the one that is sent, and it works.
+    w.issuer.with(|s| {
+        s.refresh_status = 200;
+        s.refresh_delay = Duration::ZERO;
+    });
+    w.clock.advance(Duration::from_secs(6));
+    assert_eq!(session.access_token().await.unwrap(), "access-2");
+    assert_eq!(w.issuer.refreshes(), 2);
+    assert_eq!(w.issuer.sign_ins(), 1, "never a second sign-in");
+    let last = w
+        .issuer
+        .mock
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|r| r.form().get("grant_type").map(String::as_str) == Some("refresh_token"))
+        .unwrap();
+    assert_eq!(last.form()["refresh_token"], "refresh-1");
+}
+
+#[tokio::test]
+async fn a_refresh_refused_as_invalid_grant_falls_back_to_a_sign_in() {
+    for status in [400u16, 401] {
+        let w = World::new().await;
+        let session = w.session();
+        session.access_token().await.unwrap();
+        w.issuer.with(|s| s.refresh_status = status);
+        w.clock.advance(Duration::from_secs(280));
+        assert_eq!(
+            session.access_token().await.unwrap(),
+            "access-2",
+            "{status}"
+        );
+        assert_eq!(w.issuer.refreshes(), 1, "{status}");
+        assert_eq!(w.issuer.sign_ins(), 2, "{status}: the key signed in again");
+    }
+}
+
+#[tokio::test]
+async fn a_refresh_that_times_out_falls_back_to_a_sign_in() {
+    // The server may have rotated the token before the answer was lost, so the
+    // refresh token is spent: the sign-in is the way on.
+    let w = World::new().await;
+    let tuning = Tuning {
+        flow_request_timeout: Duration::from_millis(300),
+        ..Tuning::default()
+    };
+    let session = w.session_with(tuning);
+    session.access_token().await.unwrap();
+    w.issuer.with(|s| s.refresh_delay = Duration::from_secs(5));
+    w.clock.advance(Duration::from_secs(280));
+    let started = std::time::Instant::now();
+    assert_eq!(session.access_token().await.unwrap(), "access-3");
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert_eq!(w.issuer.refreshes(), 1);
+    assert_eq!(w.issuer.sign_ins(), 2);
+}
+
+#[tokio::test]
+async fn the_refresh_has_one_clock_and_no_shorter_one_around_it() {
+    // The request timeout (an outer bound on a whole refresh, once) was shorter
+    // than the flow timeout it wraps, so a refresh the server answered in time
+    // by the flow's clock was abandoned, and a sign-in took its place.
+    let w = World::new().await;
+    let tuning = Tuning {
+        request_timeout: Duration::from_millis(150),
+        flow_request_timeout: Duration::from_secs(2),
+        ..Tuning::default()
+    };
+    let session = w.session_with(tuning);
+    session.access_token().await.unwrap();
+    w.issuer
+        .with(|s| s.refresh_delay = Duration::from_millis(600));
+    w.clock.advance(Duration::from_secs(280));
+    assert_eq!(session.access_token().await.unwrap(), "access-2");
+    assert_eq!(w.issuer.refreshes(), 1);
+    assert_eq!(w.issuer.sign_ins(), 1, "the refresh was waited for");
+}
+
+#[tokio::test]
+async fn the_sign_in_bound_is_never_shorter_than_the_request_it_wraps() {
+    // A sign_in_timeout below the per-request timeout is raised to it: the
+    // request is given its own clock, and a server that answers within it is
+    // not cut off by the outer one.
+    let w = World::new().await;
+    w.issuer
+        .with(|s| s.authorize_delay = Duration::from_millis(400));
+    let tuning = Tuning {
+        sign_in_timeout: Duration::from_millis(100),
+        flow_request_timeout: Duration::from_secs(2),
+        ..Tuning::default()
+    };
+    let session = w.session_with(tuning);
+    assert_eq!(session.access_token().await.unwrap(), "access-1");
+}
+
+// ---------------------------------------------------------------------------
+// A 429 whose body cannot be read is still a 429 (F3)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_429_whose_body_cannot_be_read_is_still_rate_limited_with_the_header_hint() {
+    let limited = || {
+        Resp::json(429, json!({"errcode": "M_LIMIT_EXCEEDED"}))
+            .header("Retry-After", "9")
+            .truncated()
+    };
+
+    let w = World::new().await;
+    w.hs.on_module(move |_, _| limited());
+    let err = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "ada", 5)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DirectoryError::RateLimited { .. }),
+        "the module: {err:?}"
+    );
+    assert_eq!(err.retry_after(), Some(Duration::from_secs(9)), "{err:?}");
+    assert!(err.is_rate_limited() && err.is_retryable());
+
+    w.hs.on_user_directory(move |_, _| limited());
+    let err = w.directory().search_as_user("t", "a", 5).await.unwrap_err();
+    assert!(
+        matches!(err, DirectoryError::RateLimited { .. }),
+        "the user directory: {err:?}"
+    );
+    assert_eq!(err.retry_after(), Some(Duration::from_secs(9)), "{err:?}");
+}
+
+#[tokio::test]
+async fn any_other_answer_whose_body_cannot_be_read_is_unavailable() {
+    for status in [200u16, 401, 403, 500, 503] {
+        let w = World::new().await;
+        w.hs.on_module(move |_, _| {
+            Resp::json(status, json!({"results": []}))
+                .header("Retry-After", "9")
+                .truncated()
+        });
+        let err = w
+            .directory()
+            .search_for_asker(&w.session(), ASKER_DID, "ada", 5)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DirectoryError::Unavailable(_)),
+            "{status}: {err:?}"
+        );
+        assert!(err.is_retryable(), "{status}");
+        assert!(!err.is_rate_limited(), "{status}");
+        assert_eq!(err.retry_after(), None, "{status}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The host owns re-sign-in (F5)
+// ---------------------------------------------------------------------------
+
+fn directory_that_leaves_sign_in_to_the_host(
+    w: &World,
+) -> siwx_oidc_auth::directory::DirectoryClient {
+    siwx_oidc_auth::directory::DirectoryClient::new(w.config().with_sign_in_again_on_401(false))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn when_the_host_owns_re_sign_in_a_module_401_is_unauthorized_and_nothing_signs_in() {
+    let w = World::new().await;
+    w.hs.on_module(|_, _| Resp::json(401, json!({"errcode": "M_UNKNOWN_TOKEN"})));
+    let err = directory_that_leaves_sign_in_to_the_host(&w)
+        .search_for_asker(&w.session(), ASKER_DID, "ada", 5)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DirectoryError::Unauthorized), "{err:?}");
+    assert!(!err.is_retryable());
+    assert_eq!(w.hs.module_calls(), 1, "no retry");
+    assert_eq!(w.issuer.sign_ins(), 1, "and no second sign-in");
+}
+
+#[tokio::test]
+async fn the_default_still_signs_in_again_on_a_module_401() {
+    let w = World::new().await;
+    assert!(w.config().sign_in_again_on_401);
+    w.hs.on_module(|_, _| Resp::json(401, json!({"errcode": "M_UNKNOWN_TOKEN"})));
+    let err = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "ada", 5)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DirectoryError::Unauthorized), "{err:?}");
+    assert_eq!(w.hs.module_calls(), 2);
+    assert_eq!(w.issuer.sign_ins(), 2);
+}
+
+#[tokio::test]
+async fn the_host_renews_through_invalidate_access_token() {
+    let w = World::new().await;
+    let hits = vec![published(&w, "alice")];
+    w.hs.on_module(move |_, n| {
+        if n == 0 {
+            Resp::json(401, json!({"errcode": "M_UNKNOWN_TOKEN"}))
+        } else {
+            Resp::json(200, json!({"results": hits.clone(), "limited": false}))
+        }
+    });
+    let directory = directory_that_leaves_sign_in_to_the_host(&w);
+    let session = w.session();
+
+    let used = session.access_token().await.unwrap();
+    let err = directory
+        .search_for_asker(&session, ASKER_DID, "ada", 5)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DirectoryError::Unauthorized), "{err:?}");
+
+    // The host's own gate: the token it used was refused, so it asks for the
+    // next `access_token()` to renew, and searches again.
+    session.invalidate_access_token(&used).await;
+    let got = directory
+        .search_for_asker(&session, ASKER_DID, "ada", 5)
+        .await
+        .unwrap();
+    assert_eq!(got.results.len(), 1);
+    let bearers: Vec<_> =
+        w.hs.mock
+            .requests()
+            .iter()
+            .filter(|r| r.path == MODULE_PATH)
+            .map(|r| r.bearer().unwrap())
+            .collect();
+    assert_eq!(bearers, ["access-1", "access-2"]);
+    assert_eq!(w.issuer.sign_ins(), 2, "a fresh sign-in with the key");
+    assert_eq!(
+        w.issuer.refreshes(),
+        0,
+        "a refused token's refresh is not used"
+    );
+}
+
+#[tokio::test]
+async fn invalidate_access_token_discards_only_the_token_it_names() {
+    let w = World::new().await;
+    let session = w.session();
+    assert_eq!(session.access_token().await.unwrap(), "access-1");
+
+    // Some other token: nothing to discard.
+    session
+        .invalidate_access_token("not-the-current-token")
+        .await;
+    assert_eq!(session.access_token().await.unwrap(), "access-1");
+    assert_eq!(w.issuer.sign_ins(), 1);
+
+    session.invalidate_access_token("access-1").await;
+    assert_eq!(session.access_token().await.unwrap(), "access-2");
+    assert_eq!(w.issuer.sign_ins(), 2);
+
+    // A late report of the token another caller already replaced must not throw
+    // the renewed one away (a burst of 401s reports the same token many times).
+    session.invalidate_access_token("access-1").await;
+    assert_eq!(session.access_token().await.unwrap(), "access-2");
+    assert_eq!(w.issuer.sign_ins(), 2, "no renewal for a stale report");
 }

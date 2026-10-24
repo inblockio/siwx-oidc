@@ -146,9 +146,19 @@ one behind each time. `access_token()` returns a token that is good now:
 - after a failed attempt the same failure is answered, without a request, for
   `Tuning::failed_sign_in_cooldown` (5 seconds); the first call after that
   tries again. No more than one attempt is ever in flight;
-- when the refresh fails (the grant is gone, the server restarted without its
-  store) it falls back to a fresh sign-in with the key;
-- a 401 from the homeserver triggers one fresh sign-in and one retry of the call;
+- when the refresh is refused as invalid (400 or 401 `invalid_grant`: the grant
+  is gone, the server restarted without its store) or gets no answer in time (the
+  server may have rotated the token before the answer was lost), it falls back to
+  a fresh sign-in with the key. A refresh answered **429** is different: the
+  server did not process it, so the refresh token is kept and the call fails with
+  the typed rate limit and its hint (below), shared by the callers that waited;
+  the first call after the cooldown tries the same refresh token again. A refresh
+  has one clock, `Tuning::flow_request_timeout` (10 seconds, the answer's body
+  included), and no shorter timeout wraps it; the bound on a whole sign-in
+  (`Tuning::sign_in_timeout`) is never shorter than that one request either (a
+  smaller value is raised to it);
+- a 401 from the homeserver triggers one fresh sign-in and one retry of the call
+  (see "A host that owns the sign-in retries" below to take that over);
 - the token's lifetime is the server's `expires_in`, read from any JSON number
   (`3600.5`, `1e20` and a count above `u64` included) and held between 10
   seconds and 24 hours; a missing or non-number `expires_in` (`null`, a string,
@@ -166,6 +176,61 @@ A sign-in the server refuses is `DirectoryError::SignIn`. `access_denied`
 signed out and the server refuses to reuse it) are final; use
 `siwx_oidc_auth::is_device_refused` on the source if you want to pick a new id.
 `temporarily_unavailable` and network faults are retryable.
+
+**A host that owns the sign-in retries.** A service that has its own gate for
+sign-in attempts (its own backoff, one attempt for the whole process) turns the
+client's retry off and renews through its gate:
+
+```rust
+let directory = DirectoryClient::new(
+    DirectoryConfig::new(issuer, homeserver, server_name).with_sign_in_again_on_401(false),
+)?;
+
+let token = session.access_token().await?;      // through your gate
+match directory.search_for_asker(&session, asker, term, 10).await {
+    Err(DirectoryError::Unauthorized) => {
+        // The module refused the token this call used. Drop it, then renew
+        // through your gate and search again.
+        session.invalidate_access_token(&token).await;
+        let _renewed = session.access_token().await?;
+        /* search again */
+    }
+    other => other?,
+}
+```
+
+With `sign_in_again_on_401` off (default `true`, the behaviour above), a 401 from
+the directory module is `DirectoryError::Unauthorized` at once: no sign-in, no
+retry. `ServiceSession::invalidate_access_token(rejected)` discards the session's
+access token and its refresh token when the access token is `rejected`, so the
+next `access_token()` signs in with the key (a refused access token says nothing
+good of its refresh token, and this is what the client's own retry does). It
+discards only the token it names: when another caller has renewed already, the
+call does nothing, so a burst of refused requests that report the same token costs
+one renewal. A failed renewal's cooldown applies to the next `access_token()` as
+ever. (`search_as_user` never renews: its 401 is `Unauthorized` either way.)
+
+**A rate limit at the sign-in** is `AuthError::RateLimited { retry_after }` in the
+source: a 429 at `/authorize`, `/sign_in`, `/token` or the refresh (something in
+front of the server usually answers it; the server itself does not). It is
+retryable, but not before `retry_after`. `DirectoryError::is_rate_limited()`
+answers it, and `DirectoryError::retry_after()` gives the hint, for this and for
+the homeserver's 429 alike:
+
+```rust
+match directory.search_for_asker(&session, asker, term, 10).await {
+    Err(e) if e.is_rate_limited() => {
+        let wait = e.retry_after().unwrap_or(Duration::from_secs(30));
+        /* try again after `wait` */
+    }
+    other => other?,
+}
+```
+
+`retry_after` is the numeric `Retry-After` header held to one hour
+(`siwx_oidc_auth::RETRY_AFTER_MAX`); an HTTP-date, no header or anything that is
+not a number of seconds is `None`, and the caller picks its backoff. The error
+still prints "returned 429", without the body and without the hint.
 
 **A client id the server does not know** is `AuthError::UnknownClient` in the
 source, and `DirectoryError::is_unknown_client()` answers it directly. A dynamic
@@ -209,9 +274,10 @@ so a consumer that matched that text keeps working until it matches the type.)
 3. The proof check, per hit.
 
 The status codes: 401 signs the service in again once and retries once (a second
-401 is `Unauthorized`); 403 is `NotAdmitted` (the service is not admitted, or its
-account is locked or deactivated); 429 is `RateLimited`, with Synapse's
-`retry_after_ms` when it gave one.
+401 is `Unauthorized`; with `sign_in_again_on_401` off the first one is, and
+nothing signs in); 403 is `NotAdmitted` (the service is not admitted, or its
+account is locked or deactivated); 429 is `RateLimited`, with the `Retry-After`
+header or Synapse's `retry_after_ms` when it gave one (at most one hour).
 
 ### `search_as_user(user_token, term, limit)`
 
@@ -319,9 +385,9 @@ never the search term, a token or a response body.
 |---|---|---|
 | `InvalidInput` | refused before any request: bounds, an empty asker or token, a session of another deployment | no |
 | `NotAdmitted` | 403: the service is not admitted | no |
-| `RateLimited { retry_after }` | 429 | yes |
+| `RateLimited { retry_after }` | 429 from the homeserver; `is_rate_limited()` and `retry_after()` also answer for a sign-in that was rate limited (below) | yes, after `retry_after` |
 | `Unauthorized` | the token was refused (for the service, even after a fresh sign-in) | no |
-| `SignIn { source }` | the service could not sign in | by cause (see above) |
+| `SignIn { source }` | the service could not sign in; a 429 there is `AuthError::RateLimited` in the `source` (`is_rate_limited()`, `retry_after()`) | by cause (see above) |
 | `Unavailable` | network, timeout, 5xx, discovery or key set | yes |
 | `UnexpectedStatus { status, errcode }` | a status the client does not act on | no |
 | `Protocol` | an answer that is not the contract: malformed JSON, a row without a user id, a body over the cap | no |
@@ -340,14 +406,20 @@ Checked on the client, before any request.
   sent.
 - Limit: 1 to 20. A module that returns more rows than asked for is cut to the
   limit and the result is `limited`.
-- 5 seconds per request, from connect to the last byte of the body; the headless
-  sign-in as a whole may take 30.
+- 5 seconds per request of the client (`Tuning::request_timeout`), from connect to
+  the last byte of the body. The service session's own requests (the sign-in and
+  the refresh) are held to 10 seconds each (`Tuning::flow_request_timeout`), the
+  headless sign-in as a whole to 30 (`Tuning::sign_in_timeout`, never less than
+  one request's 10).
 - Response bodies are read under a 256 KiB cap, discovery and key set included. A
   body that declares more is refused before it is read, and one that does not is
   cut off while streaming. A success over the cap is a `Protocol` error. An
   error status over the cap is classified by its status all the same (a 401
   still signs the service in again, a 429 is `RateLimited`, a 5xx is
   `Unavailable`): only the body is dropped, with the hints it would have given.
+  A 429 whose body cannot be read at all (the connection drops, the body stalls)
+  is still `RateLimited`, with the `Retry-After` header's hint; any other status
+  with an unreadable body is `Unavailable`.
 - Redirects are never followed, so a bearer token cannot be carried elsewhere.
   The public `verify_did_assertion` follows none either for discovery and the key
   set: the same-origin rule for `jwks_uri` judges the URL the issuer named, and
@@ -366,6 +438,11 @@ Checked on the client, before any request.
   `error_description`. A transport error names the endpoint (`GET /authorize
   failed`) and never the request URL, which carries the client id, the redirect
   URI, the scope, the code challenge and the state.
+- An error answer whose status line arrives and whose body then stalls past the
+  request timeout is `AuthError::TimedOut` (transient), at every endpoint
+  (`/authorize`, `/sign_in`, `/token`, the refresh, the device flow, the
+  registration), not that status: a 400 would read as final and a stall is worth a
+  retry. A 429 stays the rate limit with its header's hint, whatever its body does.
 - The session's issuer and homeserver must be those of the client, so a token
   is never sent to a homeserver it was not issued for.
 

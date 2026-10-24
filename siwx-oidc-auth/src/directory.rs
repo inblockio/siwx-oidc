@@ -68,8 +68,9 @@ use crate::did_assertion::{
     DEFAULT_BODY_CAP, DID_PROFILE_FIELD,
 };
 use crate::{
-    authenticate_with_device, refresh, AuthError, SiwxKey, TOKEN_LIFETIME_DEFAULT_SECS,
-    TOKEN_LIFETIME_MAX_SECS, TOKEN_LIFETIME_MIN_SECS,
+    authenticate_with_device_within, refresh_within, request_failed, AuthError, Refusal, SiwxKey,
+    FLOW_REQUEST_TIMEOUT, TOKEN_LIFETIME_DEFAULT_SECS, TOKEN_LIFETIME_MAX_SECS,
+    TOKEN_LIFETIME_MIN_SECS,
 };
 
 /// The shortest and longest search term, in characters after trimming.
@@ -207,10 +208,39 @@ impl DirectoryError {
         }
     }
 
+    /// Whether the call was rate limited: a 429 from the homeserver
+    /// ([`DirectoryError::RateLimited`]) or from the sign-in
+    /// ([`AuthError::RateLimited`] in the `source` of a
+    /// [`DirectoryError::SignIn`]). It is retryable after
+    /// [`retry_after`](Self::retry_after), when there is one. Match this, not
+    /// the text.
+    pub fn is_rate_limited(&self) -> bool {
+        match self {
+            DirectoryError::RateLimited { .. } => true,
+            DirectoryError::SignIn { source } => crate::is_rate_limited(source),
+            _ => false,
+        }
+    }
+
+    /// The wait the server asked for, when the call was rate limited (see
+    /// [`is_rate_limited`](Self::is_rate_limited)) and it named one: at most
+    /// [`RETRY_AFTER_MAX`](crate::RETRY_AFTER_MAX). `None` otherwise, and the
+    /// caller picks its own backoff.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            DirectoryError::RateLimited { retry_after } => *retry_after,
+            DirectoryError::SignIn { source } => source
+                .downcast_ref::<AuthError>()
+                .and_then(AuthError::retry_after),
+            _ => None,
+        }
+    }
+
     /// Whether the same call may succeed later without a change on the caller's
     /// side. A sign-in is retryable unless the server refused the account
     /// (`access_denied`), the device id (`invalid_scope`) or the request for
-    /// another reason; an untyped sign-in fault (a network error) is retryable.
+    /// another reason; a rate limit at the sign-in is retryable after its hint;
+    /// an untyped sign-in fault (a network error) is retryable.
     pub fn is_retryable(&self) -> bool {
         match self {
             DirectoryError::RateLimited { .. } | DirectoryError::Unavailable(_) => true,
@@ -301,10 +331,24 @@ impl fmt::Debug for Clock {
 /// so a test can.
 #[derive(Debug, Clone)]
 pub struct Tuning {
-    /// Per request, connect to the last byte of the body.
+    /// Per request of the directory client (the asker lookup, the key set, the
+    /// directory module, the profiles), connect to the last byte of the body.
+    /// The service session's own requests (the sign-in and the refresh) are held
+    /// to `flow_request_timeout` instead.
     pub request_timeout: Duration,
-    /// The whole headless sign-in, which is several requests.
+    /// The whole headless sign-in, which is several requests. An outer bound is
+    /// never shorter than the request it wraps: a value below
+    /// `flow_request_timeout` is raised to it, so that a request is ended by its
+    /// own typed timeout and never cut off earlier by this one.
     pub sign_in_timeout: Duration,
+    /// Per request of the headless sign-in (`/authorize`, `/sign_in`, `/token`)
+    /// and of the refresh, connect to the last byte of the answer (the body
+    /// included). A request that gets no answer in this time fails the attempt
+    /// at once as the transient [`AuthError::TimedOut`], so a server that goes
+    /// silent costs this, not `sign_in_timeout`. This is the only clock a
+    /// refresh has: nothing shorter wraps it, so a refresh the server answers
+    /// within this time is never abandoned for a sign-in.
+    pub flow_request_timeout: Duration,
     /// A token is renewed this long before it expires (at most half its life).
     pub token_refresh_margin: Duration,
     /// How long an asker's DID to MXID mapping is kept once found.
@@ -336,6 +380,7 @@ impl Default for Tuning {
         Tuning {
             request_timeout: Duration::from_secs(5),
             sign_in_timeout: Duration::from_secs(30),
+            flow_request_timeout: FLOW_REQUEST_TIMEOUT,
             token_refresh_margin: Duration::from_secs(30),
             resolve_hit_ttl: Duration::from_secs(10 * 60),
             resolve_miss_ttl: Duration::from_secs(60),
@@ -436,8 +481,12 @@ fn is_mxid(s: &str) -> bool {
 }
 
 fn http_client(tuning: &Tuning) -> Result<reqwest::Client, DirectoryError> {
+    http_client_within(tuning.request_timeout)
+}
+
+fn http_client_within(timeout: Duration) -> Result<reqwest::Client, DirectoryError> {
     reqwest::Client::builder()
-        .timeout(tuning.request_timeout)
+        .timeout(timeout)
         // A redirect would carry a bearer token to wherever it points.
         .redirect(Policy::none())
         .build()
@@ -463,14 +512,24 @@ pub async fn register_public_client(
     redirect_uri: &str,
     client_name: &str,
 ) -> anyhow::Result<String> {
+    register_with(&Tuning::default(), issuer_url, redirect_uri, client_name).await
+}
+
+/// [`register_public_client`] under the bounds of `tuning` (its request timeout
+/// and body cap), which a test sets.
+pub(crate) async fn register_with(
+    tuning: &Tuning,
+    issuer_url: &str,
+    redirect_uri: &str,
+    client_name: &str,
+) -> anyhow::Result<String> {
     #[derive(Deserialize)]
     struct Registered {
         client_id: String,
     }
 
-    let tuning = Tuning::default();
     let base = clean_base("issuer_url", issuer_url)?;
-    let resp = http_client(&tuning)?
+    let resp = http_client_within(tuning.flow_request_timeout)?
         .post(format!("{base}/register"))
         .json(&json!({
             "redirect_uris": [redirect_uri],
@@ -480,25 +539,17 @@ pub async fn register_public_client(
         }))
         .send()
         .await
-        .map_err(|e| {
-            anyhow!(
-                "OIDC client registration request failed: {}",
-                e.without_url()
-            )
-        })?;
+        .map_err(|e| request_failed(e.without_url(), "OIDC client registration request failed"))?;
 
-    let status = resp.status();
-    // An error answer counts by its status even when its body is over the cap.
-    let body = read_at_most(resp, tuning.max_body_bytes).await?;
-    if !status.is_success() {
-        let code = body
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-            .and_then(|v| short_code(v.get("error")?.as_str()?));
-        return Err(match code {
-            Some(code) => anyhow!("OIDC registration returned {status} ({code})"),
-            None => anyhow!("OIDC registration returned {status}"),
-        });
+    // An error answer is its status and, when the body names one, a short code;
+    // a 429 is the typed rate limit of the other endpoints. The body is read
+    // under the cap, and its status still counts when it is over.
+    if !resp.status().is_success() {
+        return Err(Refusal::of(resp).await.into_flow_error("OIDC registration"));
     }
+    let body = read_at_most(resp, tuning.max_body_bytes)
+        .await
+        .map_err(|e| request_failed(e, "reading the OIDC registration answer failed"))?;
     let body = body.ok_or(BodyTooLarge {
         cap: tuning.max_body_bytes,
     })?;
@@ -705,6 +756,30 @@ impl ServiceSession {
         self.token(None).await
     }
 
+    /// Make the next [`access_token`](Self::access_token) renew, because the
+    /// homeserver refused `rejected`.
+    ///
+    /// For a host that owns sign-in retries (its own gate and backoff) and so
+    /// runs its client with
+    /// [`DirectoryConfig::sign_in_again_on_401`] off: it calls this with the
+    /// token it sent, then `access_token()` through its gate. The renewal is a
+    /// fresh sign-in with the key, as the client's own retry makes: a refused
+    /// access token says nothing good of its refresh token, which is dropped.
+    ///
+    /// Only the token it names is discarded. When another caller has already
+    /// renewed (the session now holds a different token), nothing happens, so a
+    /// burst of refused requests that all report the same token costs one
+    /// renewal, not one each. A failed renewal's cooldown still applies to the
+    /// next `access_token()`.
+    pub async fn invalidate_access_token(&self, rejected: &str) {
+        let mut tokens = self.tokens.lock().await;
+        if tokens.access.as_deref() == Some(rejected) {
+            tokens.access = None;
+            tokens.renew_at = None;
+            tokens.refresh = None;
+        }
+    }
+
     /// The token to use after the homeserver refused `rejected`. If another
     /// caller already replaced it, theirs; otherwise a fresh sign-in with the
     /// key (a refused access token says nothing good of its refresh token).
@@ -773,22 +848,47 @@ impl ServiceSession {
     async fn renew(&self, tokens: &mut Tokens) -> Result<String, Fault> {
         // A refresh token is single use: it is taken, and replaced by the answer.
         if let Some(refresh_token) = tokens.refresh.take() {
-            let attempt = tokio::time::timeout(
-                self.tuning.request_timeout,
-                refresh(&self.issuer_url, &self.client_id, &refresh_token, &self.did),
+            // One clock: the request is held to `flow_request_timeout` by its own
+            // client, body included. Nothing shorter wraps it, which would
+            // abandon a refresh the server answers in time.
+            let attempt = refresh_within(
+                self.tuning.flow_request_timeout,
+                &self.issuer_url,
+                &self.client_id,
+                &refresh_token,
+                &self.did,
             )
             .await;
-            if let Ok(Ok(issued)) = attempt {
-                return Ok(self.keep(tokens, issued));
+            match attempt {
+                Ok(issued) => return Ok(self.keep(tokens, issued)),
+                // A 429 means the server did not process the refresh: the token
+                // is unspent. Put it back, and report the rate limit with its
+                // hint, as the sign-in does, instead of signing in at once on top
+                // of a server that asked for fewer requests.
+                Err(source) if crate::is_rate_limited(&source) => {
+                    tokens.refresh = Some(refresh_token);
+                    return Err(Fault::of(&source));
+                }
+                // Refused as invalid (400 or 401 `invalid_grant`), or no answer in
+                // time (the server may have rotated the token before the answer
+                // was lost), or another failure: the token is not to be trusted
+                // any more, and the key signs in.
+                Err(_) => {}
             }
         }
         self.sign_in(tokens).await
     }
 
     async fn sign_in(&self, tokens: &mut Tokens) -> Result<String, Fault> {
+        // Never shorter than one request, whose timeout it wraps.
+        let bound = self
+            .tuning
+            .sign_in_timeout
+            .max(self.tuning.flow_request_timeout);
         let attempt = tokio::time::timeout(
-            self.tuning.sign_in_timeout,
-            authenticate_with_device(
+            bound,
+            authenticate_with_device_within(
+                self.tuning.flow_request_timeout,
                 &self.issuer_url,
                 &self.client_id,
                 &self.redirect_uri,
@@ -801,8 +901,7 @@ impl ServiceSession {
             Ok(Ok(issued)) => Ok(self.keep(tokens, issued)),
             Ok(Err(source)) => Err(Fault::of(&source)),
             Err(_) => Err(Fault::of(&anyhow!(
-                "the sign-in did not finish within {:?}",
-                self.tuning.sign_in_timeout
+                "the sign-in did not finish within {bound:?}"
             ))),
         }
     }
@@ -929,6 +1028,13 @@ pub struct DirectoryConfig {
     /// Only its own users carry a proof from this issuer; every other server's
     /// users are `not_yet_published` and their profiles are not read.
     pub server_name: String,
+    /// Whether [`DirectoryClient::search_for_asker`] signs the service in again
+    /// itself when the directory module answers 401 (once, then retries once).
+    /// `true` by default. A host that owns the sign-in retries (its own gate,
+    /// its own backoff) sets `false`: a 401 is then the typed
+    /// [`DirectoryError::Unauthorized`] and the host renews through
+    /// [`ServiceSession::invalidate_access_token`].
+    pub sign_in_again_on_401: bool,
     pub tuning: Tuning,
     pub clock: Clock,
 }
@@ -943,6 +1049,7 @@ impl DirectoryConfig {
             issuer_url: issuer_url.into(),
             homeserver_url: homeserver_url.into(),
             server_name: server_name.into(),
+            sign_in_again_on_401: true,
             tuning: Tuning::default(),
             clock: Clock::system(),
         }
@@ -955,6 +1062,12 @@ impl DirectoryConfig {
 
     pub fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Set [`sign_in_again_on_401`](Self::sign_in_again_on_401).
+    pub fn with_sign_in_again_on_401(mut self, again: bool) -> Self {
+        self.sign_in_again_on_401 = again;
         self
     }
 }
@@ -970,6 +1083,7 @@ struct Inner {
     issuer_url: String,
     homeserver_url: String,
     server_name: String,
+    sign_in_again_on_401: bool,
     tuning: Tuning,
     clock: Clock,
     http: reqwest::Client,
@@ -1023,6 +1137,7 @@ impl DirectoryClient {
             issuer_url,
             homeserver_url,
             server_name,
+            sign_in_again_on_401,
             tuning,
             clock,
         } = config;
@@ -1035,6 +1150,7 @@ impl DirectoryClient {
                 issuer_url: clean_base("issuer_url", &issuer_url)?,
                 homeserver_url: clean_base("homeserver_url", &homeserver_url)?,
                 server_name,
+                sign_in_again_on_401,
                 tuning,
                 clock,
                 http,
@@ -1068,7 +1184,10 @@ impl DirectoryClient {
     /// Resolves the asker at siwx-oidc (an unknown asker, or a DID no sign-in
     /// could accept, gets the same empty result as no match, and the module is
     /// not called), then asks the directory module with the service's token. A
-    /// 401 signs the service in again once and retries once; a 403 is
+    /// 401 signs the service in again once and retries once (unless the client
+    /// was made with [`DirectoryConfig::sign_in_again_on_401`] off: then a 401 is
+    /// the typed [`DirectoryError::Unauthorized`] at once, and the host renews
+    /// with [`ServiceSession::invalidate_access_token`]); a 403 is
     /// [`DirectoryError::NotAdmitted`]; a 429 is [`DirectoryError::RateLimited`].
     /// Every hit is then proof-checked.
     ///
@@ -1096,7 +1215,7 @@ impl DirectoryClient {
 
         let token = session.access_token().await?;
         let body = match inner.ask_module(&token, &asker, term, limit).await {
-            Err(DirectoryError::Unauthorized) => {
+            Err(DirectoryError::Unauthorized) if inner.sign_in_again_on_401 => {
                 let token = session.token_after_rejection(&token).await?;
                 inner.ask_module(&token, &asker, term, limit).await?
             }
@@ -1179,13 +1298,13 @@ impl Reply {
     }
 }
 
-/// Synapse's `retry_after_ms` in a 429 body.
+/// Synapse's `retry_after_ms` in a 429 body, held to [`crate::RETRY_AFTER_MAX`].
 fn retry_after_ms(body: &[u8]) -> Option<Duration> {
     let ms = serde_json::from_slice::<Value>(body)
         .ok()?
         .get("retry_after_ms")?
         .as_u64()?;
-    Some(Duration::from_millis(ms))
+    Some(Duration::from_millis(ms).min(crate::RETRY_AFTER_MAX))
 }
 
 /// The answer of the directory module or of Synapse's user directory. The two
@@ -1265,12 +1384,7 @@ impl Inner {
             })
         })?;
         let status = response.status().as_u16();
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map(Duration::from_secs);
+        let retry_after = crate::retry_after_hint(response.headers());
         let cap = self.tuning.max_body_bytes;
         let body = match read_at_most(response, cap).await {
             Ok(Some(body)) => body,
@@ -1279,6 +1393,10 @@ impl Inner {
             // does not need the rest, and a body that is not kept costs nothing.
             Ok(None) if !(200..300).contains(&status) => Vec::new(),
             Ok(None) => return Err(DirectoryError::Protocol(BodyTooLarge { cap }.to_string())),
+            // A 429 is known by its status and its `Retry-After` header: a body
+            // that cannot be read (the connection dropped, a stall) takes
+            // neither, so the caller still gets the rate limit and its hint.
+            Err(_) if status == 429 => Vec::new(),
             Err(_) => {
                 return Err(DirectoryError::Unavailable(
                     "reading the answer failed".into(),

@@ -115,10 +115,10 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   `MIGRATION_TEST_REDIS_URL`; and the pure check `an_absent_strict_skips_variable_means_strict`
   in `e2e_account_lifecycle_live` and in `e2e_did_field_live` (1 each). In the headless
   client's crate it also runs the three pure checks of `siwx-oidc-auth/tests/live_upgrade.rs`'s
-  helpers and the 148 unit and hermetic tests of the rotation canary
+  helpers and the 169 unit and hermetic tests of the rotation canary
   (`siwx-oidc-auth/tests/rotation_canary_unit.rs`, which compiles the modules of
   `examples/rotation_canary.rs`; the hermetic ones talk to a fake server inside the test process),
-  and the directory client's suites: `siwx-oidc-auth/tests/directory.rs` (64 tests through the
+  and the directory client's suites: `siwx-oidc-auth/tests/directory.rs` (87 tests through the
   public API against a fake siwx-oidc and a fake homeserver on local sockets, `tests/directory/support.rs`,
   with a clock the tests move by hand) and the shared vectors in `siwx-oidc-auth/tests/vectors/directory/`
   (`every_vector_gives_its_expected_result`; the `#[ignore]`d `regenerate_directory_vectors` makes them
