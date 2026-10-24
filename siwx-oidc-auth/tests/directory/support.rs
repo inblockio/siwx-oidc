@@ -73,6 +73,7 @@ impl Req {
     }
 }
 
+#[derive(Clone)]
 pub struct Resp {
     pub status: u16,
     pub headers: Vec<(String, String)>,

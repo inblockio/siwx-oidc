@@ -2774,15 +2774,40 @@ fn people(w: &World, people: &[(String, Option<Value>)]) {
     );
 }
 
+/// How many profiles of other servers' people the homeserver has been asked for.
+fn remote_profile_reads(w: &World) -> usize {
+    w.hs.mock
+        .requests()
+        .iter()
+        .filter(|r| {
+            r.path.starts_with("/_matrix/client/v3/profile/")
+                && r.path.contains(&format!(":{OTHER}/"))
+        })
+        .count()
+}
+
+/// Both transports for the same people. The claims the first one read are
+/// kept, so the clock is moved past every lifetime before the second one asks,
+/// and the second must have read the remote profiles itself: an answer from the
+/// first one's cache would say nothing about the second transport.
 async fn ask_both(w: &World, dir: &DirectoryClient) -> [DirectoryResults; 2] {
-    [
-        dir.search_for_asker(&w.session(), ASKER_DID, "p", 20)
-            .await
-            .unwrap(),
-        dir.search_as_user("user-token-fixture", "p", 20)
-            .await
-            .unwrap(),
-    ]
+    let before = remote_profile_reads(w);
+    let first = dir
+        .search_for_asker(&w.session(), ASKER_DID, "p", 20)
+        .await
+        .unwrap();
+    let by_first = remote_profile_reads(w) - before;
+    w.clock.advance(11 * MIN);
+    let second = dir
+        .search_as_user("user-token-fixture", "p", 20)
+        .await
+        .unwrap();
+    assert_eq!(
+        remote_profile_reads(w) - before - by_first,
+        by_first,
+        "the second transport reads the remote profiles itself, not from the cache of the first"
+    );
+    [first, second]
 }
 
 #[tokio::test]
@@ -2955,27 +2980,36 @@ async fn a_remote_user_without_a_usable_claim_is_not_yet_published() {
             Resp::json(401, json!({"errcode": "M_MISSING_TOKEN"})),
         ),
     ];
-    let mut every = vec![(remote("fine"), None)];
-    for (name, _) in &cases {
-        every.push((remote(name), None));
-    }
-    people(&w, &every);
     w.hs.profile(&remote("fine"), Some(json!({"did": "did:key:zFine"})));
-    for (name, resp) in cases {
-        w.hs.profile_answer(&remote(name), resp);
+    for (name, resp) in &cases {
+        w.hs.profile_answer(&remote(name), resp.clone());
     }
-    let dir = w.directory();
-    for got in ask_both(&w, &dir).await {
-        let s = states(&got);
-        assert_eq!(
-            s[0],
-            unconfirmed("did:key:zFine"),
-            "the search is not spoiled by the others"
-        );
-        for (i, state) in s.iter().enumerate().skip(1) {
-            assert_eq!(*state, not_yet(), "case {}", every[i].0);
+    // A search returns at most 20 rows (`LIMIT_MAX`): the honest person and up to
+    // 19 of the cases at a time, so that no case is cut off unseen. Each group has
+    // a client of its own, so that nothing a group read is served to the next.
+    let mut checked = 0;
+    for chunk in cases.chunks(19) {
+        let dir = w.directory();
+        let mut every = vec![(remote("fine"), None)];
+        every.extend(chunk.iter().map(|(name, _)| (remote(name), None)));
+        assert!(every.len() <= 20);
+        people(&w, &every);
+        for got in ask_both(&w, &dir).await {
+            assert_eq!(got.results.len(), every.len(), "no row was cut off");
+            assert!(!got.limited);
+            let s = states(&got);
+            assert_eq!(
+                s[0],
+                unconfirmed("did:key:zFine"),
+                "the search is not spoiled by the others"
+            );
+            for (i, state) in s.iter().enumerate().skip(1) {
+                assert_eq!(*state, not_yet(), "case {}", every[i].0);
+            }
         }
+        checked += chunk.len();
     }
+    assert_eq!(checked, cases.len(), "every case was searched");
 }
 
 #[tokio::test]
