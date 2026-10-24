@@ -433,15 +433,22 @@ pub struct Tuning {
     /// How long a verified `(mxid, proof)` is kept. A key dropped from the key
     /// set stops verifying within `keys_ttl` plus this time.
     pub verified_ttl: Duration,
-    /// One read of a user-of-another-server's profile, connect to the last byte.
-    /// A foreign server that is slower costs a search this and no more: that
-    /// person is `not_yet_published`. Held below `request_timeout`, which still
-    /// ends a read that is somehow not ended by this.
+    /// One read of a user-of-another-server's profile, connect to the last byte,
+    /// counted from when the read gets its place. A foreign server that is
+    /// slower costs a search this and no more: that person is
+    /// `not_yet_published`, and is remembered as such for `remote_miss_ttl`. Held
+    /// below `request_timeout`, which still ends a read that is somehow not ended
+    /// by this.
     pub remote_profile_timeout: Duration,
-    /// All the remote profile reads of one search together, the wait for one of
-    /// the [`PROFILE_READS_AT_ONCE`] places included. A read that has not ended
-    /// by then is dropped and its person is `not_yet_published`, so many slow
-    /// foreign servers cannot stretch a search past this.
+    /// All the remote profile reads of one search together, counted from the
+    /// moment the first is started (the local reads of a search come before and
+    /// are not part of it), the wait for one of the [`PROFILE_READS_AT_ONCE`]
+    /// places included. A read still running at the end is ended there (its
+    /// own bound is the earlier of this and `remote_profile_timeout`) and its
+    /// person is `not_yet_published`; a row that never got a place is not asked.
+    /// So many slow foreign servers cannot stretch a search past this: it is
+    /// what remote reads add to a search's critical path, and a host with a
+    /// deadline of its own budgets for it.
     ///
     /// Raised to `remote_profile_timeout` when it is shorter: it is a total, and
     /// a total below one read's bound would cut every read before its own bound.
@@ -451,8 +458,9 @@ pub struct Tuning {
     /// cache and never enters it.
     pub unconfirmed_ttl: Duration,
     /// How long "no usable claim" of a remote person is kept (no field, a value
-    /// that is not a DID, a server that failed or was too slow), so that a dead
-    /// foreign server costs one wait and not one per search.
+    /// that is not a DID, a server that failed or was too slow, a read the total
+    /// ended), so that a dead foreign server costs one wait and not one per
+    /// search.
     pub remote_miss_ttl: Duration,
     /// The most entries each cache holds.
     pub max_cache_entries: usize,
@@ -1790,27 +1798,63 @@ impl Inner {
         self.assemble(rows).await
     }
 
-    /// Read the `io.inblock.did` profile of the rows, at most
-    /// [`PROFILE_READS_AT_ONCE`] at a time, local and remote together.
+    /// Read the `io.inblock.did` profile of the rows: the local people first,
+    /// then the people of other servers, each group at most
+    /// [`PROFILE_READS_AT_ONCE`] at a time, so the two never are in flight
+    /// together.
     ///
-    /// - A **local** row's field is the proof to check. Its read can fail, and
-    ///   then the first failure ends the search and aborts the reads still
-    ///   running: that person's state is unknown.
-    /// - A **remote** row's profile is read through this homeserver (which asks
-    ///   the person's own, over federation) for a claimed DID. It never fails the
-    ///   search: no field, an unreadable one, a value that is not a DID, a server
-    ///   that is slow or down, all leave the row without a claim. Each read is
-    ///   held to [`Tuning::remote_profile_timeout`] and all of them together to
-    ///   [`Tuning::remote_profiles_timeout`], the wait for a place included.
+    /// Local before remote, so that a foreign server can never delay the check of
+    /// a local person: a slow or dead one holds a place for its whole bound, and
+    /// reads that queue behind it wait. The local reads are to this homeserver
+    /// and are quick; the remote ones are the slow kind and bounded as below.
     async fn read_profiles(
         self: &Arc<Self>,
         rows: &mut Rows,
         which: Reads,
     ) -> Result<(), DirectoryError> {
-        enum Read {
-            Local(Result<Option<Value>, DirectoryError>),
-            Remote(Option<ClaimedDid>),
+        if which == Reads::All {
+            self.read_local_profiles(rows).await?;
         }
+        self.read_remote_profiles(rows).await
+    }
+
+    /// The local rows' profiles, whose field is the proof to check. A read can
+    /// fail, and then the first failure ends the search and aborts the reads
+    /// still running: that person's state is unknown.
+    async fn read_local_profiles(self: &Arc<Self>, rows: &mut Rows) -> Result<(), DirectoryError> {
+        let permits = Arc::new(Semaphore::new(PROFILE_READS_AT_ONCE));
+        let mut reads = JoinSet::new();
+        for (index, row) in rows.rows.iter().enumerate() {
+            if !self.is_local(&row.mxid) {
+                continue;
+            }
+            let (inner, permits, mxid) = (self.clone(), permits.clone(), row.mxid.clone());
+            reads.spawn(async move {
+                let _permit = permits.acquire_owned().await;
+                (index, inner.read_profile(&mxid).await)
+            });
+        }
+        while let Some(done) = reads.join_next().await {
+            let (index, field) =
+                done.map_err(|_| DirectoryError::Unavailable("a profile read was lost".into()))?;
+            rows.rows[index].field = field?;
+        }
+        Ok(())
+    }
+
+    /// The remote rows' profiles, read through this homeserver (which asks the
+    /// person's own, over federation) for a claimed DID. It never fails the
+    /// search: no field, an unreadable one, a value that is not a DID, a server
+    /// that is slow or down, all leave the row without a claim. Each read is held
+    /// to [`Tuning::remote_profile_timeout`] and all of them together to
+    /// [`Tuning::remote_profiles_timeout`] from the start of this step, the wait
+    /// for a place included.
+    ///
+    /// Eight places and a total of two bounds mean at most sixteen slow servers
+    /// are waited out in one search. A row behind them is not asked in that
+    /// search and is `not_yet_published`; every server that was waited out is
+    /// remembered, so the next search asks the rest.
+    async fn read_remote_profiles(self: &Arc<Self>, rows: &mut Rows) -> Result<(), DirectoryError> {
         let permits = Arc::new(Semaphore::new(PROFILE_READS_AT_ONCE));
         let began = tokio::time::Instant::now();
         let remote_deadline = began
@@ -1818,44 +1862,29 @@ impl Inner {
             .unwrap_or(began);
         let mut reads = JoinSet::new();
         for (index, row) in rows.rows.iter().enumerate() {
-            let local = self.is_local(&row.mxid);
-            if local && which == Reads::RemoteOnly {
+            if self.is_local(&row.mxid) {
                 continue;
             }
             let (inner, permits, mxid) = (self.clone(), permits.clone(), row.mxid.clone());
-            if local {
-                reads.spawn(async move {
-                    let _permit = permits.acquire_owned().await;
-                    (index, Read::Local(inner.read_profile(&mxid).await))
-                });
-            } else {
-                reads.spawn(async move {
-                    let claim = async {
-                        if let Some(kept) = inner.kept_claim(&mxid) {
-                            return kept;
-                        }
-                        // The wait for a place is held to the total; the read is
-                        // too, but by its own bound (see `read_claim`), so that
-                        // what the read learns is kept.
-                        let Ok(Ok(_permit)) =
-                            tokio::time::timeout_at(remote_deadline, permits.acquire_owned()).await
-                        else {
-                            return None;
-                        };
-                        inner.read_claim(&mxid, remote_deadline).await
-                    }
-                    .await;
-                    (index, Read::Remote(claim))
-                });
-            }
+            reads.spawn(async move {
+                if let Some(kept) = inner.kept_claim(&mxid) {
+                    return (index, kept);
+                }
+                // The wait for a place is held to the total; the read is too, but
+                // by its own bound (see `read_claim`), so that what it learns is
+                // kept.
+                let Ok(Ok(_permit)) =
+                    tokio::time::timeout_at(remote_deadline, permits.acquire_owned()).await
+                else {
+                    return (index, None);
+                };
+                (index, inner.read_claim(&mxid, remote_deadline).await)
+            });
         }
         while let Some(done) = reads.join_next().await {
-            let (index, read) =
+            let (index, claim) =
                 done.map_err(|_| DirectoryError::Unavailable("a profile read was lost".into()))?;
-            match read {
-                Read::Local(field) => rows.rows[index].field = field?,
-                Read::Remote(claim) => rows.rows[index].claim = claim,
-            }
+            rows.rows[index].claim = claim;
         }
         Ok(())
     }

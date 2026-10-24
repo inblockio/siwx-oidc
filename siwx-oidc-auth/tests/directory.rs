@@ -3678,3 +3678,78 @@ async fn the_second_wave_of_slow_reads_is_remembered_like_the_first() {
         started.elapsed()
     );
 }
+
+#[tokio::test]
+async fn local_people_are_read_before_any_foreign_server_is_asked() {
+    let w = World::new().await;
+    // The homeserver's order puts twelve dead servers first, then an honest one,
+    // then three local people with a valid proof.
+    let dead = dead_remotes(&w, "dead", 12);
+    let honest = remote("honest");
+    let locals: Vec<String> = ["ann", "bob", "cy"].iter().map(|n| mxid(n)).collect();
+    let mut rows: Vec<(String, Option<Value>)> = dead.iter().map(|m| (m.clone(), None)).collect();
+    rows.push((honest.clone(), None));
+    rows.extend(locals.iter().map(|m| (m.clone(), None)));
+    people(&w, &rows);
+    w.hs.profile(&honest, Some(json!({"did": "did:key:zHonest"})));
+    for m in &locals {
+        w.hs.profile(
+            m,
+            Some(w.issuer.field(&did_of(&m[1..m.find(':').unwrap()]), m)),
+        );
+    }
+    let tuning = Tuning {
+        remote_profile_timeout: Duration::from_millis(400),
+        remote_profiles_timeout: Duration::from_millis(800),
+        ..Tuning::default()
+    };
+    let got = w
+        .directory_with(tuning)
+        .search_as_user("user-token-fixture", "p", 20)
+        .await
+        .unwrap();
+
+    let mut expected = vec![not_yet(); 12];
+    expected.push(unconfirmed("did:key:zHonest"));
+    expected.extend(["ann", "bob", "cy"].iter().map(|n| verified(&did_of(n))));
+    assert_eq!(
+        states(&got),
+        expected,
+        "the locals verified, the honest one heard"
+    );
+
+    // The order the homeserver was asked in: every local profile before the first foreign one.
+    let order: Vec<bool> =
+        w.hs.mock
+            .requests()
+            .iter()
+            .filter(|r| r.path.starts_with("/_matrix/client/v3/profile/"))
+            .map(|r| r.path.contains(&format!(":{OTHER}/")))
+            .collect();
+    assert_eq!(order.len(), 3 + 13, "every profile was read");
+    let first_foreign = order.iter().position(|&foreign| foreign).unwrap();
+    assert_eq!(
+        first_foreign, 3,
+        "no foreign server was asked before the three local profiles were read: {order:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_local_read_ends_the_search_before_any_foreign_server_is_asked() {
+    let w = World::new().await;
+    let (broken, foreign) = (mxid("broken"), remote("carol"));
+    people(&w, &[(foreign.clone(), None), (broken.clone(), None)]);
+    w.hs.profile(&foreign, Some(json!({"did": "did:key:zCarol"})));
+    w.hs.profile_status(&broken, 500);
+    let err = w
+        .directory()
+        .search_as_user("user-token-fixture", "p", 20)
+        .await
+        .unwrap_err();
+    assert!(err.is_retryable(), "{err}");
+    assert_eq!(
+        remote_profile_reads(&w),
+        0,
+        "the state of a local person is unknown, and no foreign server was bothered for the answer"
+    );
+}
