@@ -456,14 +456,17 @@ There is no age check, because there is no expiry.
 
 - **Field absent** (404, or `null`): `DidAssertionError::FieldAbsent`.
 - **No `proof`** (ephemeral issuer key, an empty-string proof, or the older bare
-  string form): `DidAssertionError::ProofAbsent`, carrying `unverified_did`.
-  Treat it as absent, not as a usable DID.
+  string form): `DidAssertionError::ProofAbsent`, carrying `unverified_did` as
+  data. It is in no `Display` or `Debug` of the error. Treat it as absent, not as
+  a usable DID.
 - **Any other failure** (bad signature, wrong issuer, unknown `kid`, replay,
   unreadable profile): an untyped error. The only correct response to all of
   them is the same: do not trust the DID.
 - If the object's plain `did` member disagrees with the signed `sub`, the
-  **signed** value is returned and a warning is printed. The plain member is
-  not covered by the signature.
+  **signed** value is returned and `VerifiedDid::plain_did_disagrees()` is
+  `true`. The library prints nothing and keeps nothing of the plain member (it is
+  not covered by the signature and is the homeserver's text); `--verify-did`
+  tells the user on stderr that the two disagree, without the value.
 - A failed profile read (for example a 500) is an error, never "field absent".
 - Neither verifier prints a response body. A failed fetch (discovery, key set or
   profile) is reported by its status and, when the body is JSON with a short

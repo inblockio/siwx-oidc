@@ -320,11 +320,15 @@ doc; read it before changing the code the rule covers.
   `h6_a_proof_that_omits_the_mxid_claim_binds_nothing_and_is_rejected`.
 - **`alg` is checked before any network I/O**; `none` and `HS*` are rejected by name. Pin:
   `h7_alg_none_is_rejected_before_any_key_is_fetched`, `h7_hmac_alg_is_rejected_before_any_key_is_fetched`.
-- **An unknown `kid` is a hard error naming the kid**, never a try-every-key fallback. Pin:
-  `h7_unknown_kid_error_names_the_kid`.
+- **An unknown `kid` is a hard error**, never a try-every-key fallback; it repeats no kid (the
+  proof's or the key set's: both are the server's text) and says how many keys the set offers.
+  Pin: `h7_unknown_kid_error_repeats_no_kid`.
 - **Verify over the received bytes**, not a re-serialisation; `iss` must equal the discovery
-  `issuer`; the verified `sub` beats the plain `did` member. Pin: `iss_mismatch_is_rejected`,
-  `fetch_plain_did_disagreement_returns_the_verified_sub`.
+  `issuer`; the verified `sub` beats the plain `did` member, and a disagreement is the flag
+  `VerifiedDid::plain_did_disagrees()`, never a line on stderr and never the plain value (the
+  CLI says only that the two disagree). Pin: `iss_mismatch_is_rejected`,
+  `fetch_plain_did_disagreement_returns_the_verified_sub`,
+  `cli_verify_did::a_disagreeing_plain_did_is_told_to_the_user_without_its_value`.
 - **The directory client never turns an answer it could not check into a state**
   ([docs/directory.md](docs/directory.md)). A fetch failure of the issuer's discovery or key set,
   with no usable set held, fails the whole search with a retryable error and is stored nowhere;
@@ -609,8 +613,12 @@ doc; read it before changing the code the rule covers.
   consumer matches that type (`is_unknown_client`), not the text. That 401 carries no
   `WWW-Authenticate` header (pinned in the interop test); a 401 with one is a proxy's wall and is
   `AuthError::Unauthorized`, never re-registered on. A refusal's `error_description`, a reqwest
-  error's URL and the server-written values of the DID verifier (discovery `issuer`, `jwks_uri`,
-  JWK `use`/`key_ops`/`alg`/`kty`/`crv`) are in no error text; `expires_in` is read tolerantly
+  error's URL, a `Location` header and the server-written values of the DID verifier (discovery
+  `issuer`, `jwks_uri`, JWK `use`/`key_ops`/`alg`/`kty`/`crv`/`kid`, the proof's header
+  `alg`/`typ`/`crit`/`kid` and claims `iss`/`sub`/`mxid`, the profile's plain `did`) are in no
+  error text, `Display` or `Debug`; the device flow prints its approval address and codes with
+  control characters dropped, the one place the library shows server text, because the person
+  has to read it; `expires_in` is read tolerantly
   (`TOKEN_LIFETIME_*`) so a token answer is never lost to it. Pin:
   `a_token_error_is_reported_by_its_status_and_code_and_never_its_body`,
   `a_sign_in_page_is_reported_by_its_status_and_never_its_body`,

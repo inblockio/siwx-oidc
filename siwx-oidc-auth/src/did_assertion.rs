@@ -169,6 +169,10 @@ pub struct VerifiedDid {
     mxid: String,
     issuer: String,
     issued_at: i64,
+    /// Set by [`fetch_and_verify_did`] only. Not part of the serialized form: the
+    /// output of `--verify-did` is unchanged.
+    #[serde(skip_serializing)]
+    plain_did_disagrees: bool,
 }
 
 impl VerifiedDid {
@@ -180,6 +184,19 @@ impl VerifiedDid {
     /// token's `sub` with no translation step in between.
     pub fn did(&self) -> &str {
         &self.did
+    }
+
+    /// Whether the profile object's plain `did` member, which the signature does
+    /// not cover, named another DID than the signed `sub`. Only
+    /// [`fetch_and_verify_did`] can answer `true`: [`verify_did_assertion`] sees
+    /// the proof alone.
+    ///
+    /// The signed value ([`VerifiedDid::did`]) is the one returned either way.
+    /// The plain member is not kept here and not printed, because it is text the
+    /// homeserver wrote; a caller that wants to tell its user says only that the
+    /// two disagree.
+    pub fn plain_did_disagrees(&self) -> bool {
+        self.plain_did_disagrees
     }
 
     /// The Matrix ID this DID is bound to. Always equal to the `expected_mxid`
@@ -223,7 +240,7 @@ impl VerifiedDid {
 /// response to all of them: do not trust the DID.
 ///
 /// Recover the discriminator with `err.downcast_ref::<DidAssertionError>()`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum DidAssertionError {
     /// The profile carries no `io.inblock.did` field at all.
     FieldAbsent { mxid: String },
@@ -232,10 +249,12 @@ pub enum DidAssertionError {
     ///
     /// `unverified_did` is named for what it is: the plain `did` member of the
     /// profile object, copied out verbatim, with **no signature over it**. It
-    /// is reported so an operator can see what the profile claims, and for no
-    /// other purpose. Do not rename it back to `did`: under the old name every
-    /// `match` site read as if it were destructuring a verified value, which is
-    /// the exact confusion this module exists to prevent.
+    /// is there so a caller that matches on the variant can see what the profile
+    /// claims, and for no other purpose. It is in no `Display` or `Debug` of the
+    /// error: it is the homeserver's text. Do not rename it back to `did`: under
+    /// the old name every `match` site read as if it were destructuring a
+    /// verified value, which is the exact confusion this module exists to
+    /// prevent.
     ProofAbsent {
         mxid: String,
         unverified_did: String,
@@ -252,17 +271,31 @@ impl fmt::Display for DidAssertionError {
                  published before this account existed, or the homeserver is withholding custom \
                  profile fields)"
             ),
-            DidAssertionError::ProofAbsent {
-                mxid,
-                unverified_did,
-            } => write!(
+            DidAssertionError::ProofAbsent { mxid, .. } => write!(
                 f,
-                "the `{DID_PROFILE_FIELD}` field of {mxid} carries the UNVERIFIED did \
-                 `{unverified_did}` but NO `proof`: the issuer refused to mint one because its \
-                 signing key is ephemeral (no configured signing key PEM). Nothing signed that \
-                 value, so anyone who can write the profile could have chosen it. The binding is \
-                 UNVERIFIABLE — treat it as absent, not as a DID you may act on"
+                "the `{DID_PROFILE_FIELD}` field of {mxid} carries an UNVERIFIED did but NO \
+                 `proof`: the issuer refused to mint one because its signing key is ephemeral (no \
+                 configured signing key PEM). Nothing signed that value, so anyone who can write \
+                 the profile could have chosen it. The binding is UNVERIFIABLE, treat it as \
+                 absent, not as a DID you may act on"
             ),
+        }
+    }
+}
+
+/// `unverified_did` is data for a caller that matches on the variant. It is the
+/// homeserver's text, so no `Debug` output (an error report formats it with
+/// `{:#?}`) repeats it either.
+impl fmt::Debug for DidAssertionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DidAssertionError::FieldAbsent { mxid } => {
+                f.debug_struct("FieldAbsent").field("mxid", mxid).finish()
+            }
+            DidAssertionError::ProofAbsent { mxid, .. } => f
+                .debug_struct("ProofAbsent")
+                .field("mxid", mxid)
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -521,14 +554,13 @@ pub(crate) fn parse_proof(jws: &str) -> Result<ParsedProof> {
              any key was fetched (RFC 8725 §3.1)"
         ),
         Some(alg) if alg.starts_with("HS") => bail!(
-            "proof header declares the symmetric alg `{alg}`, but the issuer's key is an asymmetric \
+            "proof header declares a symmetric (HMAC) `alg`, but the issuer's key is an asymmetric \
              P-256 key. This is the classic algorithm-confusion attack — it asks the verifier to \
              use a PUBLIC key as an HMAC secret, which anyone who reads the JWKS also knows. \
              Rejected before any key was fetched (RFC 8725 §3.1)"
         ),
-        Some(alg) => bail!(
-            "unsupported proof alg `{alg}`: siwx-oidc mints ES256 and this verifier accepts \
-             nothing else"
+        Some(_) => bail!(
+            "unsupported proof `alg`: siwx-oidc mints ES256 and this verifier accepts nothing else"
         ),
     }
 
@@ -558,9 +590,10 @@ pub(crate) fn parse_proof(jws: &str) -> Result<ParsedProof> {
                  minted by siwx-oidc"
             );
         }
+        // The extensions are not named: the list is the proof's own text.
         bail!(
-            "proof header carries `crit`: {crit}. RFC 7515 §4.1.11 requires a recipient that does \
-             not understand every extension named there to REJECT the JWS, and this verifier \
+            "proof header carries `crit`. RFC 7515 §4.1.11 requires a recipient that does not \
+             understand every extension named there to REJECT the JWS, and this verifier \
              implements none. siwx-oidc's minter never stamps a `crit`, so this proof is either \
              not ours, or is demanding we enforce something we cannot"
         );
@@ -570,7 +603,10 @@ pub(crate) fn parse_proof(jws: &str) -> Result<ParsedProof> {
     // case-insensitive. Absent is fine: `typ` is optional and only advisory.
     if let Some(typ) = header.typ.as_deref() {
         if !typ.eq_ignore_ascii_case("JWT") {
-            bail!("proof header declares typ=`{typ}`; expected `JWT` or no `typ` at all");
+            // Not repeated: the header is the proof's own text.
+            bail!(
+                "proof header declares a `typ` other than `JWT`; expected `JWT` or no `typ` at all"
+            );
         }
     }
 
@@ -608,7 +644,6 @@ pub(crate) struct IssuerKeys {
     anchor: String,
     discovery_url: String,
     issuer: String,
-    jwks_uri: String,
     jwks: Jwks,
 }
 
@@ -630,7 +665,6 @@ impl IssuerKeys {
         let anchor = issuer.trim_end_matches('/').to_string();
         IssuerKeys {
             discovery_url: format!("{anchor}/.well-known/openid-configuration"),
-            jwks_uri: format!("{anchor}/jwk"),
             issuer: anchor.clone(),
             anchor,
             jwks: serde_json::from_value(jwks).expect("a JWKS"),
@@ -731,7 +765,6 @@ pub(crate) async fn fetch_issuer_keys(
         anchor: anchor.to_string(),
         discovery_url,
         issuer: discovery.issuer,
-        jwks_uri: discovery.jwks_uri,
         jwks,
     })
 }
@@ -758,22 +791,21 @@ pub(crate) fn verify_parsed(
         .iter()
         .find(|k| k.kid.as_deref() == Some(kid))
         .ok_or_else(|| {
-            let offered: Vec<&str> = jwks.keys.iter().filter_map(|k| k.kid.as_deref()).collect();
-            // The kid MUST appear in this message: an operator reading it needs
-            // to tell "the issuer rotated its key" apart from "this proof is
-            // forged", and those look identical without the two kid lists.
+            // Neither the proof's `kid`, nor the ones the key set offers, nor the
+            // `jwks_uri` are repeated: all three are text the server wrote. The
+            // count is what an operator needs to tell a rotated key (the set is
+            // not empty) from a set with no key at all.
             anyhow!(
-                "no JWK with kid `{kid}` in the JWKS at {} (it offers: [{}]). The issuer's signing \
-                 key has been rotated or was ephemeral and did not survive a restart. This is \
-                 deliberately a hard failure: trying every key instead would turn a rotated key \
-                 into an indistinguishable \"bad signature\"",
-                keys.jwks_uri,
-                offered.join(", ")
+                "no JWK with the proof's `kid` in the issuer's JWKS (it offers {} key(s)). The \
+                 issuer's signing key has been rotated or was ephemeral and did not survive a \
+                 restart. This is deliberately a hard failure: trying every key instead would turn \
+                 a rotated key into an indistinguishable \"bad signature\"",
+                jwks.keys.len()
             )
         })?;
 
     // -- 6-7. Honour the JWK's own restrictions, then rebuild the key ------
-    let verifying_key = verifying_key_from_jwk(jwk, kid)?;
+    let verifying_key = verifying_key_from_jwk(jwk)?;
 
     // -- 8. Signature: exactly 64 raw bytes, r||s --------------------------
     let signature_bytes =
@@ -792,8 +824,8 @@ pub(crate) fn verify_parsed(
         .verify(signing_input.as_bytes(), &signature)
         .map_err(|e| {
             anyhow!(
-                "proof signature does not verify under the JWKS key `{kid}`: {e}. The payload was \
-                 altered, or the proof was signed by a different key"
+                "proof signature does not verify under the JWKS key its `kid` names: {e}. \
+                 The payload was altered, or the proof was signed by a different key"
             )
         })?;
 
@@ -807,11 +839,11 @@ pub(crate) fn verify_parsed(
         .iss
         .ok_or_else(|| anyhow!("proof payload has no `iss` claim"))?;
     if normalize_issuer(&iss) != normalize_issuer(&keys.issuer) {
+        // Neither `iss` nor the discovery `issuer` is repeated (both are the
+        // server's text); the latter was pinned to `anchor` by the check above.
         bail!(
-            "proof `iss` is `{iss}` but the discovery document at {discovery_url} says the issuer \
-             is `{}` (a value already pinned to `{anchor}` by the §4.3 check above). This proof \
-             was minted by a different provider",
-            keys.issuer
+            "proof `iss` is not the issuer `{anchor}` that the discovery document at \
+             {discovery_url} names. This proof was minted by a different provider"
         );
     }
 
@@ -821,7 +853,7 @@ pub(crate) fn verify_parsed(
     if !sub.starts_with("did:") {
         // Cheap sanity check, not a parser: a consumer indexes on this value,
         // and an empty or non-DID `sub` would be silently stored as an identity.
-        bail!("proof `sub` is `{sub}`, which is not a DID (it must start with `did:`)");
+        bail!("proof `sub` is not a DID (it must start with `did:`)");
     }
 
     let mxid = claims
@@ -834,10 +866,13 @@ pub(crate) fn verify_parsed(
     // lowercase base36 by construction, and case-folding here would let a
     // profile at `@Alice:server` satisfy a proof for `@alice:server`.
     if mxid != expected_mxid {
+        // `expected_mxid` is the caller's; the `mxid` the proof binds is the
+        // server's text and is not repeated.
         bail!(
-            "REPLAYED ASSERTION: the proof is validly signed but binds `{mxid}`, while it was \
-             presented for `{expected_mxid}`. This is exactly the copy-someone-else's-proof attack \
-             the `mxid` claim exists to stop; the DID in it belongs to another account"
+            "REPLAYED ASSERTION: the proof is validly signed but binds another Matrix ID than \
+             `{expected_mxid}`, for which it was presented. This is exactly the \
+             copy-someone-else's-proof attack the `mxid` claim exists to stop; the DID in it \
+             belongs to another account"
         );
     }
 
@@ -850,6 +885,7 @@ pub(crate) fn verify_parsed(
         mxid,
         issuer: iss,
         issued_at,
+        plain_did_disagrees: false,
     })
 }
 
@@ -881,9 +917,10 @@ pub(crate) fn verify_parsed(
 ///   (downcastable) — the issuer's key was ephemeral, so the binding is
 ///   unverifiable and must be treated as absent, NOT as a usable DID;
 /// - the object's plain `did` disagrees with the verified `sub` → the
-///   **verified** value is returned and the disagreement is reported on stderr.
-///   The plain member is untrusted decoration for humans and debuggers; only
-///   `sub` is covered by the signature.
+///   **verified** value is returned and [`VerifiedDid::plain_did_disagrees`] is
+///   `true`. Nothing is printed and the plain value is not kept. The plain
+///   member is untrusted decoration for humans and debuggers; only `sub` is
+///   covered by the signature.
 ///
 /// # Arguments
 ///
@@ -987,11 +1024,11 @@ pub async fn fetch_and_verify_did(
         .into());
     };
 
-    let verified = verify_did_assertion(issuer_base_url, &proof, mxid).await?;
+    let mut verified = verify_did_assertion(issuer_base_url, &proof, mxid).await?;
 
-    if let Some(message) = plain_did_disagreement(plain_did.as_deref(), &verified.did) {
-        eprintln!("warning: {message}");
-    }
+    // Reported as a flag, not on stderr, and without the plain member: a library
+    // does not print what the homeserver wrote.
+    verified.plain_did_disagrees = plain_did_disagrees(plain_did.as_deref(), &verified.did);
 
     Ok(verified)
 }
@@ -1031,24 +1068,15 @@ fn profile_client() -> Result<reqwest::Client> {
 /// How many redirects the profile read follows.
 const PROFILE_REDIRECTS: usize = 3;
 
-/// Describe a disagreement between the object's plain `did` member and the
-/// signed `sub`, or `None` when they agree (or there is no plain member).
+/// Whether the object's plain `did` member names another DID than the signed
+/// `sub`. No plain member is no disagreement.
 ///
-/// Split out of [`fetch_and_verify_did`] so the wording is unit-testable
-/// without capturing stderr. The plain member exists so a human running
-/// `curl … | jq` can see the DID; it is NOT covered by the signature, so when
-/// the two differ the signed one wins and the plain one must be called
-/// untrusted in the message — an operator who reads "mismatch" and then acts on
-/// the value printed first has learned the wrong lesson.
-fn plain_did_disagreement(plain: Option<&str>, verified: &str) -> Option<String> {
-    match plain {
-        Some(p) if p != verified => Some(format!(
-            "the `{DID_PROFILE_FIELD}` object's plain `did` member is `{p}`, which disagrees with \
-             the signed `sub` `{verified}`. The plain member is UNTRUSTED (it is not covered by \
-             the proof's signature); the verified value `{verified}` is the one being returned"
-        )),
-        _ => None,
-    }
+/// The plain member exists so a human running `curl … | jq` can see the DID; it
+/// is NOT covered by the signature, so when the two differ the signed one wins.
+/// Only the fact of the disagreement leaves this function: the member is the
+/// homeserver's text and is neither printed nor kept.
+fn plain_did_disagrees(plain: Option<&str>, verified: &str) -> bool {
+    plain.is_some_and(|p| p != verified)
 }
 
 /// Trailing-slash-insensitive issuer comparison.
@@ -1111,14 +1139,15 @@ fn require_same_origin(url: &str, issuer: &str) -> Result<()> {
 fn decode_b64url(s: &str) -> Result<Vec<u8>> {
     URL_SAFE_NO_PAD
         .decode(s)
-        .map_err(|e| anyhow!("base64url decode failed: {e}"))
+        // The decoder's own message quotes the offending symbol.
+        .map_err(|_| anyhow!("base64url decode failed"))
 }
 
 /// Rebuild a P-256 verifying key from a JWK's affine coordinates.
 ///
-/// `kid` is only used to make the errors nameable; it has already been matched
-/// by the caller.
-fn verifying_key_from_jwk(jwk: &Jwk, kid: &str) -> Result<VerifyingKey> {
+/// The JWK has already been selected by the caller through the proof's `kid`;
+/// the errors name the member at fault, never a value the key set holds.
+fn verifying_key_from_jwk(jwk: &Jwk) -> Result<VerifyingKey> {
     // -- RFC 7517 §4.2-4.4: may this key verify an ES256 signature at all? --
     //
     // DEFENCE FOR A FUTURE MULTI-KEY JWKS, not a live bug. Today siwx-oidc
@@ -1140,7 +1169,7 @@ fn verifying_key_from_jwk(jwk: &Jwk, kid: &str) -> Result<VerifyingKey> {
             // Neither this value nor the ones below are repeated: the key set is
             // whatever the server wrote.
             bail!(
-                "JWK `{kid}` declares a `use` other than `sig`; RFC 7517 §4.2 makes that the \
+                "the JWK declares a `use` other than `sig`; RFC 7517 §4.2 makes that the \
                  key's intended use, and a key published for anything but `sig` must not be \
                  used to verify a signature no matter what its bytes would happen to accept"
             );
@@ -1154,7 +1183,7 @@ fn verifying_key_from_jwk(jwk: &Jwk, kid: &str) -> Result<VerifyingKey> {
             .is_some_and(|ops| ops.iter().any(|op| op.as_str() == Some("verify")));
         if !permits_verify {
             bail!(
-                "JWK `{kid}` has `key_ops` that do not include `verify`; RFC 7517 §4.3 makes \
+                "the JWK has `key_ops` that do not include `verify`; RFC 7517 §4.3 makes \
                  key_ops the exhaustive list of operations the key may be used for"
             );
         }
@@ -1162,7 +1191,7 @@ fn verifying_key_from_jwk(jwk: &Jwk, kid: &str) -> Result<VerifyingKey> {
     if let Some(alg) = jwk.alg.as_deref() {
         if alg != "ES256" {
             bail!(
-                "JWK `{kid}` declares an `alg` other than ES256; RFC 7517 §4.4 restricts the key \
+                "the JWK declares an `alg` other than ES256; RFC 7517 §4.4 restricts the key \
                  to that one algorithm, and this verifier only ever verifies ES256"
             );
         }
@@ -1170,13 +1199,13 @@ fn verifying_key_from_jwk(jwk: &Jwk, kid: &str) -> Result<VerifyingKey> {
 
     match jwk.kty.as_deref() {
         Some("EC") => {}
-        None => bail!("JWK `{kid}` has no `kty`; ES256 requires an EC key"),
-        Some(_) => bail!("JWK `{kid}` has a `kty` other than EC; ES256 requires an EC key"),
+        None => bail!("the JWK has no `kty`; ES256 requires an EC key"),
+        Some(_) => bail!("the JWK has a `kty` other than EC; ES256 requires an EC key"),
     }
     match jwk.crv.as_deref() {
         Some("P-256") => {}
         other => bail!(
-            "JWK `{kid}` has {} `crv`; ES256 is defined only over P-256 (RFC 7518 §3.4). A key \
+            "the JWK has {} `crv`; ES256 is defined only over P-256 (RFC 7518 §3.4). A key \
              on another curve cannot verify an ES256 signature no matter how the bytes line up",
             if other.is_none() { "no" } else { "a non-P-256" }
         ),
@@ -1185,14 +1214,14 @@ fn verifying_key_from_jwk(jwk: &Jwk, kid: &str) -> Result<VerifyingKey> {
     let x = jwk
         .x
         .as_deref()
-        .ok_or_else(|| anyhow!("JWK `{kid}` has no `x` coordinate"))?;
+        .ok_or_else(|| anyhow!("the JWK has no `x` coordinate"))?;
     let y = jwk
         .y
         .as_deref()
-        .ok_or_else(|| anyhow!("JWK `{kid}` has no `y` coordinate"))?;
+        .ok_or_else(|| anyhow!("the JWK has no `y` coordinate"))?;
 
-    let x = decode_b64url(x).with_context(|| format!("JWK `{kid}` `x` is not base64url"))?;
-    let y = decode_b64url(y).with_context(|| format!("JWK `{kid}` `y` is not base64url"))?;
+    let x = decode_b64url(x).context("the JWK `x` is not base64url")?;
+    let y = decode_b64url(y).context("the JWK `y` is not base64url")?;
 
     // Both coordinates are fixed-width for the curve — RFC 7518 §6.2.1.2
     // requires the full 32-byte octet string, left-padded, NOT a minimal
@@ -1201,7 +1230,7 @@ fn verifying_key_from_jwk(jwk: &Jwk, kid: &str) -> Result<VerifyingKey> {
     // mismatch, so this `if` must not be "simplified" away.
     if x.len() != 32 || y.len() != 32 {
         bail!(
-            "JWK `{kid}` coordinates are {}/{} bytes; P-256 requires exactly 32 each (RFC 7518 \
+            "the JWK coordinates are {}/{} bytes; P-256 requires exactly 32 each (RFC 7518 \
              §6.2.1.2: fixed-width, left-padded)",
             x.len(),
             y.len()
@@ -1214,7 +1243,7 @@ fn verifying_key_from_jwk(jwk: &Jwk, kid: &str) -> Result<VerifyingKey> {
         false,
     );
     VerifyingKey::from_encoded_point(&point)
-        .map_err(|e| anyhow!("JWK `{kid}` coordinates are not a point on P-256: {e}"))
+        .map_err(|e| anyhow!("the JWK coordinates are not a point on P-256: {e}"))
 }
 
 /// GET `url` and parse the answer as JSON, with the body read under a cap:
@@ -1539,10 +1568,17 @@ mod tests {
             .await
             .expect_err("a valid proof for alice MUST NOT verify for bob");
         let msg = format!("{err:#}");
-        assert!(msg.contains(ALICE), "error must name the bound mxid: {msg}");
+        assert!(
+            msg.contains("REPLAYED ASSERTION"),
+            "unexpected error: {msg}"
+        );
         assert!(
             msg.contains(BOB),
-            "error must name the presented mxid: {msg}"
+            "error must name the presented mxid, which is the caller's: {msg}"
+        );
+        assert!(
+            !msg.contains(ALICE),
+            "the mxid the proof binds is the server's text and is not repeated: {msg}"
         );
     }
 
@@ -1626,7 +1662,14 @@ mod tests {
             .await
             .expect_err("a symmetric alg must never verify against an EC issuer");
         let msg = format!("{err:#}");
-        assert!(msg.contains("HS256"), "error must name the alg: {msg}");
+        assert!(
+            msg.contains("symmetric"),
+            "error must say what the alg is: {msg}"
+        );
+        assert!(
+            !msg.contains("HS256"),
+            "the alg is the proof's own text and is not repeated: {msg}"
+        );
         assert!(
             !msg.contains("GET "),
             "the alg gate must run before any fetch: {msg}"
@@ -1634,10 +1677,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn h7_unknown_kid_error_names_the_kid() {
+    async fn h7_unknown_kid_error_repeats_no_kid() {
         // The JWKS offers a different kid, which is exactly what an operator
-        // sees after a key rotation or an ephemeral-key restart. The message
-        // must carry both kids or the two causes are indistinguishable.
+        // sees after a key rotation or an ephemeral-key restart. Neither kid is
+        // repeated (both are text the server wrote); the count of offered keys
+        // is what tells a rotation from an empty set.
         let key = SigningKey::random(&mut OsRng);
         let jwks = json!({ "keys": [jwk_of(&key, "rotated-successor")] });
         let base = spawn_mock_http(move |b| discovery_and_jwks(b, b, jwks)).await;
@@ -1647,10 +1691,16 @@ mod tests {
             .await
             .expect_err("an unmatched kid must be a hard error, never a try-every-key fallback");
         let msg = format!("{err:#}");
-        assert!(msg.contains(KID), "error must name the proof's kid: {msg}");
+        assert!(msg.contains("no JWK with the proof's `kid`"), "{msg}");
+        assert!(msg.contains("offers 1 key(s)"), "{msg}");
+        assert!(!msg.contains(KID), "the proof's kid was echoed: {msg}");
         assert!(
-            msg.contains("rotated-successor"),
-            "error must list the kids the JWKS offers: {msg}"
+            !msg.contains("rotated-successor"),
+            "a kid the JWKS offers was echoed: {msg}"
+        );
+        assert!(
+            !msg.contains(&base),
+            "the jwks_uri the discovery named was echoed: {msg}"
         );
     }
 
@@ -1769,8 +1819,8 @@ mod tests {
             .await
             .expect_err("an unexpected typ must be rejected");
         assert!(
-            format!("{err:#}").contains("dpop+jwt"),
-            "unexpected error: {err:#}"
+            format!("{err:#}").contains("`typ`") && !format!("{err:#}").contains("dpop+jwt"),
+            "names the member, not its value: {err:#}"
         );
     }
 
@@ -2231,11 +2281,16 @@ mod tests {
             mxid: ALICE.to_string(),
             issuer: "https://issuer.example".to_string(),
             issued_at: IAT,
+            plain_did_disagrees: true,
         };
         let json = serde_json::to_string(&verified).unwrap();
         assert!(
             json.contains(DID),
             "the CLI still has to print this: {json}"
+        );
+        assert!(
+            !json.contains("plain_did_disagrees"),
+            "the flag is not part of the printed form: {json}"
         );
     }
 
@@ -2331,9 +2386,11 @@ mod tests {
         );
         assert!(
             msg.contains("UNVERIFIED"),
-            "the message must call the DID it prints untrusted, or an operator will act on it \
-             purely because it was printed: {msg}"
+            "the message must call the DID untrusted: {msg}"
         );
+        // The plain member is the homeserver's text: in no Display or Debug, but
+        // still there as data for a caller that matches on the variant.
+        assert!(!printed(&err).contains(DID), "{}", printed(&err));
     }
 
     #[tokio::test]
@@ -2364,6 +2421,47 @@ mod tests {
             "the SIGNED sub must win over the plain member"
         );
         assert_ne!(verified.did(), OTHER_DID);
+        assert!(
+            verified.plain_did_disagrees(),
+            "the disagreement is reported as a flag"
+        );
+        // The plain member is not kept: not in the Debug, not in the output of
+        // `--verify-did`.
+        assert!(!format!("{verified:?}").contains(OTHER_DID));
+        assert!(!format!("{verified:#?}").contains(OTHER_DID));
+        assert!(!serde_json::to_string(&verified)
+            .unwrap()
+            .contains(OTHER_DID));
+    }
+
+    #[tokio::test]
+    async fn fetch_plain_did_agreement_or_absence_sets_no_flag() {
+        let key = SigningKey::random(&mut OsRng);
+        let jwks = json!({ "keys": [jwk_of(&key, KID)] });
+        // The plain member agreeing, a bare-object proof with no plain member.
+        for object in [true, false] {
+            let key = key.clone();
+            let jwks = jwks.clone();
+            let base = spawn_mock_http(move |b| {
+                let jws = mint(&key, &header_of(KID), &payload_of(b, DID, ALICE));
+                let field = if object {
+                    json!({ "did": DID, "proof": jws })
+                } else {
+                    json!({ "proof": jws })
+                };
+                let mut routes = discovery_and_jwks(b, b, jwks);
+                routes.push(profile_route(
+                    ALICE,
+                    200,
+                    json!({ DID_PROFILE_FIELD: field }).to_string(),
+                ));
+                routes
+            })
+            .await;
+            let verified = fetch_and_verify_did(&base, ALICE, &base).await.unwrap();
+            assert_eq!(verified.did(), DID);
+            assert!(!verified.plain_did_disagrees());
+        }
     }
 
     // -- T5: the branches that DECIDE the typed discriminators --------------
@@ -2580,19 +2678,15 @@ mod tests {
     }
 
     #[test]
-    fn plain_did_disagreement_names_both_and_calls_the_plain_member_untrusted() {
-        assert_eq!(plain_did_disagreement(None, DID), None);
-        assert_eq!(plain_did_disagreement(Some(DID), DID), None);
-
-        let msg = plain_did_disagreement(Some(OTHER_DID), DID)
-            .expect("a disagreement must be surfaced, not swallowed");
-        assert!(msg.contains(OTHER_DID), "must name the plain member: {msg}");
-        assert!(msg.contains(DID), "must name the verified sub: {msg}");
+    fn plain_did_disagrees_only_for_a_plain_member_that_differs() {
+        assert!(!plain_did_disagrees(None, DID));
+        assert!(!plain_did_disagrees(Some(DID), DID));
         assert!(
-            msg.contains("UNTRUSTED"),
-            "must say which of the two is untrusted, or an operator will act on \
-             whichever is printed first: {msg}"
+            plain_did_disagrees(Some(OTHER_DID), DID),
+            "a disagreement must be surfaced, not swallowed"
         );
+        // Case counts: a DID is compared byte for byte, like the mxid.
+        assert!(plain_did_disagrees(Some(&DID.to_uppercase()), DID));
     }
 
     #[test]
@@ -3058,6 +3152,106 @@ mod tests {
             let message = format!("{err:#}");
             assert!(message.contains(member), "names the member: {message}");
         }
+    }
+
+    /// The header and claims of a proof are the homeserver's text (the profile
+    /// field is world-writable), and the key set is the issuer's. None of what
+    /// they hold is repeated by an error.
+    #[tokio::test]
+    async fn proof_and_key_set_values_the_server_wrote_are_not_echoed() {
+        let key = SigningKey::random(&mut OsRng);
+        let sign = |header: serde_json::Value| {
+            // The header gates run before any key is fetched, so a signature
+            // that is nothing will do for them.
+            let h = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+            let p = URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&payload_of(UNREACHABLE_ISSUER, DID, ALICE)).unwrap());
+            format!("{h}.{p}.{}", URL_SAFE_NO_PAD.encode([0u8; 64]))
+        };
+
+        // Header: alg (symmetric, other), typ, crit.
+        for header in [
+            json!({"alg": format!("HS{MARKER}"), "typ": "JWT", "kid": KID}),
+            json!({"alg": MARKER, "typ": "JWT", "kid": KID}),
+            json!({"alg": "ES256", "typ": MARKER, "kid": KID}),
+            json!({"alg": "ES256", "typ": "JWT", "kid": KID, "crit": [MARKER], MARKER: 1}),
+        ] {
+            let err = verify_did_assertion(UNREACHABLE_ISSUER, &sign(header), ALICE)
+                .await
+                .expect_err("rejected before any key is fetched");
+            assert_body_free(&err);
+        }
+
+        // Key set: a kid it offers, a kid the proof carries, and a jwks_uri.
+        let jwks = json!({ "keys": [jwk_of(&key, MARKER)] });
+        let base = spawn_mock_http(move |b| {
+            let mut routes = discovery_and_jwks(b, b, jwks.clone());
+            routes[0].2 =
+                json!({ "issuer": b, "jwks_uri": format!("{b}/jwk?{MARKER}") }).to_string();
+            routes.push((format!("/jwk?{MARKER}"), 200, jwks.to_string()));
+            routes
+        })
+        .await;
+        let jws = mint(
+            &key,
+            &header_of(&format!("{MARKER}-other")),
+            &payload_of(&base, DID, ALICE),
+        );
+        let err = verify_did_assertion(&base, &jws, ALICE)
+            .await
+            .expect_err("no key matches the proof's kid");
+        assert_body_free(&err);
+
+        // Claims of a proof whose signature is genuine: iss, sub, mxid.
+        let jwks = json!({ "keys": [jwk_of(&key, KID)] });
+        let base = spawn_mock_http(move |b| discovery_and_jwks(b, b, jwks)).await;
+        for (payload, expected) in [
+            (payload_of(MARKER, DID, ALICE), "different provider"),
+            (payload_of(&base, MARKER, ALICE), "not a DID"),
+            (payload_of(&base, DID, MARKER), "REPLAYED ASSERTION"),
+        ] {
+            let jws = mint(&key, &header_of(KID), &payload);
+            let err = verify_did_assertion(&base, &jws, ALICE)
+                .await
+                .expect_err("a claim that does not hold");
+            assert!(format!("{err:#}").contains(expected), "{err:#}");
+            assert_body_free(&err);
+        }
+
+        // The profile: a plain `did` member beside no proof, and beside one.
+        let jwks = json!({ "keys": [jwk_of(&key, KID)] });
+        let signer = key.clone();
+        let base = spawn_mock_http(move |b| {
+            let jws = mint(&signer, &header_of(KID), &payload_of(b, DID, ALICE));
+            let mut routes = discovery_and_jwks(b, b, jwks);
+            routes.push(profile_route(
+                ALICE,
+                200,
+                json!({ DID_PROFILE_FIELD: { "did": MARKER } }).to_string(),
+            ));
+            routes.push(profile_route(
+                BOB,
+                200,
+                json!({ DID_PROFILE_FIELD: { "did": MARKER, "proof": jws } }).to_string(),
+            ));
+            routes
+        })
+        .await;
+        let err = fetch_and_verify_did(&base, ALICE, &base)
+            .await
+            .expect_err("no proof");
+        assert!(matches!(
+            err.downcast_ref::<DidAssertionError>(),
+            Some(DidAssertionError::ProofAbsent { unverified_did, .. }) if unverified_did == MARKER
+        ));
+        assert_body_free(&err);
+        // The proof binds alice and is presented for bob: replayed, and the
+        // plain member beside it is not printed either.
+        let err = fetch_and_verify_did(&base, BOB, &base)
+            .await
+            .expect_err("a proof for another account");
+        assert!(format!("{err:#}").contains("REPLAYED ASSERTION"), "{err:#}");
+        assert_body_free(&err);
     }
 
     #[tokio::test]

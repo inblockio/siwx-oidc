@@ -231,7 +231,7 @@ MAS deployment before looking anywhere else.
 - **The profile has `{"did": …}` but no `proof`**: the server runs with an
   ephemeral signing key. Set `SIWXOIDC_SIGNING_KEY_PEM`; the next sign-in
   re-publishes with a proof.
-- **Verification fails with "no JWK with kid …"**: the key that signed the proof
+- **Verification fails with "no JWK with the proof's `kid`"**: the key that signed the proof
   is no longer in `/jwk`. The signing key was rotated without listing the old
   public key in `SIWXOIDC_RETIRED_SIGNING_KEYS_PEM`, or the key was ephemeral.
   The user's next sign-in re-asserts with the current key.

@@ -745,6 +745,12 @@ fn authorize_refusal(base: &Url, location: &str) -> Option<String> {
     Some(directory::short_code(&error).unwrap_or_else(|| UNRECOGNISED_ERROR.to_string()))
 }
 
+/// `text` without its control characters (escape sequences, carriage returns,
+/// newlines), for a line of terminal output that holds text the server wrote.
+fn printable(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
 /// The authorization code flow every code-flow entry point runs: PKCE,
 /// `/authorize`, the CAIP-122 signature at `/sign_in`, and the code exchange at
 /// `/token`. `scope` is sent as given; the callers decide what it is.
@@ -914,7 +920,9 @@ async fn code_flow(
         .query_pairs()
         .find(|(k, _)| k == "code")
         .map(|(_, v)| v.into_owned())
-        .ok_or_else(|| anyhow!("no 'code' in /sign_in redirect: {code_location}"))?;
+        // The endpoint only: the Location is the server's text and can carry the
+        // state, the client id and the redirect URI.
+        .ok_or_else(|| anyhow!("the /sign_in redirect carries no 'code'"))?;
 
     // -----------------------------------------------------------------------
     // Step 4: POST /token — exchange code for tokens
@@ -1061,14 +1069,18 @@ pub async fn authenticate_device_flow(server_url: &str, client_id: &str) -> Resu
             .await
             .context("/device_authorization JSON parse failed")?;
 
-    // Step 2: Display instructions
+    // Step 2: Display instructions. These are the one place the library prints
+    // what the server wrote, because the person has to read the address and the
+    // code to approve the device; control characters are dropped, so that the
+    // text cannot move the cursor or rewrite the terminal.
     eprintln!();
     eprintln!("To approve this device, open:");
-    eprintln!("  {}", device_auth.verification_uri_complete);
+    eprintln!("  {}", printable(&device_auth.verification_uri_complete));
     eprintln!();
     eprintln!(
         "Or go to {} and enter code: {}",
-        device_auth.verification_uri, device_auth.user_code
+        printable(&device_auth.verification_uri),
+        printable(&device_auth.user_code)
     );
     eprintln!();
     eprintln!(
@@ -2027,14 +2039,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn printable_drops_control_characters_and_keeps_the_rest() {
+        assert_eq!(
+            printable("https://id.example/device?user_code=ABCD-1234"),
+            "https://id.example/device?user_code=ABCD-1234"
+        );
+        assert_eq!(
+            printable("AB\x1b[2J\x1b]0;title\x07CD\r\nEF\u{9b}31m"),
+            "AB[2J]0;titleCDEF31m"
+        );
+        assert_eq!(printable("ÄÖ-\u{1f511}"), "ÄÖ-\u{1f511}");
+    }
+
     #[tokio::test]
-    async fn auth_missing_code_without_error_keeps_old_message() {
-        let location = format!("{REDIRECT_URI}?state=headless");
+    async fn auth_missing_code_without_error_names_the_endpoint_only() {
+        // The marker sits in the Location the server wrote, in a parameter the
+        // client reads (state) and in one it does not.
+        let location = format!("{REDIRECT_URI}?state={MARKER}&extra={MARKER}");
         let error = sign_in_answering(&location).await;
         assert!(error.downcast_ref::<AuthError>().is_none());
         assert_eq!(
             format!("{error:#}"),
-            format!("no 'code' in /sign_in redirect: {location}")
+            "the /sign_in redirect carries no 'code'"
+        );
+        // No Display, no alternate Display, no Debug carries the Location.
+        assert_body_free(&error);
+        assert!(
+            !printed(&error).contains(REDIRECT_URI),
+            "{}",
+            printed(&error)
         );
     }
 
