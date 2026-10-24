@@ -45,7 +45,7 @@ anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
 axum-extra = { version = "0.10", features = ["typed-header"] }
-base64 = "0.22"
+base64 = "0.23"
 bb8-redis = "0.26"
 chrono = "0.4"
 cookie = "0.18"
@@ -104,7 +104,7 @@ figment = { version = "0.10", features = ["toml", "env", "test"] }
 # It also pins the `DID_PROFILE_FIELD` wire contract from both sides at compile
 # time (`publish_uses_the_shared_field_constant`).
 siwx-oidc-auth = { path = "siwx-oidc-auth" }
-base64 = "0.22"
+base64 = "0.23"
 chrono = "0.4"
 ed25519-dalek = "2"
 env_logger = "0.11"
