@@ -63,7 +63,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -239,6 +239,13 @@ pub enum DirectoryError {
     /// An answer that is not what the contract says (malformed JSON, a row
     /// without a user id, a success body over the size cap).
     Protocol(String),
+    /// The homeserver's own people are not on [`DirectoryConfig::server_name`]:
+    /// the asker of a module search, or the owner of the token of a user search.
+    /// The configured name is not the homeserver's (a delegated host, a typo),
+    /// and answering anyway would show every local person as a foreign one.
+    /// Not retryable: the operator corrects the configuration. The message names
+    /// neither the person nor either server.
+    ServerNameMismatch,
 }
 
 impl DirectoryError {
@@ -298,7 +305,8 @@ impl DirectoryError {
             | DirectoryError::NotAdmitted
             | DirectoryError::Unauthorized
             | DirectoryError::UnexpectedStatus { .. }
-            | DirectoryError::Protocol(_) => false,
+            | DirectoryError::Protocol(_)
+            | DirectoryError::ServerNameMismatch => false,
         }
     }
 }
@@ -329,6 +337,10 @@ impl fmt::Display for DirectoryError {
                 errcode: None,
             } => write!(f, "unexpected status {status}"),
             DirectoryError::Protocol(why) => write!(f, "unexpected answer: {why}"),
+            DirectoryError::ServerNameMismatch => write!(
+                f,
+                "the homeserver's users are not on the configured server_name"
+            ),
         }
     }
 }
@@ -1149,11 +1161,22 @@ pub struct DirectoryConfig {
     pub issuer_url: String,
     /// The homeserver's client-API base URL.
     pub homeserver_url: String,
-    /// The homeserver's server name (`example.org` in `@alice:example.org`).
-    /// Only its own users carry a proof from this issuer. Every other server's
-    /// users are never `verified`: their profile is read through this
-    /// homeserver and a well-formed DID in it is `unconfirmed`, otherwise
-    /// `not_yet_published`.
+    /// The homeserver's server name (`example.org` in `@alice:example.org`):
+    /// Synapse's `server_name`, which is the part after the colon in its users'
+    /// MXIDs, **not** the host the client API is served from when the two differ
+    /// (`matrix.example.org` behind a delegation).
+    ///
+    /// Only the homeserver's own users carry a proof from this issuer. Every
+    /// other server's users are never `verified`: their profile is read through
+    /// this homeserver and a well-formed DID in it is `unconfirmed`, otherwise
+    /// `not_yet_published`. A name that is not the homeserver's would make that
+    /// split wrong for everybody, so the client checks it: the asker of
+    /// [`DirectoryClient::search_for_asker`] and the owner of the token of
+    /// [`DirectoryClient::search_as_user`] are the homeserver's own people, and
+    /// when one is not on this name the search is the error
+    /// [`DirectoryError::ServerNameMismatch`] and nothing else is asked. (An
+    /// asker that does not exist has no MXID to check, and gets the empty result
+    /// as before.)
     pub server_name: String,
     /// Whether [`DirectoryClient::search_for_asker`] signs the service in again
     /// itself when the directory module answers 401 (once, then retries once).
@@ -1220,6 +1243,10 @@ struct Inner {
     /// Fetches that have finished, read before waiting at `key_fetch`: a caller
     /// that finds it changed knows a fetch ran while it waited.
     key_fetches: AtomicU64,
+    /// Set once a person of the homeserver itself was seen on `server_name`.
+    /// Never set by a mismatch, so a wrong name is answered with an error on
+    /// every search.
+    server_name_confirmed: AtomicBool,
 }
 
 #[derive(Default)]
@@ -1293,6 +1320,7 @@ impl DirectoryClient {
                 }),
                 key_fetch: AsyncMutex::new(KeyFetch::default()),
                 key_fetches: AtomicU64::new(0),
+                server_name_confirmed: AtomicBool::new(false),
             }),
         })
     }
@@ -1325,6 +1353,10 @@ impl DirectoryClient {
     /// Every local hit is then proof-checked; the profile of each hit on another
     /// server is read for a claim ([`DidState::Unconfirmed`]).
     ///
+    /// An asker who is not on [`DirectoryConfig::server_name`] is
+    /// [`DirectoryError::ServerNameMismatch`]: the asker is the homeserver's own
+    /// person, so the configured name is wrong. Nothing is asked of the module.
+    ///
     /// `session` must belong to the deployment this client was made for, so its
     /// token is never sent to a homeserver it was not issued for.
     pub async fn search_for_asker(
@@ -1346,6 +1378,10 @@ impl DirectoryClient {
         let Some(asker) = inner.resolve_asker(asker_did).await? else {
             return Ok(DirectoryResults::empty());
         };
+        // The asker comes from our own issuer, so it is a person of the
+        // homeserver itself. One that is not on `server_name` says the name is
+        // wrong, and then every local person would be taken for a foreign one.
+        inner.confirm_server_name(&asker)?;
 
         let token = session.access_token().await?;
         let body = match inner.ask_module(&token, &asker, term, limit).await {
@@ -1363,7 +1399,13 @@ impl DirectoryClient {
     /// Synapse's standard `user_directory/search`, then each hit's
     /// `io.inblock.did` profile field, read without a credential, at most eight
     /// at a time. A 401 is [`DirectoryError::Unauthorized`] (the token is the
-    /// caller's to renew). A local profile that cannot be read fails the search:
+    /// caller's to renew).
+    ///
+    /// The first search asks `GET /account/whoami` with the token, once, to learn
+    /// that its owner is on [`DirectoryConfig::server_name`]; one who is not is
+    /// [`DirectoryError::ServerNameMismatch`] and the directory is not asked
+    /// (a search for an asker that matched the name already makes this
+    /// unnecessary). A local profile that cannot be read fails the search:
     /// its state is unknown, and `invalid` would be a claim about the person. A
     /// profile of another server's user is read for a claim
     /// ([`DidState::Unconfirmed`]) and never fails the search.
@@ -1377,6 +1419,7 @@ impl DirectoryClient {
         check_limit(limit)?;
         check_token(user_token)?;
         let inner = &self.inner;
+        inner.confirm_server_name_of_token(user_token).await?;
 
         let reply = inner
             .send(
@@ -1516,6 +1559,47 @@ impl Inner {
     fn is_local(&self, mxid: &str) -> bool {
         mxid.split_once(':')
             .is_some_and(|(_, server)| server == self.server_name)
+    }
+
+    /// The people of the homeserver itself must be on `server_name`. The whole
+    /// split between "a local person, whose proof is checked" and "a person of
+    /// another server, whose claim is only shown" rests on that name, and a name
+    /// that is not the homeserver's (a delegated host, a typo) would turn every
+    /// local person into a foreign one: their valid proof ignored, their unsigned
+    /// `did` member shown. `local` is a person known to be the homeserver's own.
+    fn confirm_server_name(&self, local: &str) -> Result<(), DirectoryError> {
+        if !self.is_local(local) {
+            return Err(DirectoryError::ServerNameMismatch);
+        }
+        self.server_name_confirmed.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// The same check for the user transport, which has no asker: the token's
+    /// owner (`GET /account/whoami`) is a person of the homeserver itself. Asked
+    /// once, with the first search, and not again after the name matched; a
+    /// mismatch or a failure is never kept.
+    async fn confirm_server_name_of_token(&self, token: &str) -> Result<(), DirectoryError> {
+        if self.server_name_confirmed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let reply = self
+            .send(
+                self.http
+                    .get(format!(
+                        "{}/_matrix/client/v3/account/whoami",
+                        self.homeserver_url
+                    ))
+                    .bearer_auth(token),
+            )
+            .await?;
+        let body = reply.ok_body()?;
+        let user = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|v| v.get("user_id")?.as_str().map(str::to_string))
+            .filter(|user| is_mxid(user))
+            .ok_or_else(|| DirectoryError::Protocol("whoami names no user".into()))?;
+        self.confirm_server_name(&user)
     }
 
     /// Send, read the body under the size cap (a success over it is a protocol

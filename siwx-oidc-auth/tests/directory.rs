@@ -3316,3 +3316,164 @@ async fn the_remote_claims_cache_is_bounded() {
         .unwrap();
     assert_eq!(dir.cache_stats().remote_claims, 3);
 }
+
+// ---------------------------------------------------------------------------
+// A server_name that is not the homeserver's fails closed
+// ---------------------------------------------------------------------------
+
+/// The deployment's users are `@x:example.org`; the client is told the name of
+/// the delegated host instead, as an operator can by mistake.
+const WRONG_NAME: &str = "matrix.example.org";
+
+fn misconfigured(w: &World) -> DirectoryClient {
+    let mut config = w.config();
+    config.server_name = WRONG_NAME.to_string();
+    DirectoryClient::new(config).unwrap()
+}
+
+/// With the wrong name every local person would look like a person of another
+/// server: not checked against their proof, their unsigned `did` member shown as
+/// a claim. That must be an error, never an answer.
+fn local_people_with_a_valid_proof(w: &World) {
+    let alice = mxid("alice");
+    w.hs.module_hits(vec![published(w, "alice")]);
+    w.hs.directory_rows(vec![json!({"user_id": alice, "display_name": "alice"})]);
+    w.hs.profile(&alice, Some(w.issuer.field(&did_of("alice"), &alice)));
+}
+
+fn is_name_mismatch(e: &DirectoryError) -> bool {
+    matches!(e, DirectoryError::ServerNameMismatch)
+}
+
+#[tokio::test]
+async fn a_wrong_server_name_fails_the_module_search_closed() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    let dir = misconfigured(&w);
+    let err = dir
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .expect_err("an answer under the wrong name would show local people as unconfirmed");
+    assert!(is_name_mismatch(&err), "{err}");
+    assert!(
+        !err.is_retryable(),
+        "the operator fixes it, a retry does not"
+    );
+    let text = err.to_string();
+    assert!(
+        !text.contains("asker-fixture")
+            && !text.contains(SERVER_NAME)
+            && !text.contains(WRONG_NAME),
+        "the message names neither a person nor a server: {text}"
+    );
+    assert_eq!(w.hs.module_calls(), 0, "the module is not asked");
+    assert_eq!(w.hs.profile_reads(), 0, "no profile is read");
+    // And it is not remembered as fine: the next search fails the same way.
+    assert!(is_name_mismatch(
+        &dir.search_for_asker(&w.session(), ASKER_DID, "a", 5)
+            .await
+            .unwrap_err()
+    ));
+}
+
+#[tokio::test]
+async fn a_wrong_server_name_fails_the_user_search_closed() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    let dir = misconfigured(&w);
+    let err = dir
+        .search_as_user("user-token-fixture", "a", 5)
+        .await
+        .expect_err("an answer under the wrong name would show local people as unconfirmed");
+    assert!(is_name_mismatch(&err), "{err}");
+    assert!(!err.is_retryable());
+    let text = err.to_string();
+    assert!(
+        !text.contains("whoami-fixture")
+            && !text.contains(SERVER_NAME)
+            && !text.contains(WRONG_NAME),
+        "the message names neither a person nor a server: {text}"
+    );
+    assert_eq!(w.hs.user_directory_calls(), 0, "the directory is not asked");
+    assert_eq!(w.hs.profile_reads(), 0, "no profile is read");
+    assert!(is_name_mismatch(
+        &dir.search_as_user("user-token-fixture", "a", 5)
+            .await
+            .unwrap_err()
+    ));
+    assert_eq!(
+        w.hs.whoami_calls(),
+        2,
+        "a mismatch is asked again, never kept"
+    );
+}
+
+#[tokio::test]
+async fn the_homeservers_name_is_asked_once_and_not_again_after_it_matched() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    let dir = w.directory();
+    for _ in 0..3 {
+        let got = dir
+            .search_as_user("user-token-fixture", "a", 5)
+            .await
+            .unwrap();
+        assert_eq!(states(&got), vec![verified(&did_of("alice"))]);
+    }
+    assert_eq!(w.hs.whoami_calls(), 1);
+    let whoami =
+        w.hs.mock
+            .requests()
+            .into_iter()
+            .find(|r| r.path == WHOAMI_PATH);
+    assert_eq!(
+        whoami.unwrap().bearer().as_deref(),
+        Some("user-token-fixture"),
+        "it is the user's own token that asks"
+    );
+}
+
+#[tokio::test]
+async fn an_asker_on_the_server_name_confirms_it_for_the_user_transport_too() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    let dir = w.directory();
+    dir.search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .unwrap();
+    dir.search_as_user("user-token-fixture", "a", 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        w.hs.whoami_calls(),
+        0,
+        "the same deployment and the same name: nothing left to ask"
+    );
+}
+
+#[tokio::test]
+async fn a_whoami_that_fails_is_the_searchs_error_and_is_not_kept() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    let dir = w.directory();
+
+    w.hs.on_whoami(|_, _| Resp::json(401, json!({"errcode": "M_UNKNOWN_TOKEN"})));
+    assert!(matches!(
+        dir.search_as_user("stale", "a", 5).await.unwrap_err(),
+        DirectoryError::Unauthorized
+    ));
+    w.hs.on_whoami(|_, _| Resp::json(502, json!({"errcode": "M_UNKNOWN"})));
+    let err = dir.search_as_user("t", "a", 5).await.unwrap_err();
+    assert!(matches!(err, DirectoryError::Unavailable(_)) && err.is_retryable());
+    w.hs.on_whoami(|_, _| Resp::json(200, json!({"device_id": "D"})));
+    assert!(matches!(
+        dir.search_as_user("t", "a", 5).await.unwrap_err(),
+        DirectoryError::Protocol(_)
+    ));
+    assert_eq!(w.hs.user_directory_calls(), 0);
+
+    // None of it was kept as a verdict: the next honest answer works.
+    w.hs.on_whoami(|_, _| Resp::json(200, json!({"user_id": mxid("someone")})));
+    let got = dir.search_as_user("t", "a", 5).await.unwrap();
+    assert_eq!(states(&got), vec![verified(&did_of("alice"))]);
+}
