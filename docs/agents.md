@@ -360,7 +360,11 @@ with the reason there is none. See [directory.md](directory.md).
   help). `RateLimited { retry_after }` is a 429 at `/authorize`, `/sign_in`,
   `/token`, the refresh or the device flow (`is_rate_limited(&err)`; also
   transient): wait for `retry_after`, the numeric `Retry-After` held to one hour,
-  or back off on your own when it is `None` (an HTTP-date is not read). A
+  or back off on your own when it is `None` (an HTTP-date is not read).
+  `TimedOut` is a request that got no answer within `FLOW_REQUEST_TIMEOUT` (10 s;
+  also transient): the entry points that build their own client give up on a
+  silent server after that, not after your whole sign-in. A client you pass in
+  (`authenticate_with_scope_using`) needs its own timeout. A
   refusal carries its `error` code and no `error_description`, which is free
   text the server wrote. A token answer is never refused for its
   `expires_in` (see `TOKEN_LIFETIME_*`).
