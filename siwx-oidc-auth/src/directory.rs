@@ -67,7 +67,10 @@ use crate::did_assertion::{
     fetch_issuer_keys, parse_proof, read_at_most, verify_parsed, BodyTooLarge, IssuerKeys,
     DEFAULT_BODY_CAP, DID_PROFILE_FIELD,
 };
-use crate::{authenticate_with_device, refresh, AuthError, SiwxKey};
+use crate::{
+    authenticate_with_device, refresh, AuthError, SiwxKey, TOKEN_LIFETIME_DEFAULT_SECS,
+    TOKEN_LIFETIME_MAX_SECS, TOKEN_LIFETIME_MIN_SECS,
+};
 
 /// The shortest and longest search term, in characters after trimming.
 const TERM_MIN: usize = 1;
@@ -76,11 +79,6 @@ const TERM_MAX: usize = 64;
 const LIMIT_MAX: u32 = 20;
 /// Profile reads in flight at once on the user transport.
 const PROFILE_READS_AT_ONCE: usize = 8;
-/// What a token with no `expires_in` is assumed to live, in seconds.
-const UNKNOWN_LIFETIME_SECS: u64 = 60;
-/// The longest a token is trusted to live, whatever `expires_in` says: a server
-/// that names a year is renewed daily all the same.
-const MAX_LIFETIME_SECS: u64 = 24 * 60 * 60;
 
 // ---------------------------------------------------------------------------
 // The result (plan 4.1)
@@ -197,10 +195,6 @@ pub enum DirectoryError {
 }
 
 impl DirectoryError {
-    /// Whether the same call may succeed later without a change on the caller's
-    /// side. A sign-in is retryable unless the server refused the account
-    /// (`access_denied`), the device id (`invalid_scope`) or the request for
-    /// another reason; an untyped sign-in fault (a network error) is retryable.
     /// Whether the service could not sign in because the server does not know its
     /// client id: a dynamic client lapses after 30 days without a use (see
     /// [`register_public_client`]). The remedy is to register again and keep the
@@ -213,6 +207,10 @@ impl DirectoryError {
         }
     }
 
+    /// Whether the same call may succeed later without a change on the caller's
+    /// side. A sign-in is retryable unless the server refused the account
+    /// (`access_denied`), the device id (`invalid_scope`) or the request for
+    /// another reason; an untyped sign-in fault (a network error) is retryable.
     pub fn is_retryable(&self) -> bool {
         match self {
             DirectoryError::RateLimited { .. } | DirectoryError::Unavailable(_) => true,
@@ -811,16 +809,19 @@ impl ServiceSession {
 
     /// Keep the new pair. The tokens are stored before anything is computed from
     /// the lifetime, so no `expires_in` can lose them (the refresh token was
-    /// already taken to get them); a lifetime is capped at [`MAX_LIFETIME_SECS`],
-    /// and a deadline the clock cannot represent is "renew on the next call".
+    /// already taken to get them); a lifetime is held between
+    /// [`TOKEN_LIFETIME_MIN_SECS`] and [`TOKEN_LIFETIME_MAX_SECS`] (the flows
+    /// already do that; a caller-built `AuthTokens` may not), none is
+    /// [`TOKEN_LIFETIME_DEFAULT_SECS`], and a deadline the clock cannot
+    /// represent is "renew on the next call".
     fn keep(&self, tokens: &mut Tokens, issued: crate::AuthTokens) -> String {
         tokens.access = Some(issued.access_token.clone());
         tokens.refresh = issued.refresh_token;
         let life = Duration::from_secs(
             issued
                 .expires_in
-                .unwrap_or(UNKNOWN_LIFETIME_SECS)
-                .min(MAX_LIFETIME_SECS),
+                .unwrap_or(TOKEN_LIFETIME_DEFAULT_SECS)
+                .clamp(TOKEN_LIFETIME_MIN_SECS, TOKEN_LIFETIME_MAX_SECS),
         );
         let margin = self.tuning.token_refresh_margin.min(life / 2);
         let now = self.clock.now();
@@ -1457,7 +1458,10 @@ impl Inner {
     /// - a verified `(mxid, proof)` still in the cache: `verified`, no key needed;
     /// - a proof that is malformed, or that does not verify under the issuer's
     ///   keys, or that names another MXID: `invalid`, and nothing is kept;
-    /// - keys that cannot be had: an error, so the whole search fails.
+    /// - no key set at all (none cached and none to be fetched): an error, so
+    ///   the whole search fails. A proof whose `kid` the cached set lacks is
+    ///   `invalid` when the refetch for it is rate limited or fails; that is
+    ///   never an error, and the verdict is not kept.
     async fn did_state(
         &self,
         mxid: &str,
@@ -1492,8 +1496,9 @@ impl Inner {
         let mut keys = self.keys().await?;
         if !keys.has_kid(parsed.kid()) {
             // A key the issuer rotated in since the set was fetched: look again
-            // (rate limited) before judging the proof against a stale set.
-            keys = self.keys_after_unknown_kid(&keys).await?;
+            // (rate limited) before judging the proof against a stale set. The
+            // look can fail, and then the stale set stands.
+            keys = self.keys_after_unknown_kid(&keys).await;
         }
         match verify_parsed(&keys, &parsed, mxid) {
             Ok(verified) => {
@@ -1524,11 +1529,16 @@ impl Inner {
     /// than `stale` is returned as it is; otherwise the set is fetched again,
     /// unless a fetch began less than [`Tuning::keys_refetch_interval`] ago, in
     /// which case `stale` stands (and the proof is judged `invalid` against it).
-    async fn keys_after_unknown_kid(
-        &self,
-        stale: &Arc<IssuerKeys>,
-    ) -> Result<Arc<IssuerKeys>, DirectoryError> {
-        self.fetch_keys(Some(stale)).await
+    ///
+    /// This never fails: `stale` is a set that was usable a moment ago, and a
+    /// refetch that fails (or whose failure an earlier caller stored) leaves it
+    /// standing, so one row with an unknown `kid` cannot fail a search or hold
+    /// the others' answers hostage for the length of the rate limit.
+    async fn keys_after_unknown_kid(&self, stale: &Arc<IssuerKeys>) -> Arc<IssuerKeys> {
+        match self.fetch_keys(Some(stale)).await {
+            Ok(keys) => keys,
+            Err(_) => stale.clone(),
+        }
     }
 
     fn cached_keys(&self) -> Option<Arc<IssuerKeys>> {
@@ -1546,7 +1556,10 @@ impl Inner {
     /// each stores a set that is newer than the one it replaces: an older fetch
     /// cannot land after a newer one. Nothing of a failure is stored; the next
     /// call that finds no usable set fetches again. `stale` is the set a proof's
-    /// `kid` was missing from, when that is why the call is made.
+    /// `kid` was missing from, when that is why the call is made; such a call
+    /// is answered with `stale` (not an error) while the rate limit holds after
+    /// a failed fetch, and the failure is only ever the answer of a call that has
+    /// no set (`stale` is `None`).
     async fn fetch_keys(
         &self,
         stale: Option<&Arc<IssuerKeys>>,
@@ -1564,10 +1577,17 @@ impl Inner {
         };
         if self.key_fetches.load(Ordering::SeqCst) != seen {
             // A fetch ended while this caller waited: its outcome is the answer.
-            match (&fetch.last, stored()) {
-                (Some((_, Some(why))), _) => return Err(DirectoryError::Unavailable(why.clone())),
-                (_, Some(keys)) => return Ok(keys),
-                (_, None) => {}
+            match (&fetch.last, stored(), stale) {
+                // The set a proof's `kid` was missing from is still the one to
+                // judge it by when the refetch that ended meanwhile failed.
+                (Some((_, Some(_))), current, Some(stale)) => {
+                    return Ok(current.unwrap_or_else(|| stale.clone()))
+                }
+                (Some((_, Some(why))), _, None) => {
+                    return Err(DirectoryError::Unavailable(why.clone()))
+                }
+                (_, Some(keys), _) => return Ok(keys),
+                (_, None, _) => {}
             }
         }
         match stale {
@@ -1580,15 +1600,14 @@ impl Inner {
                 if let Some(current) = stored().filter(|current| !Arc::ptr_eq(current, stale)) {
                     return Ok(current);
                 }
-                if let Some((began, failure)) = &fetch.last {
+                if let Some((began, _)) = &fetch.last {
                     let limited = began
                         .checked_add(self.tuning.keys_refetch_interval)
                         .is_none_or(|until| self.now() < until);
                     if limited {
-                        return match failure {
-                            Some(why) => Err(DirectoryError::Unavailable(why.clone())),
-                            None => Ok(stale.clone()),
-                        };
+                        // A failed fetch limits the next one just as a good
+                        // one does, and `stale` stands either way.
+                        return Ok(stale.clone());
                     }
                 }
             }

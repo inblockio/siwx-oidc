@@ -326,16 +326,19 @@ doc; read it before changing the code the rule covers.
   `issuer`; the verified `sub` beats the plain `did` member. Pin: `iss_mismatch_is_rejected`,
   `fetch_plain_did_disagreement_returns_the_verified_sub`.
 - **The directory client never turns an answer it could not check into a state**
-  ([docs/directory.md](docs/directory.md)). A fetch failure of the issuer's discovery or key set
-  fails the whole search with a retryable error and is stored nowhere; only a proof that was read
-  and fails is `invalid`. `DidState::Verified` can only be made inside `directory.rs` and the result
+  ([docs/directory.md](docs/directory.md)). A fetch failure of the issuer's discovery or key set,
+  with no usable set held, fails the whole search with a retryable error and is stored nowhere;
+  only a proof that was read and fails is `invalid` (a failed refetch for an unknown `kid` with a
+  set held is that proof's `invalid` alone). `DidState::Verified` can only be made inside `directory.rs` and the result
   types derive `Serialize` only, like `VerifiedDid`. The verified cache is keyed by `(mxid, proof)`
   and lives at most 10 minutes. Tokens stay in memory: no file API and no output macro in the module
   outside its tests. The key set is fetched by one request pair at a time and a waiter shares the
   fetch's outcome; a proof with a `kid` the cached set lacks refetches it, at most once per 30 s; a
   failed renewal of the service session is shared by its waiters and answered for 5 s; an error
   status is classified by its status however long its body; the public verifier follows no
-  redirect (its `jwks_uri` was judged as named). Pin: `a_failure_to_get_the_keys_fails_the_search_and_is_stored_nowhere`,
+  redirect for discovery and the key set (its `jwks_uri` was judged as named; the profile read of
+  `fetch_and_verify_did` follows up to 3); a failed unknown-`kid` refetch never fails a search (that
+  proof is `invalid` in that answer, the 30 s limit holds, only "no key set at all" fails). Pin: `a_failure_to_get_the_keys_fails_the_search_and_is_stored_nowhere`,
   `the_result_types_cannot_be_deserialized`, `a_cached_verification_is_for_that_mxid_and_that_proof_only`,
   `a_verified_result_is_kept_for_ten_minutes_and_not_a_second_longer`,
   `the_module_touches_no_file_and_prints_nothing`,
@@ -343,7 +346,9 @@ doc; read it before changing the code the rule covers.
   `a_proof_with_an_unknown_kid_refetches_the_key_set_once_per_thirty_seconds`,
   `waiters_share_one_failed_renewal_instead_of_signing_in_one_after_another`,
   `an_error_status_is_classified_by_its_status_however_large_its_body`,
-  `the_public_verifier_follows_no_redirect_for_the_key_set`.
+  `the_public_verifier_follows_no_redirect_for_the_key_set`,
+  `a_failed_unknown_kid_refetch_never_fails_a_search`,
+  `fetch_and_verify_did_follows_up_to_three_redirects_for_the_profile_read`.
 
 ### Publication and the Synapse client ([docs/matrix-integration.md](docs/matrix-integration.md))
 
@@ -601,11 +606,20 @@ doc; read it before changing the code the rule covers.
   device flow read an error answer under the 256 KiB cap (`Refusal`) and keep the status and, when
   the body is JSON with an `error` that is a short token, that code. `/authorize` answers 401 for an
   unregistered client id (`oidc::authorize`) and the client returns `AuthError::UnknownClient`; a
-  consumer matches that type (`is_unknown_client`), not the text. Pin:
+  consumer matches that type (`is_unknown_client`), not the text. That 401 carries no
+  `WWW-Authenticate` header (pinned in the interop test); a 401 with one is a proxy's wall and is
+  `AuthError::Unauthorized`, never re-registered on. A refusal's `error_description`, a reqwest
+  error's URL and the server-written values of the DID verifier (discovery `issuer`, `jwks_uri`,
+  JWK `use`/`key_ops`/`alg`/`kty`/`crv`) are in no error text; `expires_in` is read tolerantly
+  (`TOKEN_LIFETIME_*`) so a token answer is never lost to it. Pin:
   `a_token_error_is_reported_by_its_status_and_code_and_never_its_body`,
   `a_sign_in_page_is_reported_by_its_status_and_never_its_body`,
   `a_refresh_error_is_reported_by_its_status_and_code_and_never_its_body`,
-  `an_unregistered_client_at_authorize_is_a_typed_error`, and against this server's own handler
+  `an_unregistered_client_at_authorize_is_a_typed_error`,
+  `a_401_with_a_challenge_at_authorize_is_not_an_unknown_client`,
+  `a_transport_error_names_the_endpoint_and_never_the_request_url`,
+  `a_refusals_description_is_in_no_error_text`,
+  `any_expires_in_keeps_the_new_pair_with_a_bounded_lifetime`, and against this server's own handler
   `an_unregistered_client_id_is_the_typed_unknown_client_error`.
 - **An empty `device_id` is JSON `null` on the wire, never `""`.** Synapse rejects `""`. Pin:
   `empty_device_id_renders_as_json_null`, `deviceless_token_body_carries_device_id_null`.

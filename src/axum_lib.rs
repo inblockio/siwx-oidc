@@ -3608,6 +3608,34 @@ mod headless_client_interop_tests {
         );
         assert!(is_unknown_client(&error));
 
+        // What `UnknownClient` is told from a proxy's auth wall by: the server's
+        // own 401 carries no `WWW-Authenticate` header (a wall's does, and the
+        // client types that as `AuthError::Unauthorized`). If this server ever
+        // challenges here, `UnknownClient` would stop being recognised.
+        let raw = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+            .get(format!("{base}/authorize"))
+            .query(&[
+                ("client_id", unknown.as_str()),
+                ("redirect_uri", REDIRECT),
+                ("scope", "openid"),
+                ("response_type", "code"),
+                ("state", "s"),
+                ("code_challenge", "c"),
+                ("code_challenge_method", "S256"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(raw.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            raw.headers().get(header::WWW_AUTHENTICATE).is_none(),
+            "{:?}",
+            raw.headers()
+        );
+
         // A client the server knows is not that, with its redirect URI or with
         // one that is not registered: the answers differ from the 401.
         let known = format!("known-client-{tag}");

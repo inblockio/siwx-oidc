@@ -653,9 +653,14 @@ pub(crate) async fn fetch_issuer_keys(
     // well as fetched from, and those two uses must not drift apart.
     let anchor = issuer_base_url.trim_end_matches('/');
     let discovery_url = format!("{anchor}/.well-known/openid-configuration");
-    let discovery: Discovery = fetch_json(http, &discovery_url, body_cap)
-        .await
-        .context("OIDC discovery fetch failed")?;
+    let discovery: Discovery = fetch_json(
+        http,
+        &discovery_url,
+        &format!("GET {discovery_url}"),
+        body_cap,
+    )
+    .await
+    .context("OIDC discovery fetch failed")?;
 
     // OpenID Connect Discovery 1.0 §4.3 (Provider Configuration Validation):
     // "The issuer value returned MUST be identical to the Issuer URL that was
@@ -680,13 +685,15 @@ pub(crate) async fn fetch_issuer_keys(
     // so a byte-exact `==` here would reject every real deployment. ONLY the
     // trailing slash is forgiven — see `normalize_issuer`.
     if normalize_issuer(&discovery.issuer) != normalize_issuer(anchor) {
+        // The issuer the document names is not repeated: the document is whatever
+        // the server wrote, and an error reaches logs. The operator reads it at
+        // the URL below.
         bail!(
             "ISSUER MISMATCH: the discovery document fetched from `{anchor}` \
-             ({discovery_url}) declares its issuer to be `{}`. OpenID Connect Discovery 1.0 §4.3 \
-             requires those to be identical. A server naming an issuer it is not served from is \
-             either misconfigured or is trying to have its own signing key attributed to that \
-             other issuer",
-            discovery.issuer
+             ({discovery_url}) declares an issuer that is not `{anchor}`. OpenID Connect \
+             Discovery 1.0 §4.3 requires those to be identical. A server naming an issuer it is \
+             not served from is either misconfigured or is trying to have its own signing key \
+             attributed to that other issuer"
         );
     }
 
@@ -714,9 +721,11 @@ pub(crate) async fn fetch_issuer_keys(
     })?;
 
     // -- 5. JWKS ------------------------------------------------------------
-    let jwks: Jwks = fetch_json(http, &discovery.jwks_uri, body_cap)
+    // The URL is the server's text (its origin is the issuer's, the rest is not),
+    // so the errors name the `jwks_uri` member and not its value.
+    let jwks: Jwks = fetch_json(http, &discovery.jwks_uri, "GET the `jwks_uri`", body_cap)
         .await
-        .with_context(|| format!("JWKS fetch from {} failed", discovery.jwks_uri))?;
+        .context("JWKS fetch failed")?;
 
     Ok(IssuerKeys {
         anchor: anchor.to_string(),
@@ -888,7 +897,7 @@ pub async fn fetch_and_verify_did(
     mxid: &str,
     issuer_base_url: &str,
 ) -> Result<VerifiedDid> {
-    let http = http_client()?;
+    let http = profile_client()?;
 
     // Unauthenticated on purpose: the stable v3 profile route is registered
     // unconditionally on Synapse 1.159.0 (`rest/client/profile.py:100-103`) and
@@ -906,6 +915,7 @@ pub async fn fetch_and_verify_did(
         .get(&url)
         .send()
         .await
+        .map_err(reqwest::Error::without_url)
         .with_context(|| format!("GET {url} failed"))?;
 
     // 404 is the healthy "no such field" answer. Note that a 500 here is NOT
@@ -990,7 +1000,9 @@ pub async fn fetch_and_verify_did(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// The HTTP client both public entry points use. It follows no redirect: the
+/// The HTTP client of the discovery and key-set fetches, which
+/// [`verify_did_assertion`] makes (and [`fetch_and_verify_did`] through it). It
+/// follows no redirect: the
 /// same-origin rule for `jwks_uri` (step 4) judges the URL the issuer named, and
 /// a redirect from that URL would carry the key fetch to an origin nobody
 /// vouched for, after the check. A 3xx is an error like any other non-success.
@@ -1001,6 +1013,23 @@ fn http_client() -> Result<reqwest::Client> {
         .build()
         .context("failed to build HTTP client")
 }
+
+/// The HTTP client of the profile read in [`fetch_and_verify_did`]: up to
+/// [`PROFILE_REDIRECTS`] redirects. The read is unauthenticated and the proof it
+/// returns is checked against the issuer's keys whatever host answered, so where
+/// the profile came from adds no trust, and a homeserver behind a canonical-host
+/// or trailing-slash redirect still works. Discovery and the key set stay on
+/// [`http_client`] (no redirect): there the URL is the thing that is vouched for.
+fn profile_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::limited(PROFILE_REDIRECTS))
+        .build()
+        .context("failed to build HTTP client")
+}
+
+/// How many redirects the profile read follows.
+const PROFILE_REDIRECTS: usize = 3;
 
 /// Describe a disagreement between the object's plain `did` member and the
 /// signed `sub`, or `None` when they agree (or there is no plain member).
@@ -1050,12 +1079,14 @@ fn normalize_issuer(s: &str) -> &str {
 /// nothing: it is rejected rather than compared, because an empty host equal to
 /// another empty host is not a match, it is two things we cannot locate.
 fn require_same_origin(url: &str, issuer: &str) -> Result<()> {
-    fn origin_of(raw: &str) -> Result<(String, String, Option<u16>)> {
-        let parsed = Url::parse(raw).with_context(|| format!("`{raw}` is not a valid URL"))?;
+    // `which` names the URL in a message; the URL itself is not repeated (the one
+    // that is under test is text the server wrote).
+    fn origin_of(raw: &str, which: &str) -> Result<(String, String, Option<u16>)> {
+        let parsed = Url::parse(raw).with_context(|| format!("{which} is not a valid URL"))?;
         let host = parsed
             .host_str()
             .filter(|h| !h.is_empty())
-            .ok_or_else(|| anyhow!("`{raw}` has no host, so it has no origin to compare"))?;
+            .ok_or_else(|| anyhow!("{which} has no host, so it has no origin to compare"))?;
         Ok((
             parsed.scheme().to_ascii_lowercase(),
             host.to_ascii_lowercase(),
@@ -1063,16 +1094,15 @@ fn require_same_origin(url: &str, issuer: &str) -> Result<()> {
         ))
     }
 
-    let (u_scheme, u_host, u_port) = origin_of(url)?;
-    let (i_scheme, i_host, i_port) = origin_of(issuer)?;
+    let (u_scheme, u_host, u_port) = origin_of(url, "the URL")?;
+    let (i_scheme, i_host, i_port) = origin_of(issuer, "the issuer")?;
 
     if (&u_scheme, &u_host, u_port) != (&i_scheme, &i_host, i_port) {
         bail!(
-            "`{url}` is on a different origin than the issuer `{issuer}` \
-             ({u_scheme}://{u_host}:{u_port:?} vs {i_scheme}://{i_host}:{i_port:?}). Key material \
-             is only fetched from the issuer's own origin: a discovery document that sends key \
-             resolution elsewhere is asking us to verify the issuer's proofs against somebody \
-             else's key"
+            "the URL is on a different origin than the issuer `{issuer}` \
+             ({i_scheme}://{i_host}:{i_port:?}). Key material is only fetched from the issuer's \
+             own origin: a discovery document that sends key resolution elsewhere is asking us \
+             to verify the issuer's proofs against somebody else's key"
         );
     }
     Ok(())
@@ -1107,10 +1137,12 @@ fn verifying_key_from_jwk(jwk: &Jwk, kid: &str) -> Result<VerifyingKey> {
     // policy engine.
     if let Some(use_) = jwk.use_.as_deref() {
         if use_ != "sig" {
+            // Neither this value nor the ones below are repeated: the key set is
+            // whatever the server wrote.
             bail!(
-                "JWK `{kid}` declares use=`{use_}`; RFC 7517 §4.2 makes that the key's intended \
-                 use, and a key published for anything but `sig` must not be used to verify a \
-                 signature no matter what its bytes would happen to accept"
+                "JWK `{kid}` declares a `use` other than `sig`; RFC 7517 §4.2 makes that the \
+                 key's intended use, and a key published for anything but `sig` must not be \
+                 used to verify a signature no matter what its bytes would happen to accept"
             );
         }
     }
@@ -1122,33 +1154,31 @@ fn verifying_key_from_jwk(jwk: &Jwk, kid: &str) -> Result<VerifyingKey> {
             .is_some_and(|ops| ops.iter().any(|op| op.as_str() == Some("verify")));
         if !permits_verify {
             bail!(
-                "JWK `{kid}` has key_ops={ops}, which does not include `verify`; RFC 7517 §4.3 \
-                 makes key_ops the exhaustive list of operations the key may be used for"
+                "JWK `{kid}` has `key_ops` that do not include `verify`; RFC 7517 §4.3 makes \
+                 key_ops the exhaustive list of operations the key may be used for"
             );
         }
     }
     if let Some(alg) = jwk.alg.as_deref() {
         if alg != "ES256" {
             bail!(
-                "JWK `{kid}` declares alg=`{alg}`; RFC 7517 §4.4 restricts the key to that one \
-                 algorithm, and this verifier only ever verifies ES256"
+                "JWK `{kid}` declares an `alg` other than ES256; RFC 7517 §4.4 restricts the key \
+                 to that one algorithm, and this verifier only ever verifies ES256"
             );
         }
     }
 
     match jwk.kty.as_deref() {
         Some("EC") => {}
-        other => bail!(
-            "JWK `{kid}` has kty={:?}; ES256 requires an EC key",
-            other.unwrap_or("<absent>")
-        ),
+        None => bail!("JWK `{kid}` has no `kty`; ES256 requires an EC key"),
+        Some(_) => bail!("JWK `{kid}` has a `kty` other than EC; ES256 requires an EC key"),
     }
     match jwk.crv.as_deref() {
         Some("P-256") => {}
         other => bail!(
-            "JWK `{kid}` has crv={:?}; ES256 is defined only over P-256 (RFC 7518 §3.4). A key on \
-             another curve cannot verify an ES256 signature no matter how the bytes line up",
-            other.unwrap_or("<absent>")
+            "JWK `{kid}` has {} `crv`; ES256 is defined only over P-256 (RFC 7518 §3.4). A key \
+             on another curve cannot verify an ES256 signature no matter how the bytes line up",
+            if other.is_none() { "no" } else { "a non-P-256" }
         ),
     }
 
@@ -1190,10 +1220,13 @@ fn verifying_key_from_jwk(jwk: &Jwk, kid: &str) -> Result<VerifyingKey> {
 /// GET `url` and parse the answer as JSON, with the body read under a cap:
 /// `cap`, or [`DEFAULT_BODY_CAP`] when it is `None` (the public verifier). An
 /// error status is reported by the status and a short error code, a body that is
-/// not the expected JSON by saying so; neither quotes the body.
+/// not the expected JSON by saying so; neither quotes the body. `what` names the
+/// request in those messages (`GET <url>`, or a name when the URL is text the
+/// server wrote), and reqwest's own error is stripped of the URL.
 async fn fetch_json<T: serde::de::DeserializeOwned>(
     http: &reqwest::Client,
     url: &str,
+    what: &str,
     cap: Option<usize>,
 ) -> Result<T> {
     let cap = cap.unwrap_or(DEFAULT_BODY_CAP);
@@ -1201,16 +1234,15 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
         .get(url)
         .send()
         .await
-        .with_context(|| format!("GET {url} failed"))?;
+        .map_err(reqwest::Error::without_url)
+        .with_context(|| format!("{what} failed"))?;
     if !resp.status().is_success() {
-        return Err(crate::Refusal::within(resp, cap)
-            .await
-            .into_error(&format!("GET {url}")));
+        return Err(crate::Refusal::within(resp, cap).await.into_error(what));
     }
     let body = read_capped(resp, cap)
         .await
-        .with_context(|| format!("GET {url} body"))?;
-    parse_json(&body).with_context(|| format!("GET {url} did not return the expected JSON"))
+        .with_context(|| format!("{what} body"))?;
+    parse_json(&body).with_context(|| format!("{what} did not return the expected JSON"))
 }
 
 /// Read a response body under `cap` and parse it as JSON; see [`parse_json`] for
@@ -1274,6 +1306,7 @@ pub(crate) async fn read_at_most(
     while let Some(chunk) = resp
         .chunk()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("reading the response body failed")?
     {
         if body.len() + chunk.len() > cap {
@@ -1947,8 +1980,12 @@ mod tests {
             .expect_err("a discovery document may not name an issuer it is not served from");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains(IMPERSONATED),
-            "error must name the issuer the document CLAIMED: {msg}"
+            !msg.contains(IMPERSONATED),
+            "the issuer the document CLAIMED is the server's text and is not repeated: {msg}"
+        );
+        assert!(
+            msg.contains("ISSUER MISMATCH"),
+            "error must say what failed: {msg}"
         );
         assert!(
             msg.contains(&base),
@@ -1995,8 +2032,8 @@ mod tests {
             .expect_err("key resolution must not follow jwks_uri off the issuer's origin");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains(&foreign_jwks),
-            "error must name the foreign jwks_uri: {msg}"
+            !msg.contains(&foreign_jwks) && msg.contains("not acceptable"),
+            "error must say the jwks_uri is not acceptable, not repeat it: {msg}"
         );
         assert!(
             msg.contains(&anchor),
@@ -2074,8 +2111,8 @@ mod tests {
             .expect_err("a key the issuer published for encryption must not verify a signature");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("enc"),
-            "error must name the declared use: {msg}"
+            msg.contains("`use`"),
+            "error must name the member (not its value): {msg}"
         );
         assert!(msg.contains("7517"), "error must cite the RFC: {msg}");
     }
@@ -2115,8 +2152,8 @@ mod tests {
             .expect_err("a JWK restricted to another alg must not verify an ES256 proof");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("ES384"),
-            "error must name the JWK's alg: {msg}"
+            msg.contains("`alg`") && !msg.contains("ES384"),
+            "error must name the member, not its value: {msg}"
         );
         assert!(msg.contains("7517"), "error must cite the RFC: {msg}");
     }
@@ -2687,42 +2724,44 @@ mod tests {
             (
                 500u16,
                 format!("<html>{MARKER}</html>"),
-                "GET {url} returned 500 Internal Server Error",
+                "GET the `jwks_uri` returned 500 Internal Server Error",
             ),
             (
                 502,
                 format!(r#"{{"error":"bad_gateway","error_description":"{MARKER}"}}"#),
-                "GET {url} returned 502 Bad Gateway (bad_gateway)",
+                "GET the `jwks_uri` returned 502 Bad Gateway (bad_gateway)",
             ),
             (
                 404,
                 format!(r#"{{"error":["{MARKER}"]}}"#),
-                "GET {url} returned 404 Not Found",
+                "GET the `jwks_uri` returned 404 Not Found",
             ),
             // A JSON string where the key set is an object, and where its
             // `keys` is an array.
             (
                 200,
                 format!(r#""{MARKER}""#),
-                "GET {url} did not return the expected JSON",
+                "GET the `jwks_uri` did not return the expected JSON",
             ),
             (
                 200,
                 format!(r#"{{"keys":"{MARKER}"}}"#),
-                "GET {url} did not return the expected JSON",
+                "GET the `jwks_uri` did not return the expected JSON",
             ),
         ] {
             let base = spawn_mock_http(move |b| issuer_with_jwks_answer(b, status, &body)).await;
-            let url = format!("{base}/jwk");
             let jws = proof_for(&base);
             let err = verify_did_assertion(&base, &jws, ALICE)
                 .await
                 .expect_err("a broken key set verifies nothing");
             assert_body_free(&err);
             let message = format!("{err:#}");
-            let expected = expected.replace("{url}", &url);
             assert!(
-                message.contains(&expected),
+                !message.contains(&base),
+                "the key set URL is the server's text: {message}"
+            );
+            assert!(
+                message.contains(expected),
                 "expected `{expected}` in `{message}`"
             );
         }
@@ -2922,5 +2961,123 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    // -- Values the server wrote are not echoed ------------------------------
+    //
+    // The discovery document and the key set are written by whatever answers
+    // at the issuer URL, so what they say is not repeated in an error: the
+    // error says which check failed.
+
+    /// A discovery document with `jwks_uri` as `jwks_uri(base)` says.
+    async fn issuer_naming_jwks_uri(jwks_uri: impl FnOnce(&str) -> String) -> String {
+        spawn_mock_http(move |b| {
+            vec![(
+                "/.well-known/openid-configuration".to_string(),
+                200,
+                json!({ "issuer": b, "jwks_uri": jwks_uri(b) }).to_string(),
+            )]
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_discovery_issuer_the_server_wrote_is_not_echoed() {
+        let key = SigningKey::random(&mut OsRng);
+        let jwks = json!({ "keys": [jwk_of(&key, KID)] });
+        let claimed = format!("https://{MARKER}.example");
+        let named = claimed.clone();
+        let base = spawn_mock_http(move |b| discovery_and_jwks(b, &named, jwks)).await;
+
+        let jws = mint(&key, &header_of(KID), &payload_of(&claimed, DID, ALICE));
+        let err = verify_did_assertion(&base, &jws, ALICE)
+            .await
+            .expect_err("the document names another issuer");
+        assert_body_free(&err);
+        let message = format!("{err:#}");
+        assert!(message.contains("ISSUER MISMATCH"), "{message}");
+        assert!(
+            message.contains(&base),
+            "the URL it was fetched from: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_jwks_uri_the_server_wrote_is_not_echoed() {
+        // On a foreign origin.
+        let base = issuer_naming_jwks_uri(|_| format!("http://{MARKER}.example/jwk")).await;
+        let err = verify_did_assertion(&base, &proof_for(&base), ALICE)
+            .await
+            .expect_err("a foreign jwks_uri is refused");
+        assert_body_free(&err);
+        assert!(format!("{err:#}").contains("not acceptable"), "{err:#}");
+
+        // Not a URL, and one without a host.
+        for uri in [format!("{MARKER} not a url"), format!("file:///{MARKER}")] {
+            let base = issuer_naming_jwks_uri(move |_| uri).await;
+            let err = verify_did_assertion(&base, &proof_for(&base), ALICE)
+                .await
+                .expect_err("not a usable jwks_uri");
+            assert_body_free(&err);
+        }
+
+        // On the issuer's origin, with a path of the server's choosing, and
+        // answering an error.
+        let base = issuer_naming_jwks_uri(|b| format!("{b}/{MARKER}?{MARKER}")).await;
+        let err = verify_did_assertion(&base, &proof_for(&base), ALICE)
+            .await
+            .expect_err("the key set is not served");
+        assert_body_free(&err);
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("404"),
+            "the status is still named: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn jwk_member_values_the_server_wrote_are_not_echoed() {
+        for (member, value) in [
+            ("use", json!(MARKER)),
+            ("key_ops", json!([MARKER])),
+            ("key_ops", json!(MARKER)),
+            ("alg", json!(MARKER)),
+            ("kty", json!(MARKER)),
+            ("crv", json!(MARKER)),
+        ] {
+            let key = SigningKey::random(&mut OsRng);
+            let mut jwk = jwk_of(&key, KID);
+            jwk[member] = value;
+            let jwks = json!({ "keys": [jwk] });
+            let base = spawn_mock_http(move |b| discovery_and_jwks(b, b, jwks)).await;
+            let jws = mint(&key, &header_of(KID), &payload_of(&base, DID, ALICE));
+            let err = verify_did_assertion(&base, &jws, ALICE)
+                .await
+                .expect_err("a key with such a member verifies nothing");
+            assert_body_free(&err);
+            let message = format!("{err:#}");
+            assert!(message.contains(member), "names the member: {message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_names_the_url_once_and_not_through_reqwest() {
+        let dead = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        // The verifier's own message names the URL it asked; reqwest's error
+        // does not name it a second time.
+        let err = verify_did_assertion(&dead, &proof_for(&dead), ALICE)
+            .await
+            .expect_err("nothing listens");
+        let message = format!("{err:#}");
+        assert_eq!(message.matches(&dead).count(), 1, "{message}");
+
+        let err = fetch_and_verify_did(&dead, ALICE, &dead)
+            .await
+            .expect_err("nothing listens");
+        let message = format!("{err:#}");
+        assert_eq!(message.matches(&dead).count(), 1, "{message}");
     }
 }

@@ -354,7 +354,12 @@ with the reason there is none. See [directory.md](directory.md).
   answer the two questions a caller usually has. `UnknownClient` is the one
   refusal that is not a redirect: whatever its settings, the server answers
   `/authorize` for a client id it does not know with a 401, and the library turns
-  that into the type (`is_unknown_client(&err)`): register the client again.
+  that into the type (`is_unknown_client(&err)`): register the client again. Only
+  a 401 without a `WWW-Authenticate` header is that: with one it is
+  `AuthError::Unauthorized` (a proxy's auth wall; registering again does not
+  help). A refusal carries its `error` code and no `error_description`, which is
+  free text the server wrote. A token answer is never refused for its
+  `expires_in` (see `TOKEN_LIFETIME_*`).
   Error answers from `/sign_in`, `/token` and the refresh are reported by their
   status and, when the body names one, its OAuth `error` code, never the body;
   an answer that is not the expected JSON is reported as such, and every body is

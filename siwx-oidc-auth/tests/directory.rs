@@ -1775,6 +1775,119 @@ async fn many_searches_with_an_unknown_kid_cost_the_issuer_one_refetch() {
     );
 }
 
+#[tokio::test]
+async fn a_failed_unknown_kid_refetch_never_fails_a_search() {
+    let w = World::new().await;
+    let dir = w.directory();
+    let session = w.session();
+    let jwk_fetches = || w.issuer.mock.count("GET", "/jwk");
+
+    // The first search caches the key set (the issuer's first key).
+    w.hs.module_hits(vec![published(&w, "alice")]);
+    dir.search_for_asker(&session, ASKER_DID, "a", 5)
+        .await
+        .unwrap();
+    assert_eq!(jwk_fetches(), 1);
+
+    // The issuer rotates to a second key but is down when asked. A search
+    // that returns a proof under the new kid next to alice's old one: the new
+    // one is `invalid` for this answer, alice is `verified`, nothing fails.
+    let new_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+    w.issuer.with(|s| {
+        s.jwks = json!({"keys": [jwk_of(&s.proof_key, KID), jwk_of(&new_key, "fixture-kid-2")]});
+        s.jwks_status = 500;
+    });
+    w.hs.module_hits(vec![
+        signed_by(&w, &new_key, "fixture-kid-2", "carol"),
+        published(&w, "alice"),
+    ]);
+    w.clock.advance(Duration::from_secs(30));
+    let got = dir
+        .search_for_asker(&session, ASKER_DID, "a", 5)
+        .await
+        .expect("a failed refetch for an unknown kid is not a failed search");
+    assert_eq!(
+        states(&got),
+        vec![json!({"state": "invalid"}), verified(&did_of("alice"))]
+    );
+    assert_eq!(jwk_fetches(), 2, "the refetch was tried, and failed");
+
+    // The issuer is back. Inside the 30 s the failure is not held against the
+    // search either, and the issuer is not asked again.
+    w.issuer.with(|s| s.jwks_status = 200);
+    w.clock.advance(Duration::from_secs(29));
+    for _ in 0..3 {
+        let got = dir
+            .search_for_asker(&session, ASKER_DID, "a", 5)
+            .await
+            .expect("the stored failure does not fail searches while the set is valid");
+        assert_eq!(
+            states(&got),
+            vec![json!({"state": "invalid"}), verified(&did_of("alice"))]
+        );
+    }
+    assert_eq!(
+        jwk_fetches(),
+        2,
+        "the 30 s limit still holds after a failure"
+    );
+
+    // The invalid verdict was kept nowhere: after the limit the refetch
+    // succeeds and the same proof now verifies.
+    w.clock.advance(Duration::from_secs(1));
+    let got = dir
+        .search_for_asker(&session, ASKER_DID, "a", 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        states(&got),
+        vec![verified(&did_of("carol")), verified(&did_of("alice"))]
+    );
+    assert_eq!(jwk_fetches(), 3);
+}
+
+#[tokio::test]
+async fn searches_waiting_on_a_failed_unknown_kid_refetch_are_answered_not_failed() {
+    let w = World::new().await;
+    let dir = w.directory();
+    let session = Arc::new(w.session());
+    w.hs.module_hits(vec![published(&w, "alice")]);
+    dir.search_for_asker(&session, ASKER_DID, "a", 5)
+        .await
+        .unwrap();
+    w.clock.advance(Duration::from_secs(30));
+
+    let new_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+    w.issuer.with(|s| {
+        s.jwks = json!({"keys": [jwk_of(&new_key, "fixture-kid-2")]});
+        s.jwks_status = 500;
+        s.jwks_delay = Duration::from_millis(300);
+    });
+    w.hs.module_hits(vec![
+        signed_by(&w, &new_key, "fixture-kid-2", "carol"),
+        published(&w, "alice"),
+    ]);
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let (dir, session) = (dir.clone(), session.clone());
+        tasks.push(tokio::spawn(async move {
+            dir.search_for_asker(&session, ASKER_DID, "a", 5).await
+        }));
+    }
+    for t in tasks {
+        let got = t.await.unwrap().expect("not a failed search");
+        assert_eq!(
+            states(&got),
+            vec![json!({"state": "invalid"}), verified(&did_of("alice"))]
+        );
+    }
+    assert_eq!(
+        w.issuer.mock.count("GET", "/jwk"),
+        2,
+        "the first fetch and one failed refetch, shared"
+    );
+}
+
 /// Every character Python's `str.strip()` removes (`str.isspace()`, checked
 /// against Python 3 with Unicode 16): Rust's whitespace plus U+001C to U+001F.
 const MODULE_TRIMS: [char; 29] = [
@@ -1944,19 +2057,6 @@ async fn the_public_verifier_follows_no_redirect_for_the_key_set() {
 }
 
 #[tokio::test]
-async fn fetch_and_verify_did_follows_no_redirect_either() {
-    let w = World::new().await;
-    let elsewhere = Mock::start(|_| Resp::json(200, json!({"io.inblock.did": null}))).await;
-    let target = format!("{}/anything", elsewhere.base);
-    let home = Mock::start(move |_| Resp::found(target.clone())).await;
-    let err = siwx_oidc_auth::fetch_and_verify_did(&home.base, &mxid("alice"), &w.issuer.mock.base)
-        .await
-        .expect_err("a redirect is not a profile");
-    assert!(format!("{err:#}").contains("302"), "{err:#}");
-    assert_eq!(elsewhere.total(), 0, "the redirect target was never asked");
-}
-
-#[tokio::test]
 async fn an_unregistered_client_is_a_typed_sign_in_error() {
     let w = World::new().await;
     w.issuer.with(|s| s.authorize_status = Some(401));
@@ -1981,4 +2081,97 @@ async fn an_unregistered_client_is_a_typed_sign_in_error() {
     let err = w.session().access_token().await.unwrap_err();
     assert!(!err.is_unknown_client(), "{err:?}");
     assert!(err.is_retryable());
+}
+
+#[tokio::test]
+async fn a_401_with_a_challenge_is_not_an_unknown_client() {
+    // A proxy's auth wall answers 401 with a challenge; the server's own
+    // answer for an unregistered client has none. Registering again would not
+    // get past the wall.
+    for challenge in [r#"Basic realm="corp""#, "Bearer", "Negotiate"] {
+        let w = World::new().await;
+        w.issuer.with(|s| {
+            s.authorize_status = Some(401);
+            s.authorize_challenge = Some(challenge.to_string());
+        });
+        let err = w.session().access_token().await.unwrap_err();
+        assert!(!err.is_unknown_client(), "{challenge}: {err:?}");
+        assert!(
+            !err.is_retryable(),
+            "{challenge}: the same call meets the same wall: {err:?}"
+        );
+        let DirectoryError::SignIn { source } = &err else {
+            panic!("{err:?}");
+        };
+        assert!(!siwx_oidc_auth::is_unknown_client(source));
+        assert!(format!("{source:#}").contains("401"), "{source:#}");
+    }
+}
+
+#[tokio::test]
+async fn any_expires_in_keeps_the_pair_the_session_renews_with() {
+    // A lifetime that serde would refuse loses nothing: the sign-in's refresh
+    // token is the one the renewal uses.
+    for (raw, renewed_after) in [
+        ("1e20", Duration::from_secs(25 * 3600)),
+        ("18446744073709551616", Duration::from_secs(25 * 3600)),
+        ("3600.5", Duration::from_secs(3600)),
+        ("-7", Duration::from_secs(10)),
+        ("\"soon\"", Duration::from_secs(60)),
+        ("null", Duration::from_secs(60)),
+    ] {
+        let w = World::new().await;
+        w.issuer.with(|s| s.expires_in_raw = Some(raw.to_string()));
+        let session = w.session();
+        assert_eq!(session.access_token().await.unwrap(), "access-1", "{raw}");
+        w.issuer.with(|s| s.expires_in_raw = None);
+        w.clock.advance(renewed_after);
+        assert_eq!(session.access_token().await.unwrap(), "access-2", "{raw}");
+        assert_eq!(
+            w.issuer.refreshes(),
+            1,
+            "{raw}: renewed with the first pair"
+        );
+        assert_eq!(w.issuer.sign_ins(), 1, "{raw}");
+    }
+}
+
+/// A chain of `hops` redirects that ends at the profile answer of `field`.
+async fn profile_behind_redirects(hops: usize, field: Value) -> Mock {
+    let mut next = Mock::start(move |_| Resp::json(200, json!({ "io.inblock.did": field }))).await;
+    let mut hold = Vec::new();
+    for _ in 1..hops {
+        let target = format!("{}/p", next.base);
+        hold.push(next);
+        next = Mock::start(move |_| Resp::found(target.clone())).await;
+    }
+    let target = format!("{}/p", next.base);
+    let first = Mock::start(move |_| Resp::found(target.clone())).await;
+    // The hops stay up for as long as the first one is used.
+    std::mem::forget(hold);
+    std::mem::forget(next);
+    first
+}
+
+#[tokio::test]
+async fn fetch_and_verify_did_follows_up_to_three_redirects_for_the_profile_read() {
+    let w = World::new().await;
+    let field = w.issuer.field(&did_of("alice"), &mxid("alice"));
+
+    // A homeserver may redirect (a canonical host, a trailing-slash rule). The
+    // proof is pinned to the issuer, so where the profile came from adds no
+    // trust, and a redirect costs nothing.
+    let home = profile_behind_redirects(3, field.clone()).await;
+    let verified =
+        siwx_oidc_auth::fetch_and_verify_did(&home.base, &mxid("alice"), &w.issuer.mock.base)
+            .await
+            .expect("three redirects are followed");
+    assert_eq!(verified.did(), did_of("alice"));
+
+    // A fourth is one too many.
+    let home = profile_behind_redirects(4, field).await;
+    let err = siwx_oidc_auth::fetch_and_verify_did(&home.base, &mxid("alice"), &w.issuer.mock.base)
+        .await
+        .expect_err("a chain of four is refused");
+    assert!(format!("{err:#}").contains("redirect"), "{err:#}");
 }

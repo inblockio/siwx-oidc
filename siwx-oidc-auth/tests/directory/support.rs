@@ -378,6 +378,9 @@ pub struct IssuerState {
     /// Answer `/authorize` with this status and the server's own plain-text
     /// body for an unregistered client, instead of the redirect.
     pub authorize_status: Option<u16>,
+    /// A `WWW-Authenticate` challenge to put on that answer, as a proxy's auth
+    /// wall would (the server's own answer has none).
+    pub authorize_challenge: Option<String>,
     /// What the discovery document names as its issuer; `None` is its own URL.
     pub discovery_issuer: Option<String>,
     /// DID to the MXID `/resolve` finds; a DID that is absent does not exist.
@@ -386,6 +389,9 @@ pub struct IssuerState {
     pub seq: u32,
     pub current_refresh: Option<String>,
     pub expires_in: Option<u64>,
+    /// `expires_in` as JSON text, spelled any way (`1e20`, `"soon"`), instead of
+    /// `expires_in`.
+    pub expires_in_raw: Option<String>,
     pub issue_refresh: bool,
     pub refresh_status: u16,
     pub refresh_delay: Duration,
@@ -414,12 +420,14 @@ impl Issuer {
             jwks_redirect: None,
             sign_in_delay: Duration::ZERO,
             authorize_status: None,
+            authorize_challenge: None,
             discovery_issuer: None,
             resolve,
             resolve_status: 200,
             seq: 0,
             current_refresh: None,
             expires_in: Some(300),
+            expires_in_raw: None,
             issue_refresh: true,
             refresh_status: 200,
             refresh_delay: Duration::ZERO,
@@ -531,7 +539,11 @@ fn issuer_route(st: &Arc<Mutex<IssuerState>>, r: &Req) -> Resp {
         }
         ("GET", "/authorize") => {
             if let Some(status) = s.authorize_status {
-                return Resp::text(status, "Unrecognised client id.");
+                let resp = Resp::text(status, "Unrecognised client id.");
+                return match &s.authorize_challenge {
+                    Some(challenge) => resp.header("WWW-Authenticate", challenge),
+                    None => resp,
+                };
             }
             let q = r.query_pairs();
             Resp::redirect(
@@ -566,10 +578,7 @@ fn issuer_route(st: &Arc<Mutex<IssuerState>>, r: &Req) -> Resp {
         ("POST", "/token") => {
             let form = r.form();
             match form.get("grant_type").map(String::as_str) {
-                Some("authorization_code") => {
-                    let body = issue(&mut s);
-                    Resp::json(200, body)
-                }
+                Some("authorization_code") => token_answer(&mut s),
                 Some("refresh_token") => {
                     let delay = s.refresh_delay;
                     if s.refresh_status != 200
@@ -584,13 +593,28 @@ fn issuer_route(st: &Arc<Mutex<IssuerState>>, r: &Req) -> Resp {
                         return Resp::json(status, json!({"error": "invalid_grant"}))
                             .delayed(delay);
                     }
-                    let body = issue(&mut s);
-                    Resp::json(200, body).delayed(delay)
+                    token_answer(&mut s).delayed(delay)
                 }
                 _ => Resp::json(400, json!({"error": "unsupported_grant_type"})),
             }
         }
         _ => Resp::json(404, json!({"error": "not found"})),
+    }
+}
+
+/// The 200 answer of `/token`: the pair, with `expires_in` as the state says.
+fn token_answer(s: &mut IssuerState) -> Resp {
+    let raw = s.expires_in_raw.clone();
+    let mut body = issue(s);
+    match raw {
+        None => Resp::json(200, body),
+        Some(raw) => {
+            body.as_object_mut().unwrap().remove("expires_in");
+            let mut text = body.to_string();
+            text.pop(); // the closing brace
+            text.push_str(&format!(",\"expires_in\":{raw}}}"));
+            Resp::bytes(200, text.into_bytes())
+        }
     }
 }
 

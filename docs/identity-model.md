@@ -471,6 +471,12 @@ There is no age check, because there is no expiry.
   (M_UNKNOWN)`); a 2xx body that is not the expected JSON says so without
   quoting it. Every body is read under a 256 KiB cap: one that declares more is
   refused before it is read, and one that does not is cut off while streaming.
+  Values the server wrote (the discovery `issuer`, the `jwks_uri`, a JWK's `use`,
+  `key_ops`, `alg`, `kty`, `crv`) are not quoted either: an error names the
+  member that failed.
+- `fetch_and_verify_did` follows up to 3 redirects for its profile read (the
+  proof is pinned to the issuer, so the host that answered adds no trust);
+  discovery and the key set follow none.
 
 ### How the two sides are kept compatible
 

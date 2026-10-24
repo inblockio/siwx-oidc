@@ -264,13 +264,57 @@ fn build_device_flow_scope() -> String {
 // Token response
 // ---------------------------------------------------------------------------
 
+/// What an access token is assumed to live, in seconds, when its answer names no
+/// usable `expires_in` (no field, `null`, a string, a boolean, an array, an
+/// object).
+pub const TOKEN_LIFETIME_DEFAULT_SECS: u64 = 60;
+/// The least a token is assumed to live, in seconds, whatever `expires_in` says
+/// (zero, negative or a fraction of a second would have a caller sign in again
+/// on every call).
+pub const TOKEN_LIFETIME_MIN_SECS: u64 = 10;
+/// The most a token is trusted to live, in seconds (24 hours), whatever
+/// `expires_in` says: a server that names a year is renewed daily all the same.
+pub const TOKEN_LIFETIME_MAX_SECS: u64 = 24 * 60 * 60;
+
+/// The lifetime a token answer's `expires_in` (JSON text, if the field is there)
+/// stands for: a number is cut to whole seconds and held between
+/// [`TOKEN_LIFETIME_MIN_SECS`] and [`TOKEN_LIFETIME_MAX_SECS`], and anything
+/// else is [`TOKEN_LIFETIME_DEFAULT_SECS`].
+///
+/// Read from the raw text, because serde would refuse what a server may well
+/// send (`3600.5`, `1e20`, a count above `u64`, `1e999`), and the answer that
+/// carries it also carries the new token pair.
+fn token_lifetime_secs(expires_in: Option<&serde_json::value::RawValue>) -> u64 {
+    let Some(raw) = expires_in else {
+        return TOKEN_LIFETIME_DEFAULT_SECS;
+    };
+    let text = raw.get().trim();
+    // JSON text is a number exactly when it starts with `-` or a digit.
+    if !(text.starts_with('-') || text.starts_with(|c: char| c.is_ascii_digit())) {
+        return TOKEN_LIFETIME_DEFAULT_SECS;
+    }
+    match text.parse::<f64>() {
+        // `as` saturates: a count above `u64` or infinity is the maximum, a
+        // negative number is zero.
+        Ok(seconds) => (seconds as u64).clamp(TOKEN_LIFETIME_MIN_SECS, TOKEN_LIFETIME_MAX_SECS),
+        Err(_) => TOKEN_LIFETIME_DEFAULT_SECS,
+    }
+}
+
 /// Tokens returned by a successful headless authentication.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AuthTokens {
     pub access_token: String,
     pub token_type: String,
     pub id_token: Option<String>,
-    /// Token lifetime in seconds (from the server's `expires_in` field).
+    /// Token lifetime in seconds, from the server's `expires_in` field and
+    /// always within [`TOKEN_LIFETIME_MIN_SECS`] and [`TOKEN_LIFETIME_MAX_SECS`]:
+    /// a number is read however it is spelled (`3600.5`, `1e20`, above `u64`) and
+    /// bounded, anything else (no field, `null`, a string, ...) is
+    /// [`TOKEN_LIFETIME_DEFAULT_SECS`]. A token answer is never refused for its
+    /// `expires_in`, since the refresh token that earned it is already spent.
+    /// The flows in this crate always set it; it is an `Option` for callers that
+    /// build the struct themselves.
     pub expires_in: Option<u64>,
     /// Refresh token for obtaining new access tokens without re-authentication.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -303,8 +347,15 @@ struct TokenResponseRaw {
     access_token: String,
     token_type: String,
     id_token: Option<String>,
-    expires_in: Option<u64>,
+    /// Kept as text: see [`token_lifetime_secs`].
+    expires_in: Option<Box<serde_json::value::RawValue>>,
     refresh_token: Option<String>,
+}
+
+impl TokenResponseRaw {
+    fn lifetime_secs(&self) -> u64 {
+        token_lifetime_secs(self.expires_in.as_deref())
+    }
 }
 
 #[derive(Deserialize)]
@@ -478,62 +529,66 @@ fn flow_client() -> Result<reqwest::Client> {
 ///   erased). Final: stop, and report it once.
 /// - [`AuthError::TemporarilyUnavailable`]: the homeserver could not be asked or
 ///   could not set up the device. Transient: retry as after an outage.
-/// - [`AuthError::SignInRefused`]: any other `error` code, as the server sent it.
+/// - [`AuthError::SignInRefused`]: any other `error` code.
 /// - [`AuthError::UnknownClient`]: the one that is not a `/sign_in` redirect. The
 ///   server does not know the client id, which it answers at `/authorize` with a
-///   401 (no OAuth `error` code: the body is plain text). A dynamic client lapses
-///   after 30 days without a use. Register a client again and keep the new id;
-///   retrying changes nothing.
+///   401 that carries no `WWW-Authenticate` header (no OAuth `error` code: the
+///   body is plain text). A dynamic client lapses after 30 days without a use.
+///   Register a client again and keep the new id; retrying changes nothing.
+/// - [`AuthError::Unauthorized`]: a 401 at `/authorize` *with* a
+///   `WWW-Authenticate` challenge. That is not the server's own answer for an
+///   unregistered client but something in front of it (a proxy's or a gateway's
+///   auth wall) asking for credentials of its own. Registering again does not
+///   get past it; the deployment's access has to be fixed.
+///
+/// A refusal carries the `error` code and nothing else the server wrote: the
+/// `error_description` of the redirect is free text, so it is in no `Display` or
+/// `Debug` of the error (and not in the type), and a code outside the short
+/// fixed charset of the OAuth vocabulary is reported as `unrecognised_error`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AuthError {
     /// `invalid_scope`: the device id the scope proposes is refused.
-    DeviceRefused { description: Option<String> },
+    DeviceRefused,
     /// `access_denied`: the account is deactivated or erased.
-    AccessDenied { description: Option<String> },
+    AccessDenied,
     /// `temporarily_unavailable`: no grant was issued; try again later.
-    TemporarilyUnavailable { description: Option<String> },
-    /// `/authorize` answered 401: the server does not know the client id.
-    /// [`AuthError::error_code`] is `invalid_client`, the code RFC 6749 names for
-    /// it; the server sent none.
+    TemporarilyUnavailable,
+    /// `/authorize` answered 401 without a `WWW-Authenticate` challenge: the
+    /// server does not know the client id. [`AuthError::error_code`] is
+    /// `invalid_client`, the code RFC 6749 names for it; the server sent none.
     UnknownClient,
+    /// `/authorize` answered 401 with a `WWW-Authenticate` challenge: something
+    /// in front of the server wants credentials first. Not an unknown client.
+    Unauthorized,
     /// Any other `error` code at `/sign_in`.
-    SignInRefused {
-        error: String,
-        description: Option<String>,
-    },
+    SignInRefused { error: String },
 }
 
+/// The `error` code reported when the server's is not a short OAuth/Matrix token.
+const UNRECOGNISED_ERROR: &str = "unrecognised_error";
+
 impl AuthError {
-    fn from_refusal(error: String, description: Option<String>) -> Self {
+    fn from_refusal(error: String) -> Self {
         match error.as_str() {
-            "invalid_scope" => AuthError::DeviceRefused { description },
-            "access_denied" => AuthError::AccessDenied { description },
-            "temporarily_unavailable" => AuthError::TemporarilyUnavailable { description },
-            _ => AuthError::SignInRefused { error, description },
+            "invalid_scope" => AuthError::DeviceRefused,
+            "access_denied" => AuthError::AccessDenied,
+            "temporarily_unavailable" => AuthError::TemporarilyUnavailable,
+            _ => AuthError::SignInRefused { error },
         }
     }
 
     /// The `error` code the server sent (for [`AuthError::UnknownClient`], which
-    /// came with none, `invalid_client`).
+    /// came with none, `invalid_client`; for [`AuthError::Unauthorized`], which
+    /// is not the server's, `unauthorized`).
     pub fn error_code(&self) -> &str {
         match self {
             AuthError::UnknownClient => "invalid_client",
-            AuthError::DeviceRefused { .. } => "invalid_scope",
-            AuthError::AccessDenied { .. } => "access_denied",
-            AuthError::TemporarilyUnavailable { .. } => "temporarily_unavailable",
-            AuthError::SignInRefused { error, .. } => error,
-        }
-    }
-
-    /// The `error_description` the server sent, if any.
-    pub fn description(&self) -> Option<&str> {
-        match self {
-            AuthError::UnknownClient => None,
-            AuthError::DeviceRefused { description }
-            | AuthError::AccessDenied { description }
-            | AuthError::TemporarilyUnavailable { description }
-            | AuthError::SignInRefused { description, .. } => description.as_deref(),
+            AuthError::Unauthorized => "unauthorized",
+            AuthError::DeviceRefused => "invalid_scope",
+            AuthError::AccessDenied => "access_denied",
+            AuthError::TemporarilyUnavailable => "temporarily_unavailable",
+            AuthError::SignInRefused { error } => error,
         }
     }
 
@@ -544,31 +599,33 @@ impl AuthError {
 
     /// Whether this is [`AuthError::DeviceRefused`].
     pub fn is_device_refused(&self) -> bool {
-        matches!(self, AuthError::DeviceRefused { .. })
+        matches!(self, AuthError::DeviceRefused)
     }
 
     /// Whether this is [`AuthError::TemporarilyUnavailable`], the one refusal to
     /// retry unchanged.
     pub fn is_transient(&self) -> bool {
-        matches!(self, AuthError::TemporarilyUnavailable { .. })
+        matches!(self, AuthError::TemporarilyUnavailable)
     }
 }
 
 impl std::fmt::Display for AuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let AuthError::UnknownClient = self {
+        match self {
             // The status line is the one this error replaced, so a consumer that
             // matched the text keeps working until it matches the type.
-            return write!(
+            AuthError::UnknownClient => write!(
                 f,
                 "/authorize returned 401 Unauthorized instead of 303: the client id is not \
                  registered at the server"
-            );
-        }
-        write!(f, "/sign_in refused the request: {}", self.error_code())?;
-        match self.description() {
-            Some(description) => write!(f, ": {description}"),
-            None => Ok(()),
+            ),
+            AuthError::Unauthorized => write!(
+                f,
+                "/authorize returned 401 Unauthorized instead of 303, with a WWW-Authenticate \
+                 challenge: something in front of the server asks for credentials first, which \
+                 is not the server's answer for an unregistered client"
+            ),
+            _ => write!(f, "/sign_in refused the request: {}", self.error_code()),
         }
     }
 }
@@ -663,27 +720,29 @@ fn not_the_redirect(endpoint: &str, status: StatusCode, code: Option<&str>) -> a
     }
 }
 
-/// What the server says when it refuses the authorization request.
+/// What the server says when it refuses the authorization request: the `error`
+/// code, or `None` when `location` is no refusal.
 ///
 /// `/authorize` refuses a request it can still answer, an unsupported scope for
 /// one, with a 303 to the redirect URI whose query carries `error` and
 /// `error_description`. That redirect sets no session cookie, so a flow that read
 /// the cookie first would report a missing cookie and hide the reason. `/sign_in`
 /// refuses the same way when siwx-oidc runs `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS`
-/// (see [`AuthError`]). The `error` and the `error_description`, or `None` when
-/// `location` is no refusal.
-fn authorize_refusal(base: &Url, location: &str) -> Option<(String, Option<String>)> {
+/// (see [`AuthError`]).
+///
+/// Only the code is kept, and only when it is a short token of the OAuth
+/// vocabulary ([`directory::short_code`]; otherwise `unrecognised_error`): the
+/// `error_description` is text the server (or whatever answers in its place)
+/// wrote, and it is read by no one.
+fn authorize_refusal(base: &Url, location: &str) -> Option<String> {
     let redirect = base.join(location).ok()?;
-    let mut error = None;
-    let mut description = None;
-    for (name, value) in redirect.query_pairs() {
-        match name.as_ref() {
-            "error" => error = Some(value.into_owned()),
-            "error_description" => description = Some(value.into_owned()),
-            _ => {}
-        }
-    }
-    Some((error?, description))
+    let error = redirect
+        .query_pairs()
+        .fold(None, |error, (name, value)| match name.as_ref() {
+            "error" => Some(value.into_owned()),
+            _ => error,
+        })?;
+    Some(directory::short_code(&error).unwrap_or_else(|| UNRECOGNISED_ERROR.to_string()))
 }
 
 /// The authorization code flow every code-flow entry point runs: PKCE,
@@ -732,13 +791,21 @@ async fn code_flow(
         ])
         .send()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("GET /authorize failed")?;
 
     if resp.status() != StatusCode::SEE_OTHER {
         // The server answers an unregistered client id with a 401 here (and
-        // answers 401 at `/authorize` for nothing else).
+        // answers 401 at `/authorize` for nothing else), without a
+        // `WWW-Authenticate` header (`CustomError::Unauthorized` in the server).
         if resp.status() == StatusCode::UNAUTHORIZED {
-            return Err(AuthError::UnknownClient.into());
+            // Its own answer carries no challenge; a proxy's auth wall does.
+            return Err(if resp.headers().contains_key(header::WWW_AUTHENTICATE) {
+                AuthError::Unauthorized
+            } else {
+                AuthError::UnknownClient
+            }
+            .into());
         }
         if resp.status().is_success() {
             return Err(not_the_redirect("/authorize", resp.status(), None));
@@ -755,13 +822,8 @@ async fn code_flow(
         .headers()
         .get(header::LOCATION)
         .and_then(|v| v.to_str().ok());
-    if let Some((error, description)) =
-        location.and_then(|location| authorize_refusal(&base, location))
-    {
-        return Err(match description {
-            Some(description) => anyhow!("/authorize refused the request: {error}: {description}"),
-            None => anyhow!("/authorize refused the request: {error}"),
-        });
+    if let Some(error) = location.and_then(|location| authorize_refusal(&base, location)) {
+        return Err(anyhow!("/authorize refused the request: {error}"));
     }
 
     let session_cookie = resp
@@ -818,6 +880,7 @@ async fn code_flow(
         .header(header::COOKIE, &cookie_header)
         .send()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("GET /sign_in failed")?;
 
     if resp.status() != StatusCode::SEE_OTHER {
@@ -839,8 +902,8 @@ async fn code_flow(
         .ok_or_else(|| anyhow!("/sign_in response missing Location header"))?;
 
     // A refusal is the authorization error response, typed for the caller.
-    if let Some((error, description)) = authorize_refusal(&base, code_location) {
-        return Err(AuthError::from_refusal(error, description).into());
+    if let Some(error) = authorize_refusal(&base, code_location) {
+        return Err(AuthError::from_refusal(error).into());
     }
 
     let code_url = Url::parse(code_location)
@@ -867,6 +930,7 @@ async fn code_flow(
         ])
         .send()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("POST /token failed")?;
 
     if !resp.status().is_success() {
@@ -877,10 +941,10 @@ async fn code_flow(
         .await
         .context("/token JSON parse failed")?;
     Ok(AuthTokens {
+        expires_in: Some(raw.lifetime_secs()),
         access_token: raw.access_token,
         token_type: raw.token_type,
         id_token: raw.id_token,
-        expires_in: raw.expires_in,
         refresh_token: raw.refresh_token,
         did,
     })
@@ -920,6 +984,7 @@ pub async fn refresh(
         ])
         .send()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("POST /token (refresh) failed")?;
 
     if !resp.status().is_success() {
@@ -930,10 +995,10 @@ pub async fn refresh(
         .await
         .context("/token refresh JSON parse failed")?;
     Ok(AuthTokens {
+        expires_in: Some(raw.lifetime_secs()),
         access_token: raw.access_token,
         token_type: raw.token_type,
         id_token: raw.id_token,
-        expires_in: raw.expires_in,
         refresh_token: raw.refresh_token,
         did: did.to_string(),
     })
@@ -984,6 +1049,7 @@ pub async fn authenticate_device_flow(server_url: &str, client_id: &str) -> Resu
         ])
         .send()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("POST /device_authorization failed")?;
 
     if !resp.status().is_success() {
@@ -1035,6 +1101,7 @@ pub async fn authenticate_device_flow(server_url: &str, client_id: &str) -> Resu
             ])
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("POST /token (device poll) failed")?;
 
         if resp.status().is_success() {
@@ -1049,10 +1116,10 @@ pub async fn authenticate_device_flow(server_url: &str, client_id: &str) -> Resu
                 .unwrap_or_default();
             eprintln!("Approved!");
             return Ok(AuthTokens {
+                expires_in: Some(raw.lifetime_secs()),
                 access_token: raw.access_token,
                 token_type: raw.token_type,
                 id_token: raw.id_token,
-                expires_in: raw.expires_in,
                 refresh_token: raw.refresh_token,
                 did,
             });
@@ -1479,17 +1546,16 @@ mod tests {
 
     /// A server that refuses the scope answers `/authorize` with a 303 to the
     /// redirect URI, `error` and `error_description` in its query and no session
-    /// cookie. The error carries what the server said, through both entry points
-    /// that take a scope.
+    /// cookie. The error carries the code the server sent and not its
+    /// description, through both entry points that take a scope.
     #[tokio::test]
-    async fn a_refused_scope_is_reported_with_the_servers_reason() {
+    async fn a_refused_scope_is_reported_with_the_servers_code() {
         let key = SiwxKey::generate_ed25519();
         let refusal = format!(
             "location: {REDIRECT_URI}?state=headless&error=invalid_scope&error_description={}",
             urlencoding::encode("the openid scope is required")
         );
-        let expected =
-            "/authorize refused the request: invalid_scope: the openid scope is required";
+        let expected = "/authorize refused the request: invalid_scope";
 
         let (base, served) = serve_in_order(vec![raw_response("303 See Other", &[&refusal])]);
         let error = authenticate_with_scope(&base, "client", REDIRECT_URI, &key, "io.inblock.mail")
@@ -1517,7 +1583,7 @@ mod tests {
         served.join().unwrap();
     }
 
-    /// A refusal without a description still names its error, and a redirect
+    /// A refusal without a description names its error as well, and a redirect
     /// with an `error` but also a cookie is a refusal all the same.
     #[tokio::test]
     async fn a_refusal_without_a_description_still_names_the_error() {
@@ -1597,15 +1663,13 @@ mod tests {
         let error = sign_in_answering(&sign_in_refusal("invalid_scope", description)).await;
         assert_eq!(
             error.downcast_ref::<AuthError>(),
-            Some(&AuthError::DeviceRefused {
-                description: Some(description.to_string())
-            })
+            Some(&AuthError::DeviceRefused)
         );
         assert!(is_device_refused(&error));
         assert!(!is_transient(&error), "a refused id is not retried as is");
         assert_eq!(
             format!("{error:#}"),
-            format!("/sign_in refused the request: invalid_scope: {description}")
+            "/sign_in refused the request: invalid_scope"
         );
     }
 
@@ -1616,12 +1680,7 @@ mod tests {
         let typed = error
             .downcast_ref::<AuthError>()
             .expect("access_denied is typed");
-        assert_eq!(
-            typed,
-            &AuthError::AccessDenied {
-                description: Some(description.to_string())
-            }
-        );
+        assert_eq!(typed, &AuthError::AccessDenied);
         assert!(!typed.is_device_refused());
         assert!(
             !typed.is_transient(),
@@ -1638,7 +1697,7 @@ mod tests {
         .await;
         assert!(matches!(
             error.downcast_ref::<AuthError>(),
-            Some(AuthError::TemporarilyUnavailable { .. })
+            Some(AuthError::TemporarilyUnavailable)
         ));
         assert!(is_transient(&error), "retried like an outage");
         assert!(!is_device_refused(&error));
@@ -1646,14 +1705,15 @@ mod tests {
 
     #[tokio::test]
     async fn auth_is_device_refused_matches_only_that_error() {
-        let device_refused = AuthError::DeviceRefused { description: None };
+        let device_refused = AuthError::DeviceRefused;
         assert!(device_refused.is_device_refused());
         for other in [
-            AuthError::AccessDenied { description: None },
-            AuthError::TemporarilyUnavailable { description: None },
+            AuthError::AccessDenied,
+            AuthError::TemporarilyUnavailable,
+            AuthError::Unauthorized,
+            AuthError::UnknownClient,
             AuthError::SignInRefused {
                 error: "server_error".to_string(),
-                description: None,
             },
         ] {
             assert!(!other.is_device_refused(), "{other:?}");
@@ -1666,7 +1726,6 @@ mod tests {
             error.downcast_ref::<AuthError>(),
             Some(&AuthError::SignInRefused {
                 error: "server_error".to_string(),
-                description: Some("boom".to_string())
             })
         );
         assert!(!is_device_refused(&error));
@@ -1861,7 +1920,7 @@ mod tests {
         let wrong_shape = "JSON parse failed: the body is JSON of another shape than expected";
         for body in [
             format!(r#""{MARKER}""#),
-            format!(r#"{{"access_token":"a","token_type":"b","expires_in":"{MARKER}"}}"#),
+            format!(r#"{{"access_token":{{"x":"{MARKER}"}},"token_type":"b"}}"#),
         ] {
             let error = token_answering(raw_response_with_body("200 OK", &json, &body)).await;
             assert_body_free(&error);
@@ -1940,7 +1999,6 @@ mod tests {
             assert!(!is_device_refused(&error) && !is_transient(&error));
             let unknown = error.downcast_ref::<AuthError>().unwrap();
             assert_eq!(unknown.error_code(), "invalid_client");
-            assert_eq!(unknown.description(), None);
             assert!(unknown.is_unknown_client());
             // The text a consumer matched before the type existed still reads
             // the same.
@@ -1978,5 +2036,273 @@ mod tests {
             format!("{error:#}"),
             format!("no 'code' in /sign_in redirect: {location}")
         );
+    }
+
+    // ---- Round 3 of the review: URLs, descriptions, lifetimes, challenges ----
+
+    /// A base URL nothing listens on.
+    fn dead_base() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    }
+
+    /// What a request URL of the code flow would put into a message: the query
+    /// (client id, redirect URI, scope, challenge, state) or any URL at all.
+    fn assert_no_request_url(error: &anyhow::Error) {
+        let text = printed(error);
+        for needle in [
+            "client_id=",
+            "redirect_uri=",
+            "code_challenge",
+            "state=headless",
+            "http://",
+        ] {
+            assert!(!text.contains(needle), "`{needle}` in: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_names_the_endpoint_and_never_the_request_url() {
+        let key = SiwxKey::generate_ed25519();
+
+        // /authorize
+        let error = authenticate_with_scope(&dead_base(), "client", REDIRECT_URI, &key, "openid")
+            .await
+            .expect_err("nothing listens");
+        assert_no_request_url(&error);
+        assert!(
+            format!("{error:#}").starts_with("GET /authorize failed"),
+            "{error:#}"
+        );
+
+        // /sign_in: the server answers /authorize and is gone afterwards.
+        let authorize_redirect = format!(
+            "location: /login?nonce=n1&state=headless&client_id=client&redirect_uri={}",
+            urlencoding::encode(REDIRECT_URI)
+        );
+        let (base, served) = serve_in_order(vec![raw_response(
+            "303 See Other",
+            &[&authorize_redirect, "set-cookie: session=abc; Path=/"],
+        )]);
+        let error = authenticate_with_scope(&base, "client", REDIRECT_URI, &key, "openid")
+            .await
+            .expect_err("no /sign_in");
+        served.join().unwrap();
+        assert_no_request_url(&error);
+        assert!(
+            format!("{error:#}").starts_with("GET /sign_in failed"),
+            "{error:#}"
+        );
+
+        // /token
+        let sign_in_redirect = format!("location: {REDIRECT_URI}?code=abc&state=headless");
+        let (base, served) = serve_in_order(vec![
+            raw_response(
+                "303 See Other",
+                &[&authorize_redirect, "set-cookie: session=abc; Path=/"],
+            ),
+            raw_response("303 See Other", &[&sign_in_redirect]),
+        ]);
+        let error = authenticate_with_scope(&base, "client", REDIRECT_URI, &key, "openid")
+            .await
+            .expect_err("no /token");
+        served.join().unwrap();
+        assert_no_request_url(&error);
+        assert!(
+            format!("{error:#}").starts_with("POST /token failed"),
+            "{error:#}"
+        );
+
+        // The refresh and the device flow.
+        let error = refresh(&dead_base(), "client", "rt-1", "did:key:zFixture")
+            .await
+            .expect_err("nothing listens");
+        assert_no_request_url(&error);
+        let error = authenticate_device_flow(&dead_base(), "client")
+            .await
+            .expect_err("nothing listens");
+        assert_no_request_url(&error);
+    }
+
+    #[tokio::test]
+    async fn a_body_read_error_names_no_url_either() {
+        // The head promises 100 bytes and the connection ends after three.
+        let truncated =
+            "HTTP/1.1 200 OK\r\ncontent-length: 100\r\ncontent-type: application/json\r\n\
+                         connection: close\r\n\r\nabc"
+                .to_string();
+        let (base, served) = serve_in_order(vec![truncated]);
+        let error = refresh(&base, "client", "rt-1", "did:key:zFixture")
+            .await
+            .expect_err("the body ends early");
+        served.join().unwrap();
+        assert_no_request_url(&error);
+    }
+
+    #[tokio::test]
+    async fn a_refusals_description_is_in_no_error_text() {
+        for code in [
+            "invalid_scope",
+            "access_denied",
+            "temporarily_unavailable",
+            "server_error",
+        ] {
+            let error = sign_in_answering(&sign_in_refusal(code, MARKER)).await;
+            assert_body_free(&error);
+            let typed = error.downcast_ref::<AuthError>().expect("typed");
+            assert_eq!(typed.error_code(), code);
+            assert_eq!(
+                format!("{error:#}"),
+                format!("/sign_in refused the request: {code}")
+            );
+        }
+
+        // The `error` is held to the short fixed charset as well: a value
+        // outside it is not repeated.
+        let hostile = urlencoding::encode(&format!("{MARKER} <b>x</b>")).into_owned();
+        let location = format!("{REDIRECT_URI}?error={hostile}&state=headless");
+        let error = sign_in_answering(&location).await;
+        assert_body_free(&error);
+        assert!(error.downcast_ref::<AuthError>().is_some(), "{error:#}");
+
+        // At /authorize.
+        let key = SiwxKey::generate_ed25519();
+        let refusal = format!(
+            "location: {REDIRECT_URI}?state=headless&error=invalid_scope&error_description={}",
+            urlencoding::encode(MARKER)
+        );
+        let (base, served) = serve_in_order(vec![raw_response("303 See Other", &[&refusal])]);
+        let error = authenticate_with_scope(&base, "client", REDIRECT_URI, &key, "io.inblock.mail")
+            .await
+            .expect_err("refused");
+        served.join().unwrap();
+        assert_body_free(&error);
+        assert_eq!(
+            format!("{error:#}"),
+            "/authorize refused the request: invalid_scope"
+        );
+        let hostile = format!("location: {REDIRECT_URI}?state=headless&error={hostile}");
+        let (base, served) = serve_in_order(vec![raw_response("303 See Other", &[&hostile])]);
+        let error = authenticate_with_scope(&base, "client", REDIRECT_URI, &key, "io.inblock.mail")
+            .await
+            .expect_err("refused");
+        served.join().unwrap();
+        assert_body_free(&error);
+    }
+
+    /// A token answer with `expires_in` spelled as `raw` (JSON text), or none.
+    async fn tokens_with_expires_in(raw: Option<&str>) -> AuthTokens {
+        let body = match raw {
+            Some(raw) => format!(
+                r#"{{"access_token":"new-a","token_type":"Bearer","refresh_token":"new-r","expires_in":{raw}}}"#
+            ),
+            None => r#"{"access_token":"new-a","token_type":"Bearer","refresh_token":"new-r"}"#
+                .to_string(),
+        };
+        let (base, served) = serve_in_order(vec![raw_response_with_body(
+            "200 OK",
+            &["content-type: application/json"],
+            &body,
+        )]);
+        let tokens = refresh(&base, "client", "old-r", "did:key:zFixture")
+            .await
+            .unwrap_or_else(|e| panic!("expires_in {raw:?} lost the pair: {e:#}"));
+        served.join().unwrap();
+        assert_eq!(tokens.access_token, "new-a");
+        assert_eq!(tokens.refresh_token.as_deref(), Some("new-r"));
+        tokens
+    }
+
+    #[tokio::test]
+    async fn any_expires_in_keeps_the_new_pair_with_a_bounded_lifetime() {
+        const DAY: u64 = 24 * 60 * 60;
+        for (raw, lifetime) in [
+            (Some("300"), 300),
+            (Some("3600.5"), 3600),
+            (Some("1e20"), DAY),
+            (Some("1e999"), DAY),
+            (Some("18446744073709551615"), DAY),
+            (Some("18446744073709551616"), DAY),
+            (Some("99999999999999999999999999"), DAY),
+            (Some("-5"), 10),
+            (Some("-1e999"), 10),
+            (Some("0"), 10),
+            (Some("3"), 10),
+            (Some("0.5"), 10),
+            // No number: the documented default.
+            (Some("\"3600\""), 60),
+            (Some("\"soon\""), 60),
+            (Some("null"), 60),
+            (Some("true"), 60),
+            (Some("[1]"), 60),
+            (Some(r#"{"a":1}"#), 60),
+            (None, 60),
+        ] {
+            let tokens = tokens_with_expires_in(raw).await;
+            assert_eq!(tokens.expires_in, Some(lifetime), "expires_in {raw:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_code_flow_and_the_device_flow_read_expires_in_the_same_way() {
+        let key = SiwxKey::generate_ed25519();
+        let tokens = {
+            let body = r#"{"access_token":"a","token_type":"Bearer","expires_in":1e20}"#;
+            let authorize_redirect = format!(
+                "location: /login?nonce=n1&state=headless&client_id=client&redirect_uri={}",
+                urlencoding::encode(REDIRECT_URI)
+            );
+            let sign_in_redirect = format!("location: {REDIRECT_URI}?code=abc&state=headless");
+            let (base, served) = serve_in_order(vec![
+                raw_response(
+                    "303 See Other",
+                    &[&authorize_redirect, "set-cookie: session=abc; Path=/"],
+                ),
+                raw_response("303 See Other", &[&sign_in_redirect]),
+                raw_response_with_body("200 OK", &["content-type: application/json"], body),
+            ]);
+            let tokens = authenticate_with_scope(&base, "client", REDIRECT_URI, &key, "openid")
+                .await
+                .expect("the pair is kept");
+            served.join().unwrap();
+            tokens
+        };
+        assert_eq!(tokens.access_token, "a");
+        assert_eq!(tokens.expires_in, Some(24 * 60 * 60));
+    }
+
+    /// A proxy's auth wall is a 401 with a challenge; the server's own answer
+    /// for an unregistered client has none. Only the latter is a client that
+    /// registering again would fix.
+    #[tokio::test]
+    async fn a_401_with_a_challenge_at_authorize_is_not_an_unknown_client() {
+        let key = SiwxKey::generate_ed25519();
+        for challenge in [r#"Basic realm="corp""#, "Bearer", r#"Negotiate"#] {
+            let header = format!("www-authenticate: {challenge}");
+            let (base, served) = serve_in_order(vec![raw_response_with_body(
+                "401 Unauthorized",
+                &["content-type: text/html", &header],
+                "<html>please sign in</html>",
+            )]);
+            let error = authenticate_with_scope(&base, "client", REDIRECT_URI, &key, "openid")
+                .await
+                .expect_err("refused by the wall");
+            served.join().unwrap();
+            assert!(!is_unknown_client(&error), "{challenge}: {error:#}");
+            assert_eq!(
+                error.downcast_ref::<AuthError>(),
+                Some(&AuthError::Unauthorized),
+                "{challenge}: {error:#}"
+            );
+            assert_eq!(
+                error.downcast_ref::<AuthError>().unwrap().error_code(),
+                "unauthorized"
+            );
+            assert!(!is_transient(&error) && !is_device_refused(&error));
+            assert!(
+                format!("{error:#}").contains("401"),
+                "the status is named: {error:#}"
+            );
+        }
     }
 }

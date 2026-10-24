@@ -50,19 +50,23 @@ same holds for the answers the client accepts: one that is not the expected JSON
 is reported as such (`/token JSON parse failed: the body is JSON of another shape
 than expected`), and a body over 256 KiB is refused unread. The DID verifier
 (`fetch_and_verify_did`, `verify_did_assertion`) reports a failed fetch the same
-way, for example `GET <url> returned 500 Internal Server Error (M_UNKNOWN)`.
+way, for example `GET <url> returned 500 Internal Server Error (M_UNKNOWN)`; a
+value the server wrote (the discovery `issuer`, the `jwks_uri`, a JWK's `use`,
+`key_ops`, `alg`, `kty` or `crv`) is named by its member, never repeated, and a
+transport error does not print the request URL.
 
 | Error printed by the client | Cause | Fix |
 |---|---|---|
 | `/authorize returned 401 Unauthorized instead of 303: the client id is not registered at the server` (`AuthError::UnknownClient`) | the `client_id` is not registered, or a dynamic client lapsed after 30 days without a use | register a client ([agents.md](agents.md#prerequisites)); check with `siwx_oidc_auth::is_unknown_client` |
 | `/authorize response missing session cookie` | the `redirect_uri` is not registered for that client; the server answered with a 303 to `/error?message=unregistered_redirect_uri`, which sets no session cookie | pass exactly a registered redirect URI (query strings are ignored in the comparison) |
-| `/authorize refused the request: invalid_scope: …` | the scope passed to `authenticate_with_scope` asks for nothing the server will grant this client; the server answered with a 303 to the redirect URI carrying `error` and `error_description`, and the client reports both | read the description; ask for a scope the client may have, or change the client's allowed scopes |
+| `/authorize returned 401 Unauthorized instead of 303, with a WWW-Authenticate challenge …` (`AuthError::Unauthorized`) | something in front of the server (a proxy or gateway) answered with its own auth wall; the server's own answer for an unknown client has no `WWW-Authenticate` | fix the deployment's access; registering a client again does not help |
+| `/authorize refused the request: invalid_scope` | the scope passed to `authenticate_with_scope` asks for nothing the server will grant this client; the server answered with a 303 to the redirect URI carrying `error` and `error_description`, and the client reports the code only | ask for a scope the client may have, or change the client's allowed scopes; the description is in the server log |
 | `/sign_in returned 400 Bad Request instead of 303` | the request was refused, for example because `supported_did_methods` does not contain `"key"` | the server log has the reason (`bad_request`); add `"key"` if that is it (it is in the default) |
 | `/sign_in returned 401 Unauthorized instead of 303` | the signature does not match the DID in the message, or the account was deactivated | the server log has the reason (`unauthorized`). Signature: check the key file, do not edit the generated message. Deactivated: such an account cannot sign in |
 | `/sign_in returned 503 Service Unavailable instead of 303` | the deactivation check could not reach Synapse | check Synapse and the shared secret; retry |
-| `/sign_in refused the request: invalid_scope: …` (`AuthError::DeviceRefused`) | the server runs `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` and the device id passed to `authenticate_with_device` was signed out (deleted); it is never recreated | forget the id and sign in with a new one; check with `siwx_oidc_auth::is_device_refused` |
-| `/sign_in refused the request: access_denied: …` (`AuthError::AccessDenied`) | the same setting, for a deactivated or erased account (the 401 above) | a deactivated account cannot sign in; stop, do not retry |
-| `/sign_in refused the request: temporarily_unavailable: …` (`AuthError::TemporarilyUnavailable`) | the same setting: Synapse could not be asked about the account, or could not set up the device (the 503 above); no tokens were issued | retry later, as after an outage (`siwx_oidc_auth::is_transient`) |
+| `/sign_in refused the request: invalid_scope` (`AuthError::DeviceRefused`) | the server runs `SIWXOIDC_REFUSE_DELETED_DEVICE_IDS` and the device id passed to `authenticate_with_device` was signed out (deleted); it is never recreated | forget the id and sign in with a new one; check with `siwx_oidc_auth::is_device_refused` |
+| `/sign_in refused the request: access_denied` (`AuthError::AccessDenied`) | the same setting, for a deactivated or erased account (the 401 above) | a deactivated account cannot sign in; stop, do not retry |
+| `/sign_in refused the request: temporarily_unavailable` (`AuthError::TemporarilyUnavailable`) | the same setting: Synapse could not be asked about the account, or could not set up the device (the 503 above); no tokens were issued | retry later, as after an outage (`siwx_oidc_auth::is_transient`) |
 | `/token returned 401 Unauthorized (invalid_client)` | the client was registered as a confidential client ("Secret required.") | register it with `token_endpoint_auth_method: "none"` |
 | `/token refresh returned 400 Bad Request (invalid_grant)` | the refresh names another client than the one the tokens were issued to ("client_id does not match the refresh token."), or the refresh token was already rotated (more than 60 s ago), expired, or its session was revoked | the server log has the description. Refresh with the `client_id` used at sign-in; otherwise sign in again with the key, and always store the newest refresh token |
 | `/token error: unsupported_grant_type (400 Bad Request)` with `--device-flow` | the server is not in delegated-auth mode ("MSC3861 mode" is the older name): "device_code grant requires MSC3861 mode." | the device flow needs a Synapse-backed deployment |
@@ -234,9 +238,12 @@ MAS deployment before looking anywhere else.
 - **"REPLAYED ASSERTION"**: the proof is valid but binds a different MXID. It
   was copied from another account; do not trust it.
 - **"ISSUER MISMATCH"**: the `--server` you passed serves a discovery document
-  naming a different issuer. Pass the issuer URL itself.
-- **`jwks_uri` "is on a different origin"**: the verifier fetches keys only from
-  the issuer's own origin. Serve `/jwk` from the issuer's host.
+  naming a different issuer. Pass the issuer URL itself. The error does not
+  repeat the issuer the document names (it is the server's text); read the
+  document at the URL the error gives.
+- **The `jwks_uri` "is not acceptable" ("is on a different origin")**: the
+  verifier fetches keys only from the issuer's own origin. Serve `/jwk` from the
+  issuer's host. The error does not repeat the `jwks_uri`.
 - **The field is never written**: check that `SIWXOIDC_MATRIX_SERVER_NAME` is
   set, and look for `publishing the attested DID profile field failed` or
   `attested DID field NOT asserted` in the logs. The latter means identity
