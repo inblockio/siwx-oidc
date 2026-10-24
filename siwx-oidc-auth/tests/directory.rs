@@ -3477,3 +3477,145 @@ async fn a_whoami_that_fails_is_the_searchs_error_and_is_not_kept() {
     let got = dir.search_as_user("t", "a", 5).await.unwrap();
     assert_eq!(states(&got), vec![verified(&did_of("alice"))]);
 }
+
+// ---------------------------------------------------------------------------
+// Tuning that would overflow a clock is held to a bound
+// ---------------------------------------------------------------------------
+
+/// One person of each kind, so that a search runs every cache and every bound:
+/// the asker is resolved, a local person is verified, a foreign one is read.
+fn one_of_each(w: &World) {
+    let (local, foreign) = (mxid("alice"), remote("carol"));
+    people(
+        w,
+        &[
+            (foreign.clone(), None),
+            (
+                local.clone(),
+                Some(w.issuer.field(&did_of("alice"), &local)),
+            ),
+        ],
+    );
+    w.hs.profile(&foreign, Some(json!({"did": "did:key:zCarol"})));
+    w.hs.profile(&local, Some(w.issuer.field(&did_of("alice"), &local)));
+}
+
+type Field = (&'static str, fn(&mut Tuning));
+
+/// Every duration of the tuning, once set to what "never" would be to a host.
+const DURATIONS: [Field; 14] = [
+    ("request_timeout", |t| t.request_timeout = Duration::MAX),
+    ("sign_in_timeout", |t| t.sign_in_timeout = Duration::MAX),
+    ("flow_request_timeout", |t| {
+        t.flow_request_timeout = Duration::MAX
+    }),
+    ("token_refresh_margin", |t| {
+        t.token_refresh_margin = Duration::MAX
+    }),
+    ("resolve_hit_ttl", |t| t.resolve_hit_ttl = Duration::MAX),
+    ("resolve_miss_ttl", |t| t.resolve_miss_ttl = Duration::MAX),
+    ("failed_sign_in_cooldown", |t| {
+        t.failed_sign_in_cooldown = Duration::MAX
+    }),
+    ("keys_ttl", |t| t.keys_ttl = Duration::MAX),
+    ("keys_refetch_interval", |t| {
+        t.keys_refetch_interval = Duration::MAX
+    }),
+    ("verified_ttl", |t| t.verified_ttl = Duration::MAX),
+    ("remote_profile_timeout", |t| {
+        t.remote_profile_timeout = Duration::MAX
+    }),
+    ("remote_profiles_timeout", |t| {
+        t.remote_profiles_timeout = Duration::MAX
+    }),
+    ("unconfirmed_ttl", |t| t.unconfirmed_ttl = Duration::MAX),
+    ("remote_miss_ttl", |t| t.remote_miss_ttl = Duration::MAX),
+];
+
+#[tokio::test]
+async fn no_duration_of_the_tuning_can_make_a_search_panic() {
+    for (name, set) in DURATIONS {
+        let w = World::new().await;
+        one_of_each(&w);
+        let mut tuning = Tuning::default();
+        set(&mut tuning);
+        let dir = w.directory_with(tuning.clone());
+        // The service signs in with the same tuning.
+        let session = w.session_with(tuning);
+        let expected = vec![unconfirmed("did:key:zCarol"), verified(&did_of("alice"))];
+        let got = dir
+            .search_for_asker(&session, ASKER_DID, "p", 20)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(states(&got), expected, "{name}: module transport");
+        let got = dir
+            .search_as_user("user-token-fixture", "p", 20)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(states(&got), expected, "{name}: user transport");
+    }
+}
+
+#[tokio::test]
+async fn a_lifetime_taken_as_never_is_kept_for_a_bounded_time_and_is_a_real_cache() {
+    let w = World::new().await;
+    one_of_each(&w);
+    let forever = Tuning {
+        resolve_hit_ttl: Duration::MAX,
+        keys_ttl: Duration::MAX,
+        verified_ttl: Duration::MAX,
+        unconfirmed_ttl: Duration::MAX,
+        remote_miss_ttl: Duration::MAX,
+        ..Tuning::default()
+    };
+    let dir = w.directory_with(forever);
+    for _ in 0..2 {
+        let got = dir
+            .search_for_asker(&w.session(), ASKER_DID, "p", 20)
+            .await
+            .unwrap();
+        assert_eq!(got.results.len(), 2);
+    }
+    assert_eq!(
+        w.hs.profile_reads(),
+        1,
+        "the claim was kept, not read again"
+    );
+    assert_eq!(w.issuer.mock.count("GET", "/resolve"), 1);
+    // A day on, it is all still there; a hundred years on it is not.
+    w.clock.advance(24 * 60 * MIN);
+    dir.search_for_asker(&w.session(), ASKER_DID, "p", 20)
+        .await
+        .unwrap();
+    assert_eq!(w.hs.profile_reads(), 1);
+    w.clock.advance(Duration::from_secs(2 * 365 * 24 * 3600));
+    dir.search_for_asker(&w.session(), ASKER_DID, "p", 20)
+        .await
+        .unwrap();
+    assert_eq!(w.hs.profile_reads(), 2, "no lifetime is longer than a year");
+}
+
+#[tokio::test]
+async fn the_remote_total_is_never_shorter_than_one_read() {
+    let w = World::new().await;
+    let r = remote("carol");
+    people(&w, &[(r.clone(), None)]);
+    // It answers after 300 ms. The per-read bound allows that; the total, set
+    // lower by mistake, would cut every read before it could.
+    w.hs.profile_answer(
+        &r,
+        Resp::json(200, json!({"io.inblock.did": {"did": "did:key:zCarol"}}))
+            .delayed(Duration::from_millis(300)),
+    );
+    let tuning = Tuning {
+        remote_profile_timeout: Duration::from_millis(800),
+        remote_profiles_timeout: Duration::from_millis(100),
+        ..Tuning::default()
+    };
+    let got = w
+        .directory_with(tuning)
+        .search_for_asker(&w.session(), ASKER_DID, "p", 5)
+        .await
+        .unwrap();
+    assert_eq!(states(&got), vec![unconfirmed("did:key:zCarol")]);
+}

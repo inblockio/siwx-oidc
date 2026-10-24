@@ -387,6 +387,12 @@ impl fmt::Debug for Clock {
 /// Every lifetime and size bound in one place. The defaults are the contract
 /// (plan 4.3); a service has no reason to change them, and the fields are open
 /// so a test can.
+///
+/// A client or a session made with a tuning holds it to bounds, and never
+/// panics on one: every duration is taken at most a year (so `Duration::MAX`
+/// for "never" is a year, not an overflow), and
+/// [`remote_profiles_timeout`](Self::remote_profiles_timeout) is raised to at
+/// least [`remote_profile_timeout`](Self::remote_profile_timeout).
 #[derive(Debug, Clone)]
 pub struct Tuning {
     /// Per request of the directory client (the asker lookup, the key set, the
@@ -436,6 +442,9 @@ pub struct Tuning {
     /// the [`PROFILE_READS_AT_ONCE`] places included. A read that has not ended
     /// by then is dropped and its person is `not_yet_published`, so many slow
     /// foreign servers cannot stretch a search past this.
+    ///
+    /// Raised to `remote_profile_timeout` when it is shorter: it is a total, and
+    /// a total below one read's bound would cut every read before its own bound.
     pub remote_profiles_timeout: Duration,
     /// How long a remote person's claimed DID is kept. Short, because a claim
     /// can change and nothing confirms it; it is kept apart from the verified
@@ -449,6 +458,43 @@ pub struct Tuning {
     pub max_cache_entries: usize,
     /// The most bytes of any one response body.
     pub max_body_bytes: usize,
+}
+
+/// No duration of a [`Tuning`] is taken above this. `Duration::MAX` is the usual
+/// spelling of "never", and added to an `Instant` it overflows and panics, so
+/// every duration is held to a year when a client is made: a lifetime that long
+/// is "never" for a cache, and a timeout that long is no bound a service would
+/// notice.
+const TUNING_CEILING: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+impl Tuning {
+    /// The tuning a client works with: every duration held to [`TUNING_CEILING`],
+    /// and the total for the remote reads of a search at least as long as one
+    /// read (a total below it would cut every read before its own bound).
+    fn held_to_bounds(mut self) -> Tuning {
+        for duration in [
+            &mut self.request_timeout,
+            &mut self.sign_in_timeout,
+            &mut self.flow_request_timeout,
+            &mut self.token_refresh_margin,
+            &mut self.resolve_hit_ttl,
+            &mut self.resolve_miss_ttl,
+            &mut self.failed_sign_in_cooldown,
+            &mut self.keys_ttl,
+            &mut self.keys_refetch_interval,
+            &mut self.verified_ttl,
+            &mut self.remote_profile_timeout,
+            &mut self.remote_profiles_timeout,
+            &mut self.unconfirmed_ttl,
+            &mut self.remote_miss_ttl,
+        ] {
+            *duration = (*duration).min(TUNING_CEILING);
+        }
+        self.remote_profiles_timeout = self
+            .remote_profiles_timeout
+            .max(self.remote_profile_timeout);
+        self
+    }
 }
 
 impl Default for Tuning {
@@ -870,7 +916,7 @@ impl ServiceSession {
             device_id,
             key,
             did,
-            tuning,
+            tuning: tuning.held_to_bounds(),
             clock,
             tokens: AsyncMutex::new(Tokens::default()),
             settled: AtomicU64::new(0),
@@ -1118,7 +1164,11 @@ impl<K: Hash + Eq + Clone, V: Clone> TtlCache<K, V> {
                 };
             }
         }
-        self.entries.insert(key, (value, now + ttl));
+        // A lifetime that overflows the clock keeps nothing: the safe side of a
+        // cache. (A client holds its tuning to a year, so this is a backstop.)
+        if let Some(expires) = now.checked_add(ttl) {
+            self.entries.insert(key, (value, expires));
+        }
     }
 
     fn live(&mut self, now: Instant) -> usize {
@@ -1302,6 +1352,7 @@ impl DirectoryClient {
         if server_name.is_empty() || server_name.contains(|c: char| c.is_whitespace() || c == '@') {
             return Err(invalid("server_name is not a Matrix server name"));
         }
+        let tuning = tuning.held_to_bounds();
         let http = http_client(&tuning)?;
         Ok(DirectoryClient {
             inner: Arc::new(Inner {
@@ -1761,7 +1812,10 @@ impl Inner {
             Remote(Option<ClaimedDid>),
         }
         let permits = Arc::new(Semaphore::new(PROFILE_READS_AT_ONCE));
-        let remote_deadline = tokio::time::Instant::now() + self.tuning.remote_profiles_timeout;
+        let began = tokio::time::Instant::now();
+        let remote_deadline = began
+            .checked_add(self.tuning.remote_profiles_timeout)
+            .unwrap_or(began);
         let mut reads = JoinSet::new();
         for (index, row) in rows.rows.iter().enumerate() {
             let local = self.is_local(&row.mxid);
@@ -2054,7 +2108,11 @@ impl Inner {
         fetch.last = Some((began, fetched.as_ref().err().cloned()));
         self.key_fetches.fetch_add(1, Ordering::SeqCst);
         let keys = Arc::new(fetched.map_err(DirectoryError::Unavailable)?);
-        self.caches.lock().unwrap().keys = Some((keys.clone(), self.now() + self.tuning.keys_ttl));
+        let now = self.now();
+        self.caches.lock().unwrap().keys = Some((
+            keys.clone(),
+            now.checked_add(self.tuning.keys_ttl).unwrap_or(now),
+        ));
         Ok(keys)
     }
 }
