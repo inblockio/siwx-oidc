@@ -3619,3 +3619,62 @@ async fn the_remote_total_is_never_shorter_than_one_read() {
         .unwrap();
     assert_eq!(states(&got), vec![unconfirmed("did:key:zCarol")]);
 }
+
+// ---------------------------------------------------------------------------
+// Slow foreign servers: every read that was waited for is remembered
+// ---------------------------------------------------------------------------
+
+/// `n` people on `n` foreign servers that never answer in time (the real
+/// answers come after 5 s, far past every bound the tests set).
+fn dead_remotes(w: &World, prefix: &str, n: usize) -> Vec<String> {
+    let names: Vec<String> = (0..n).map(|i| remote(&format!("{prefix}{i}"))).collect();
+    for m in &names {
+        w.hs.profile_answer(
+            m,
+            Resp::json(502, json!({"errcode": "M_UNKNOWN"})).delayed(Duration::from_secs(5)),
+        );
+    }
+    names
+}
+
+#[tokio::test]
+async fn the_second_wave_of_slow_reads_is_remembered_like_the_first() {
+    let w = World::new().await;
+    let dead = dead_remotes(&w, "dead", 16);
+    people(
+        &w,
+        &dead.iter().map(|m| (m.clone(), None)).collect::<Vec<_>>(),
+    );
+    // Eight places: the first eight reads end at 500 ms by their own bound, the
+    // next eight begin then and meet the 1 s total before theirs.
+    let tuning = Tuning {
+        remote_profile_timeout: Duration::from_millis(500),
+        remote_profiles_timeout: Duration::from_millis(1000),
+        ..Tuning::default()
+    };
+    let dir = w.directory_with(tuning);
+    let first = dir
+        .search_for_asker(&w.session(), ASKER_DID, "dead", 20)
+        .await
+        .unwrap();
+    assert_eq!(states(&first), vec![not_yet(); 16]);
+    assert_eq!(w.hs.profile_reads(), 16, "every one was asked");
+    assert_eq!(
+        dir.cache_stats().remote_claims,
+        16,
+        "and every one is remembered"
+    );
+
+    let started = std::time::Instant::now();
+    let second = dir
+        .search_for_asker(&w.session(), ASKER_DID, "dead", 20)
+        .await
+        .unwrap();
+    assert_eq!(states(&second), vec![not_yet(); 16]);
+    assert_eq!(w.hs.profile_reads(), 16, "none of them is asked again");
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "and the second search does not wait: {:?}",
+        started.elapsed()
+    );
+}

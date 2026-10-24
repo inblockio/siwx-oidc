@@ -1830,15 +1830,21 @@ impl Inner {
                 });
             } else {
                 reads.spawn(async move {
-                    let claim = tokio::time::timeout_at(remote_deadline, async {
+                    let claim = async {
                         if let Some(kept) = inner.kept_claim(&mxid) {
                             return kept;
                         }
-                        let _permit = permits.acquire_owned().await;
-                        inner.read_claim(&mxid).await
-                    })
-                    .await
-                    .unwrap_or(None);
+                        // The wait for a place is held to the total; the read is
+                        // too, but by its own bound (see `read_claim`), so that
+                        // what the read learns is kept.
+                        let Ok(Ok(_permit)) =
+                            tokio::time::timeout_at(remote_deadline, permits.acquire_owned()).await
+                        else {
+                            return None;
+                        };
+                        inner.read_claim(&mxid, remote_deadline).await
+                    }
+                    .await;
                     (index, Read::Remote(claim))
                 });
             }
@@ -1864,11 +1870,20 @@ impl Inner {
 
     /// Read a remote person's profile for a claim, and keep what came of it. It
     /// never fails: anything but a well-formed DID in the field, or no answer
-    /// within [`Tuning::remote_profile_timeout`], is "no usable claim". A read
-    /// cut off by the caller keeps nothing, so the next search asks again.
-    async fn read_claim(&self, mxid: &str) -> Option<ClaimedDid> {
-        let read =
-            tokio::time::timeout(self.tuning.remote_profile_timeout, self.read_profile(mxid)).await;
+    /// within the read's bound, is "no usable claim", and that is kept as well.
+    ///
+    /// The bound is the earlier of [`Tuning::remote_profile_timeout`] from now
+    /// and `deadline`, the end of the search's total. The read ends by that
+    /// bound itself, and does not have the total cut it off from outside: a read
+    /// that began late would otherwise be dropped with nothing kept, and a dead
+    /// server in the second wave would cost every search the same wait again.
+    /// Only a caller that goes away (the search dropped) keeps nothing.
+    async fn read_claim(&self, mxid: &str, deadline: tokio::time::Instant) -> Option<ClaimedDid> {
+        let now = tokio::time::Instant::now();
+        let bound = now
+            .checked_add(self.tuning.remote_profile_timeout)
+            .map_or(deadline, |own| own.min(deadline));
+        let read = tokio::time::timeout_at(bound, self.read_profile(mxid)).await;
         let claim = match read {
             Ok(Ok(Some(field))) => claim_from_field(&field),
             _ => None,
