@@ -381,6 +381,9 @@ pub struct IssuerState {
     /// A `WWW-Authenticate` challenge to put on that answer, as a proxy's auth
     /// wall would (the server's own answer has none).
     pub authorize_challenge: Option<String>,
+    /// A `Retry-After` header to put on that answer, as a rate limiter's 429
+    /// would have it.
+    pub authorize_retry_after: Option<String>,
     /// What the discovery document names as its issuer; `None` is its own URL.
     pub discovery_issuer: Option<String>,
     /// DID to the MXID `/resolve` finds; a DID that is absent does not exist.
@@ -421,6 +424,7 @@ impl Issuer {
             sign_in_delay: Duration::ZERO,
             authorize_status: None,
             authorize_challenge: None,
+            authorize_retry_after: None,
             discovery_issuer: None,
             resolve,
             resolve_status: 200,
@@ -539,7 +543,10 @@ fn issuer_route(st: &Arc<Mutex<IssuerState>>, r: &Req) -> Resp {
         }
         ("GET", "/authorize") => {
             if let Some(status) = s.authorize_status {
-                let resp = Resp::text(status, "Unrecognised client id.");
+                let mut resp = Resp::text(status, "Unrecognised client id.");
+                if let Some(wait) = &s.authorize_retry_after {
+                    resp = resp.header("Retry-After", wait);
+                }
                 return match &s.authorize_challenge {
                     Some(challenge) => resp.header("WWW-Authenticate", challenge),
                     None => resp,

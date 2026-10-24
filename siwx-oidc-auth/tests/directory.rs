@@ -517,6 +517,133 @@ async fn a_403_is_not_admitted_and_signs_in_no_more() {
 }
 
 #[tokio::test]
+async fn a_429_from_the_module_exposes_the_check_and_a_bounded_hint() {
+    // The header wins over the body, and both are held to an hour.
+    for (header, body_ms, expected) in [
+        (Some("9"), Some(1500), Some(Duration::from_secs(9))),
+        (None, Some(1500), Some(Duration::from_millis(1500))),
+        (Some("86400"), None, Some(Duration::from_secs(3600))),
+        (None, Some(86_400_000), Some(Duration::from_secs(3600))),
+        (Some("Wed, 21 Oct 2026 07:28:00 GMT"), None, None),
+        (Some("soon"), None, None),
+    ] {
+        let w = World::new().await;
+        w.hs.on_module(move |_, _| {
+            let body = match body_ms {
+                Some(ms) => json!({"errcode": "M_LIMIT_EXCEEDED", "retry_after_ms": ms}),
+                None => json!({"errcode": "M_LIMIT_EXCEEDED"}),
+            };
+            let resp = Resp::json(429, body);
+            match header {
+                Some(value) => resp.header("Retry-After", value),
+                None => resp,
+            }
+        });
+        let err = w
+            .directory()
+            .search_for_asker(&w.session(), ASKER_DID, "ada", 5)
+            .await
+            .unwrap_err();
+        let case = format!("{header:?} {body_ms:?}: {err:?}");
+        assert!(err.is_rate_limited(), "{case}");
+        assert_eq!(err.retry_after(), expected, "{case}");
+        assert!(err.is_retryable(), "{case}");
+    }
+}
+
+#[tokio::test]
+async fn a_429_at_the_sign_in_is_rate_limited_and_retryable_after_the_hint() {
+    for (header, expected) in [
+        (Some("12"), Some(Duration::from_secs(12))),
+        (None, None),
+        (Some("86400"), Some(Duration::from_secs(3600))),
+        (
+            Some("99999999999999999999999999"),
+            Some(Duration::from_secs(3600)),
+        ),
+        (Some("Wed, 21 Oct 2026 07:28:00 GMT"), None),
+        (Some("garbage"), None),
+    ] {
+        let w = World::new().await;
+        w.issuer.with(|s| {
+            s.authorize_status = Some(429);
+            s.authorize_retry_after = header.map(str::to_string);
+        });
+        let session = w.session();
+        let err = session.access_token().await.unwrap_err();
+        let case = format!("{header:?}: {err:?}");
+        let DirectoryError::SignIn { source } = &err else {
+            panic!("{case}");
+        };
+        assert_eq!(
+            source.downcast_ref::<siwx_oidc_auth::AuthError>(),
+            Some(&siwx_oidc_auth::AuthError::RateLimited {
+                retry_after: expected
+            }),
+            "{case}"
+        );
+        assert!(siwx_oidc_auth::is_rate_limited(source), "{case}");
+        assert!(err.is_rate_limited(), "{case}");
+        assert_eq!(err.retry_after(), expected, "{case}");
+        assert!(err.is_retryable(), "{case}");
+        assert!(!err.is_unknown_client(), "{case}");
+        assert!(
+            err.to_string().contains("returned 429"),
+            "the status text stays readable: {err}"
+        );
+
+        // The next call inside the cooldown is answered with the same failure,
+        // type and hint included, and sends nothing.
+        w.clock.advance(Duration::from_millis(100));
+        let again = session.access_token().await.unwrap_err();
+        assert!(again.is_rate_limited(), "{again:?}");
+        assert_eq!(again.retry_after(), expected, "{case}");
+        assert_eq!(w.issuer.mock.count("GET", "/authorize"), 1, "{case}");
+    }
+}
+
+#[tokio::test]
+async fn a_search_that_cannot_sign_in_for_a_429_is_rate_limited() {
+    let w = World::new().await;
+    w.issuer.with(|s| {
+        s.authorize_status = Some(429);
+        s.authorize_retry_after = Some("30".to_string());
+    });
+    let err = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "ada", 5)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DirectoryError::SignIn { .. }), "{err:?}");
+    assert!(err.is_rate_limited(), "{err:?}");
+    assert_eq!(err.retry_after(), Some(Duration::from_secs(30)));
+    assert_eq!(w.hs.module_calls(), 0, "no search without a token");
+}
+
+#[tokio::test]
+async fn no_other_error_is_rate_limited_or_has_a_hint() {
+    // Sign-in faults that are not a 429, and errors that are not sign-ins.
+    for status in [401u16, 500] {
+        let w = World::new().await;
+        w.issuer.with(|s| s.authorize_status = Some(status));
+        let err = w.session().access_token().await.unwrap_err();
+        assert!(!err.is_rate_limited(), "{status}: {err:?}");
+        assert_eq!(err.retry_after(), None, "{status}: {err:?}");
+    }
+    let w = World::new().await;
+    w.hs.on_module(|_, _| Resp::json(503, json!({})).header("Retry-After", "30"));
+    let err = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "ada", 5)
+        .await
+        .unwrap_err();
+    assert!(!err.is_rate_limited(), "{err:?}");
+    assert_eq!(err.retry_after(), None, "{err:?}");
+    assert!(!DirectoryError::NotAdmitted.is_rate_limited());
+    assert_eq!(DirectoryError::Unauthorized.retry_after(), None);
+}
+
+#[tokio::test]
 async fn a_429_is_rate_limited_with_the_servers_hint() {
     let w = World::new().await;
     w.hs.on_module(|_, _| {

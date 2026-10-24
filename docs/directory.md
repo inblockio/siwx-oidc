@@ -167,6 +167,28 @@ signed out and the server refuses to reuse it) are final; use
 `siwx_oidc_auth::is_device_refused` on the source if you want to pick a new id.
 `temporarily_unavailable` and network faults are retryable.
 
+**A rate limit at the sign-in** is `AuthError::RateLimited { retry_after }` in the
+source: a 429 at `/authorize`, `/sign_in`, `/token` or the refresh (something in
+front of the server usually answers it; the server itself does not). It is
+retryable, but not before `retry_after`. `DirectoryError::is_rate_limited()`
+answers it, and `DirectoryError::retry_after()` gives the hint, for this and for
+the homeserver's 429 alike:
+
+```rust
+match directory.search_for_asker(&session, asker, term, 10).await {
+    Err(e) if e.is_rate_limited() => {
+        let wait = e.retry_after().unwrap_or(Duration::from_secs(30));
+        /* try again after `wait` */
+    }
+    other => other?,
+}
+```
+
+`retry_after` is the numeric `Retry-After` header held to one hour
+(`siwx_oidc_auth::RETRY_AFTER_MAX`); an HTTP-date, no header or anything that is
+not a number of seconds is `None`, and the caller picks its backoff. The error
+still prints "returned 429", without the body and without the hint.
+
 **A client id the server does not know** is `AuthError::UnknownClient` in the
 source, and `DirectoryError::is_unknown_client()` answers it directly. A dynamic
 client lapses after 30 days without a use (see `register_public_client`), and
@@ -210,8 +232,8 @@ so a consumer that matched that text keeps working until it matches the type.)
 
 The status codes: 401 signs the service in again once and retries once (a second
 401 is `Unauthorized`); 403 is `NotAdmitted` (the service is not admitted, or its
-account is locked or deactivated); 429 is `RateLimited`, with Synapse's
-`retry_after_ms` when it gave one.
+account is locked or deactivated); 429 is `RateLimited`, with the `Retry-After`
+header or Synapse's `retry_after_ms` when it gave one (at most one hour).
 
 ### `search_as_user(user_token, term, limit)`
 
@@ -319,9 +341,9 @@ never the search term, a token or a response body.
 |---|---|---|
 | `InvalidInput` | refused before any request: bounds, an empty asker or token, a session of another deployment | no |
 | `NotAdmitted` | 403: the service is not admitted | no |
-| `RateLimited { retry_after }` | 429 | yes |
+| `RateLimited { retry_after }` | 429 from the homeserver; `is_rate_limited()` and `retry_after()` also answer for a sign-in that was rate limited (below) | yes, after `retry_after` |
 | `Unauthorized` | the token was refused (for the service, even after a fresh sign-in) | no |
-| `SignIn { source }` | the service could not sign in | by cause (see above) |
+| `SignIn { source }` | the service could not sign in; a 429 there is `AuthError::RateLimited` in the `source` (`is_rate_limited()`, `retry_after()`) | by cause (see above) |
 | `Unavailable` | network, timeout, 5xx, discovery or key set | yes |
 | `UnexpectedStatus { status, errcode }` | a status the client does not act on | no |
 | `Protocol` | an answer that is not the contract: malformed JSON, a row without a user id, a body over the cap | no |

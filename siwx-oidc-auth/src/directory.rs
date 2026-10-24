@@ -207,10 +207,39 @@ impl DirectoryError {
         }
     }
 
+    /// Whether the call was rate limited: a 429 from the homeserver
+    /// ([`DirectoryError::RateLimited`]) or from the sign-in
+    /// ([`AuthError::RateLimited`] in the `source` of a
+    /// [`DirectoryError::SignIn`]). It is retryable after
+    /// [`retry_after`](Self::retry_after), when there is one. Match this, not
+    /// the text.
+    pub fn is_rate_limited(&self) -> bool {
+        match self {
+            DirectoryError::RateLimited { .. } => true,
+            DirectoryError::SignIn { source } => crate::is_rate_limited(source),
+            _ => false,
+        }
+    }
+
+    /// The wait the server asked for, when the call was rate limited (see
+    /// [`is_rate_limited`](Self::is_rate_limited)) and it named one: at most
+    /// [`RETRY_AFTER_MAX`](crate::RETRY_AFTER_MAX). `None` otherwise, and the
+    /// caller picks its own backoff.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            DirectoryError::RateLimited { retry_after } => *retry_after,
+            DirectoryError::SignIn { source } => source
+                .downcast_ref::<AuthError>()
+                .and_then(AuthError::retry_after),
+            _ => None,
+        }
+    }
+
     /// Whether the same call may succeed later without a change on the caller's
     /// side. A sign-in is retryable unless the server refused the account
     /// (`access_denied`), the device id (`invalid_scope`) or the request for
-    /// another reason; an untyped sign-in fault (a network error) is retryable.
+    /// another reason; a rate limit at the sign-in is retryable after its hint;
+    /// an untyped sign-in fault (a network error) is retryable.
     pub fn is_retryable(&self) -> bool {
         match self {
             DirectoryError::RateLimited { .. } | DirectoryError::Unavailable(_) => true,
@@ -1179,13 +1208,13 @@ impl Reply {
     }
 }
 
-/// Synapse's `retry_after_ms` in a 429 body.
+/// Synapse's `retry_after_ms` in a 429 body, held to [`crate::RETRY_AFTER_MAX`].
 fn retry_after_ms(body: &[u8]) -> Option<Duration> {
     let ms = serde_json::from_slice::<Value>(body)
         .ok()?
         .get("retry_after_ms")?
         .as_u64()?;
-    Some(Duration::from_millis(ms))
+    Some(Duration::from_millis(ms).min(crate::RETRY_AFTER_MAX))
 }
 
 /// The answer of the directory module or of Synapse's user directory. The two
@@ -1265,12 +1294,7 @@ impl Inner {
             })
         })?;
         let status = response.status().as_u16();
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map(Duration::from_secs);
+        let retry_after = crate::retry_after_hint(response.headers());
         let cap = self.tuning.max_body_bytes;
         let body = match read_at_most(response, cap).await {
             Ok(Some(body)) => body,

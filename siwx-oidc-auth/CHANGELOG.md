@@ -8,6 +8,14 @@ matches error text should match the types named here instead.
 
 ### Changed
 
+- **A rate limit is transient.** `AuthError::is_transient` (and
+  `siwx_oidc_auth::is_transient`) is now also true for `AuthError::RateLimited`,
+  and `DirectoryError::is_retryable()` for a sign-in rate limited at the server:
+  retry after `retry_after`, when there is one.
+- **The `Retry-After` hint of `DirectoryError::RateLimited` is held to one hour**
+  (`RETRY_AFTER_MAX`), from the header and from Synapse's `retry_after_ms` alike,
+  and the header is read as RFC 9110 `delay-seconds` (digits only: `+5` and `1e3`
+  are no hint, as an HTTP-date always was).
 - **No redirects for discovery and the key set.** `verify_did_assertion` (and
   `fetch_and_verify_did` through it) follows no redirect when it fetches the
   issuer's discovery document or key set: the `jwks_uri` was judged as the issuer
@@ -64,6 +72,19 @@ matches error text should match the types named here instead.
 
 ### Added
 
+- **`AuthError::RateLimited { retry_after }`**, `AuthError::is_rate_limited()`,
+  `AuthError::retry_after()`, `siwx_oidc_auth::is_rate_limited` and
+  `DirectoryError::is_rate_limited()` / `DirectoryError::retry_after()`: a 429 at
+  `/authorize`, `/sign_in`, `/token` (the code exchange, the refresh and the
+  device poll) or `/device_authorization` is a typed error, so a consumer stops
+  matching "returned 429" in the text. `retry_after` is the numeric `Retry-After`
+  header held to the new `RETRY_AFTER_MAX` (one hour); an HTTP-date, a missing
+  header or anything else that is not a number of seconds gives `None`.
+  `DirectoryError::is_rate_limited()` is true for `DirectoryError::RateLimited`
+  and for a `DirectoryError::SignIn` whose source is the sign-in's 429, and
+  `retry_after()` answers the hint of either. The error text still says
+  "returned 429" and carries neither the body nor the hint. The enum is
+  `#[non_exhaustive]`, so a variant is additive.
 - **`AuthError::UnknownClient`**, `siwx_oidc_auth::is_unknown_client` and
   `DirectoryError::is_unknown_client`: `/authorize` answered 401 without a
   `WWW-Authenticate` header, which is siwx-oidc's own answer for a client id it

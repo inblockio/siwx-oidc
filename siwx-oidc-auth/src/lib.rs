@@ -45,6 +45,7 @@ use rand::rngs::OsRng;
 use reqwest::{header, redirect::Policy, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::time::Duration;
 use url::Url;
 use urlencoding::encode;
 
@@ -529,6 +530,10 @@ fn flow_client() -> Result<reqwest::Client> {
 ///   erased). Final: stop, and report it once.
 /// - [`AuthError::TemporarilyUnavailable`]: the homeserver could not be asked or
 ///   could not set up the device. Transient: retry as after an outage.
+/// - [`AuthError::RateLimited`]: a 429 at any endpoint of a flow (`/authorize`,
+///   `/sign_in`, `/token` for the code and the refresh, `/device_authorization`
+///   and the device poll). Transient: retry as after an outage, but not before
+///   the server's hint, when it gave one ([`AuthError::retry_after`]).
 /// - [`AuthError::SignInRefused`]: any other `error` code.
 /// - [`AuthError::UnknownClient`]: the one that is not a `/sign_in` redirect. The
 ///   server does not know the client id, which it answers at `/authorize` with a
@@ -561,8 +566,35 @@ pub enum AuthError {
     /// `/authorize` answered 401 with a `WWW-Authenticate` challenge: something
     /// in front of the server wants credentials first. Not an unknown client.
     Unauthorized,
+    /// A 429 at `/authorize`, `/sign_in`, `/token` (the code exchange, the
+    /// refresh, the device poll) or `/device_authorization`: the server, or
+    /// something in front of it, is limiting the rate of requests. `retry_after`
+    /// is the hint of a numeric `Retry-After` header, held to
+    /// [`RETRY_AFTER_MAX`]; a missing header, an HTTP-date or anything else gives
+    /// `None`. [`AuthError::error_code`] is `rate_limited`, which is not the
+    /// server's.
+    RateLimited { retry_after: Option<Duration> },
     /// Any other `error` code at `/sign_in`.
     SignInRefused { error: String },
+}
+
+/// The longest `Retry-After` hint kept, one hour: a server (or a proxy) that
+/// names a day, or a count past what a clock can add, is waited for an hour at
+/// most before the next try.
+pub const RETRY_AFTER_MAX: Duration = Duration::from_secs(60 * 60);
+
+/// The wait a `Retry-After` header asks for, when it is a number of seconds
+/// (RFC 9110 `delay-seconds`: digits only, so no sign, fraction or exponent),
+/// held to [`RETRY_AFTER_MAX`]. An HTTP-date, an empty or garbled value, or no
+/// header at all is `None`: the server's text is not interpreted further.
+pub(crate) fn retry_after_hint(headers: &header::HeaderMap) -> Option<Duration> {
+    let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // Digits that overflow a u64 are a very long wait, so the cap, not nothing.
+    let secs = value.parse::<u64>().unwrap_or(u64::MAX);
+    Some(Duration::from_secs(secs).min(RETRY_AFTER_MAX))
 }
 
 /// The `error` code reported when the server's is not a short OAuth/Matrix token.
@@ -585,6 +617,7 @@ impl AuthError {
         match self {
             AuthError::UnknownClient => "invalid_client",
             AuthError::Unauthorized => "unauthorized",
+            AuthError::RateLimited { .. } => "rate_limited",
             AuthError::DeviceRefused => "invalid_scope",
             AuthError::AccessDenied => "access_denied",
             AuthError::TemporarilyUnavailable => "temporarily_unavailable",
@@ -602,10 +635,32 @@ impl AuthError {
         matches!(self, AuthError::DeviceRefused)
     }
 
-    /// Whether this is [`AuthError::TemporarilyUnavailable`], the one refusal to
-    /// retry unchanged.
+    /// Whether this is [`AuthError::RateLimited`]. Match this (or the type), not
+    /// the text.
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(self, AuthError::RateLimited { .. })
+    }
+
+    /// The wait the server asked for, when this is [`AuthError::RateLimited`]
+    /// and the answer carried a numeric `Retry-After` (at most
+    /// [`RETRY_AFTER_MAX`]). `None` for every other error, and for a rate limit
+    /// that named no wait: the caller picks its own backoff then.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            AuthError::RateLimited { retry_after } => *retry_after,
+            _ => None,
+        }
+    }
+
+    /// Whether the same call may succeed later, unchanged: a
+    /// [`AuthError::TemporarilyUnavailable`] (retry as after an outage) and an
+    /// [`AuthError::RateLimited`] (retry after [`AuthError::retry_after`], when
+    /// there is one). Every other refusal needs something to change first.
     pub fn is_transient(&self) -> bool {
-        matches!(self, AuthError::TemporarilyUnavailable)
+        matches!(
+            self,
+            AuthError::TemporarilyUnavailable | AuthError::RateLimited { .. }
+        )
     }
 }
 
@@ -625,6 +680,15 @@ impl std::fmt::Display for AuthError {
                  challenge: something in front of the server asks for credentials first, which \
                  is not the server's answer for an unregistered client"
             ),
+            // The status line the untyped error carried ("... returned 429 ..."),
+            // without the endpoint (one type serves all of them) and without the
+            // hint, which is data (`retry_after`), not text.
+            AuthError::RateLimited { .. } => {
+                write!(
+                    f,
+                    "the server returned 429 Too Many Requests (rate limited)"
+                )
+            }
             _ => write!(f, "/sign_in refused the request: {}", self.error_code()),
         }
     }
@@ -644,12 +708,21 @@ pub fn is_device_refused(err: &anyhow::Error) -> bool {
         .is_some_and(AuthError::is_device_refused)
 }
 
-/// Whether `err` is an [`AuthError::TemporarilyUnavailable`] from a code-flow
-/// entry point. An untyped error (a network fault, say) answers `false`: the
-/// caller decides for those as before.
+/// Whether `err` is an [`AuthError::TemporarilyUnavailable`] or an
+/// [`AuthError::RateLimited`] from a flow entry point (see
+/// [`AuthError::is_transient`]). An untyped error (a network fault, say) answers
+/// `false`: the caller decides for those as before.
 pub fn is_transient(err: &anyhow::Error) -> bool {
     err.downcast_ref::<AuthError>()
         .is_some_and(AuthError::is_transient)
+}
+
+/// Whether `err` is an [`AuthError::RateLimited`] from a flow entry point
+/// (`authenticate*`, `refresh`, `authenticate_device_flow`). The wait the server
+/// asked for is [`AuthError::retry_after`] on `err.downcast_ref::<AuthError>()`.
+pub fn is_rate_limited(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<AuthError>()
+        .is_some_and(AuthError::is_rate_limited)
 }
 
 /// How a server refused a request, as far as this client repeats it: the status
@@ -659,6 +732,8 @@ pub fn is_transient(err: &anyhow::Error) -> bool {
 struct Refusal {
     status: StatusCode,
     code: Option<String>,
+    /// The bounded `Retry-After` of the answer, read for a 429 only.
+    retry_after: Option<Duration>,
 }
 
 impl Refusal {
@@ -672,6 +747,9 @@ impl Refusal {
     /// [`Refusal::of`] with the read bounded by `cap` instead.
     async fn within(resp: reqwest::Response, cap: usize) -> Refusal {
         let status = resp.status();
+        let retry_after = (status == StatusCode::TOO_MANY_REQUESTS)
+            .then(|| retry_after_hint(resp.headers()))
+            .flatten();
         let code = did_assertion::read_at_most(resp, cap)
             .await
             .ok()
@@ -684,7 +762,37 @@ impl Refusal {
                     .into_iter()
                     .find_map(|field| directory::short_code(json.get(field)?.as_str()?))
             });
-        Refusal { status, code }
+        Refusal {
+            status,
+            code,
+            retry_after,
+        }
+    }
+
+    /// The error for an answer that is not the 303 redirect `endpoint` is
+    /// expected to give (see [`not_the_redirect`]), or a rate limit.
+    fn into_redirect_error(self, endpoint: &str) -> anyhow::Error {
+        if let Some(limited) = self.rate_limited() {
+            return limited.into();
+        }
+        not_the_redirect(endpoint, self.status, self.code.as_deref())
+    }
+
+    /// [`AuthError::RateLimited`] when the answer is a 429.
+    fn rate_limited(&self) -> Option<AuthError> {
+        (self.status == StatusCode::TOO_MANY_REQUESTS).then_some(AuthError::RateLimited {
+            retry_after: self.retry_after,
+        })
+    }
+
+    /// [`Refusal::into_error`] for an endpoint of a sign-in flow, where a 429 is
+    /// the typed [`AuthError::RateLimited`]. (The DID verifier's reads report a
+    /// 429 by its status and code like any other.)
+    fn into_flow_error(self, what: &str) -> anyhow::Error {
+        match self.rate_limited() {
+            Some(limited) => limited.into(),
+            None => self.into_error(what),
+        }
     }
 
     /// `{what} returned {status}`, then `({code})` when there is one.
@@ -816,12 +924,7 @@ async fn code_flow(
         if resp.status().is_success() {
             return Err(not_the_redirect("/authorize", resp.status(), None));
         }
-        let refusal = Refusal::of(resp).await;
-        return Err(not_the_redirect(
-            "/authorize",
-            refusal.status,
-            refusal.code.as_deref(),
-        ));
+        return Err(Refusal::of(resp).await.into_redirect_error("/authorize"));
     }
 
     let location = resp
@@ -893,12 +996,7 @@ async fn code_flow(
         if resp.status().is_success() {
             return Err(not_the_redirect("/sign_in", resp.status(), None));
         }
-        let refusal = Refusal::of(resp).await;
-        return Err(not_the_redirect(
-            "/sign_in",
-            refusal.status,
-            refusal.code.as_deref(),
-        ));
+        return Err(Refusal::of(resp).await.into_redirect_error("/sign_in"));
     }
 
     let code_location = resp
@@ -942,7 +1040,7 @@ async fn code_flow(
         .context("POST /token failed")?;
 
     if !resp.status().is_success() {
-        return Err(Refusal::of(resp).await.into_error("/token"));
+        return Err(Refusal::of(resp).await.into_flow_error("/token"));
     }
 
     let raw: TokenResponseRaw = did_assertion::read_json(resp, did_assertion::DEFAULT_BODY_CAP)
@@ -996,7 +1094,7 @@ pub async fn refresh(
         .context("POST /token (refresh) failed")?;
 
     if !resp.status().is_success() {
-        return Err(Refusal::of(resp).await.into_error("/token refresh"));
+        return Err(Refusal::of(resp).await.into_flow_error("/token refresh"));
     }
 
     let raw: TokenResponseRaw = did_assertion::read_json(resp, did_assertion::DEFAULT_BODY_CAP)
@@ -1061,7 +1159,9 @@ pub async fn authenticate_device_flow(server_url: &str, client_id: &str) -> Resu
         .context("POST /device_authorization failed")?;
 
     if !resp.status().is_success() {
-        return Err(Refusal::of(resp).await.into_error("/device_authorization"));
+        return Err(Refusal::of(resp)
+            .await
+            .into_flow_error("/device_authorization"));
     }
 
     let device_auth: DeviceAuthResponseRaw =
@@ -1138,6 +1238,11 @@ pub async fn authenticate_device_flow(server_url: &str, client_id: &str) -> Resu
         }
 
         let refusal = Refusal::of(resp).await;
+        // A 429 first: whatever code it carries, the server asks for fewer
+        // requests, not for the polling interval RFC 8628 names.
+        if let Some(limited) = refusal.rate_limited() {
+            return Err(limited.into());
+        }
         match refusal.code.as_deref() {
             Some("authorization_pending") => {}
             Some("slow_down") => {
@@ -2338,5 +2443,241 @@ mod tests {
                 "the status is named: {error:#}"
             );
         }
+    }
+
+    // ---- A 429 is a typed rate limit, with the server's hint held to a bound ----
+
+    /// A 429 answer with a body the server (or a proxy) wrote, and `retry_after`
+    /// as the header value when there is one.
+    fn too_many(retry_after: Option<&str>) -> String {
+        let header = retry_after.map(|v| format!("retry-after: {v}"));
+        let headers: Vec<&str> = std::iter::once("content-type: text/plain")
+            .chain(header.as_deref())
+            .collect();
+        raw_response_with_body("429 Too Many Requests", &headers, MARKER)
+    }
+
+    /// The flows' endpoints that answer, in turn, with the given 429.
+    #[derive(Clone, Copy, Debug)]
+    enum Endpoint {
+        Authorize,
+        SignIn,
+        Token,
+        Refresh,
+        DeviceAuthorization,
+        DevicePoll,
+    }
+
+    const ENDPOINTS: [Endpoint; 6] = [
+        Endpoint::Authorize,
+        Endpoint::SignIn,
+        Endpoint::Token,
+        Endpoint::Refresh,
+        Endpoint::DeviceAuthorization,
+        Endpoint::DevicePoll,
+    ];
+
+    /// Run the flow that reaches `endpoint` against a server whose answer there is
+    /// `response` (everything before it succeeds as far as it must), and return
+    /// the error the flow ends with.
+    async fn rate_limited_at(endpoint: Endpoint, response: String) -> anyhow::Error {
+        let key = SiwxKey::generate_ed25519();
+        let authorize_redirect = format!(
+            "location: /login?nonce=n1&state=headless&client_id=client&redirect_uri={}",
+            urlencoding::encode(REDIRECT_URI)
+        );
+        let authorize = raw_response(
+            "303 See Other",
+            &[&authorize_redirect, "set-cookie: session=abc; Path=/"],
+        );
+        let sign_in = raw_response(
+            "303 See Other",
+            &[&format!("location: {REDIRECT_URI}?code=abc&state=headless")],
+        );
+        let device_authorization = raw_response_with_body(
+            "200 OK",
+            &["content-type: application/json"],
+            r#"{"device_code":"d","user_code":"U-1","verification_uri":"https://idp.example/device","verification_uri_complete":"https://idp.example/device?c=U-1","expires_in":60,"interval":0}"#,
+        );
+        let (served, error) = match endpoint {
+            Endpoint::Authorize => {
+                let (base, served) = serve_in_order(vec![response]);
+                let error = authenticate_with_scope(&base, "client", REDIRECT_URI, &key, "openid")
+                    .await
+                    .expect_err("rate limited at /authorize");
+                (served, error)
+            }
+            Endpoint::SignIn => {
+                let (base, served) = serve_in_order(vec![authorize, response]);
+                let error =
+                    authenticate_with_device(&base, "client", REDIRECT_URI, &key, Some("D"))
+                        .await
+                        .expect_err("rate limited at /sign_in");
+                (served, error)
+            }
+            Endpoint::Token => {
+                let (base, served) = serve_in_order(vec![authorize, sign_in, response]);
+                let error = authenticate_with_scope(&base, "client", REDIRECT_URI, &key, "openid")
+                    .await
+                    .expect_err("rate limited at /token");
+                (served, error)
+            }
+            Endpoint::Refresh => {
+                let (base, served) = serve_in_order(vec![response]);
+                let error = refresh(&base, "client", "rt-1", "did:key:zFixture")
+                    .await
+                    .expect_err("rate limited at the refresh");
+                (served, error)
+            }
+            Endpoint::DeviceAuthorization => {
+                let (base, served) = serve_in_order(vec![response]);
+                let error = authenticate_device_flow(&base, "client")
+                    .await
+                    .expect_err("rate limited at /device_authorization");
+                (served, error)
+            }
+            Endpoint::DevicePoll => {
+                let (base, served) = serve_in_order(vec![device_authorization, response]);
+                let error = authenticate_device_flow(&base, "client")
+                    .await
+                    .expect_err("rate limited at the device poll");
+                (served, error)
+            }
+        };
+        served.join().unwrap();
+        error
+    }
+
+    /// `Retry-After` values and the hint each one gives.
+    fn retry_after_cases() -> Vec<(Option<&'static str>, Option<Duration>)> {
+        let hour = Some(RETRY_AFTER_MAX);
+        vec![
+            (None, None),
+            (Some("30"), Some(Duration::from_secs(30))),
+            (Some(" 7 "), Some(Duration::from_secs(7))),
+            (Some("0"), Some(Duration::ZERO)),
+            (Some("3600"), hour),
+            // Past the bound: held to it, however far past.
+            (Some("3601"), hour),
+            (Some("86400"), hour),
+            (Some("18446744073709551615"), hour),
+            (Some("99999999999999999999999999999999"), hour),
+            // Not a number of seconds: no hint.
+            (Some("Wed, 21 Oct 2026 07:28:00 GMT"), None),
+            (Some("soon"), None),
+            (Some(""), None),
+            (Some("-5"), None),
+            (Some("+5"), None),
+            (Some("1.5"), None),
+            (Some("1e3"), None),
+            (Some("0x10"), None),
+            (Some("30 seconds"), None),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_429_at_every_endpoint_is_a_typed_rate_limit_with_a_bounded_hint() {
+        for endpoint in ENDPOINTS {
+            for (header, hint) in retry_after_cases() {
+                let error = rate_limited_at(endpoint, too_many(header)).await;
+                let context = format!("{endpoint:?} Retry-After {header:?}: {error:#}");
+                assert_eq!(
+                    error.downcast_ref::<AuthError>(),
+                    Some(&AuthError::RateLimited { retry_after: hint }),
+                    "{context}"
+                );
+                let typed = error.downcast_ref::<AuthError>().unwrap();
+                assert!(
+                    is_rate_limited(&error) && typed.is_rate_limited(),
+                    "{context}"
+                );
+                assert_eq!(typed.retry_after(), hint, "{context}");
+                assert_eq!(typed.error_code(), "rate_limited", "{context}");
+                // Retried after the hint, like an outage; not any other kind.
+                assert!(is_transient(&error) && typed.is_transient(), "{context}");
+                assert!(
+                    !is_device_refused(&error) && !is_unknown_client(&error),
+                    "{context}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_error_says_429_and_never_what_the_server_wrote() {
+        for endpoint in ENDPOINTS {
+            let error = rate_limited_at(endpoint, too_many(Some("4242"))).await;
+            assert_body_free(&error);
+            let text = printed(&error);
+            // A consumer that matched the status text keeps working.
+            assert!(
+                format!("{error:#}").contains("returned 429"),
+                "{endpoint:?}: {text}"
+            );
+            // The hint is data, not text.
+            assert!(!text.contains("4242"), "{endpoint:?}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_429_with_its_code_in_the_body_is_still_a_rate_limit() {
+        // Synapse's and OAuth's bodies both name a code; neither changes the type.
+        for body in [
+            r#"{"errcode":"M_LIMIT_EXCEEDED","retry_after_ms":4000}"#,
+            r#"{"error":"slow_down"}"#,
+        ] {
+            let response = raw_response_with_body(
+                "429 Too Many Requests",
+                &["content-type: application/json", "retry-after: 3"],
+                body,
+            );
+            for endpoint in ENDPOINTS {
+                let error = rate_limited_at(endpoint, response.clone()).await;
+                assert_eq!(
+                    error.downcast_ref::<AuthError>(),
+                    Some(&AuthError::RateLimited {
+                        retry_after: Some(Duration::from_secs(3))
+                    }),
+                    "{endpoint:?}: {body}: {error:#}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn other_statuses_are_not_rate_limits() {
+        for status in [
+            "400 Bad Request",
+            "403 Forbidden",
+            "500 Internal Server Error",
+        ] {
+            for endpoint in ENDPOINTS {
+                let response = raw_response_with_body(status, &["retry-after: 9"], MARKER);
+                let error = rate_limited_at(endpoint, response).await;
+                assert!(!is_rate_limited(&error), "{endpoint:?} {status}: {error:#}");
+                assert!(!is_transient(&error), "{endpoint:?} {status}: {error:#}");
+            }
+        }
+    }
+
+    #[test]
+    fn rate_limited_is_not_any_other_refusal() {
+        let limited = AuthError::RateLimited { retry_after: None };
+        assert!(limited.is_rate_limited() && limited.is_transient());
+        assert!(!limited.is_device_refused() && !limited.is_unknown_client());
+        for other in [
+            AuthError::DeviceRefused,
+            AuthError::AccessDenied,
+            AuthError::UnknownClient,
+            AuthError::Unauthorized,
+            AuthError::SignInRefused {
+                error: "rate_limited".into(),
+            },
+        ] {
+            assert!(!other.is_rate_limited(), "{other:?}");
+            assert_eq!(other.retry_after(), None, "{other:?}");
+        }
+        assert!(AuthError::TemporarilyUnavailable.is_transient());
+        assert!(!AuthError::TemporarilyUnavailable.is_rate_limited());
     }
 }
