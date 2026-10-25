@@ -66,6 +66,16 @@
 //! configured name is the error [`DirectoryError::ServerNameMismatch`], never an
 //! answer in which every local person looks foreign.
 //!
+//! Only the homeserver can vouch for the name, and it does so through
+//! `GET /account/whoami`, asked once per client by whichever transport searches
+//! first: with the service's own token on the module transport (the service
+//! account is a local user of the homeserver), with the user's token on the user
+//! transport. The asker's MXID alone proves nothing, as the issuer builds it from
+//! its own configuration: an issuer and a client that share one wrong name agree
+//! on it, and the module answers that unknown asker with a plain empty `200`, so
+//! a host would report "ready" and serve empty results. A `whoami` that fails is
+//! the error of that search and is not kept.
+//!
 //! # Errors
 //!
 //! An answer that could not be checked is an error, never a state: a network,
@@ -1319,9 +1329,11 @@ pub struct DirectoryConfig {
     /// [`DirectoryClient::search_for_asker`] and the owner of the token of
     /// [`DirectoryClient::search_as_user`] are the homeserver's own people, and
     /// when one is not on this name the search is the error
-    /// [`DirectoryError::ServerNameMismatch`] and nothing else is asked. (An
-    /// asker that does not exist has no MXID to check, and gets the empty result
-    /// as before.)
+    /// [`DirectoryError::ServerNameMismatch`] and nothing else is asked. Both
+    /// transports also ask the homeserver itself, once per client, through
+    /// `GET /account/whoami`: with the user's token on the user transport and
+    /// with the service's own token on the module transport. (An asker that does
+    /// not exist has no MXID to check, and gets the empty result as before.)
     pub server_name: String,
     /// Whether [`DirectoryClient::search_for_asker`] signs the service in again
     /// itself when the directory module answers 401 (once, then retries once).
@@ -1389,12 +1401,13 @@ struct Inner {
     /// that finds it changed knows a fetch ran while it waited.
     key_fetches: AtomicU64,
     /// Set once the homeserver itself has vouched for `server_name`: its
-    /// `whoami` named a person on it, and nothing else sets it. Never a mismatch,
-    /// never a string that the issuer built from the same configuration, and
-    /// never a module answer: the module answers an asker it does not know with
-    /// a normal `200` and no results, so an answer cannot tell the homeserver's
-    /// own person from a string that matched. A wrong name is therefore answered
-    /// with an error on every user search.
+    /// `whoami` (with a user's token, or with the service's own) named a person
+    /// on it, and nothing else sets it. Never a mismatch, never a failure, never
+    /// a string that the issuer built from the same configuration, and never a
+    /// module answer: the module answers an asker it does not know with a normal
+    /// `200` and no results, so an answer cannot tell the homeserver's own person
+    /// from a string that matched. A wrong name is therefore answered with an
+    /// error on every search of either transport.
     server_name_confirmed: AtomicBool,
 }
 
@@ -1502,6 +1515,19 @@ impl DirectoryClient {
     /// [`DirectoryError::ServerNameMismatch`]: the asker is the homeserver's own
     /// person, so the configured name is wrong. Nothing is asked of the module.
     ///
+    /// The asker's name is not the homeserver's word, though: the issuer builds
+    /// the MXID from its own configuration, so an issuer and a client that share
+    /// one wrong (delegated) name agree on it, and the module answers an asker it
+    /// does not know with a plain empty `200`. The first search of the client
+    /// therefore also asks `GET /account/whoami` with the service's own token
+    /// (the service account is a local user of the homeserver, so its real MXID
+    /// is on the real name), once per client and before the module; a name that
+    /// is not the one configured is [`DirectoryError::ServerNameMismatch`] and the
+    /// module is not asked. A `whoami` that fails is the error of that search
+    /// (a 401 signs in again and retries once under the same rule as the module's)
+    /// and is not kept, so the next search asks again. An asker that does not
+    /// exist has no MXID, gets the empty result and asks nothing.
+    ///
     /// `session` must belong to the deployment this client was made for, so its
     /// token is never sent to a homeserver it was not issued for.
     pub async fn search_for_asker(
@@ -1530,7 +1556,22 @@ impl DirectoryClient {
         // configuration, so a match proves nothing about the homeserver.
         inner.refuse_other_server(&asker)?;
 
-        let token = session.access_token().await?;
+        // Nor is the asker's name the homeserver's word: when the issuer and
+        // this client share one wrong (delegated) name, the string matches and
+        // the module answers the unknown asker with a plain empty 200. So the
+        // homeserver is asked, once per client, who the service itself is (a
+        // local user of it), before the module is. A failure is this search's
+        // error and is not kept.
+        let mut token = session.access_token().await?;
+        if !inner.server_name_confirmed.load(Ordering::Acquire) {
+            if let Err(e) = inner.confirm_server_name_of_token(&token).await {
+                if !(matches!(e, DirectoryError::Unauthorized) && inner.sign_in_again_on_401) {
+                    return Err(e);
+                }
+                token = session.token_after_rejection(&token).await?;
+                inner.confirm_server_name_of_token(&token).await?;
+            }
+        }
         let body = match inner.ask_module(&token, &asker, term, limit).await {
             Err(DirectoryError::Unauthorized) if inner.sign_in_again_on_401 => {
                 let token = session.token_after_rejection(&token).await?;
@@ -1556,7 +1597,9 @@ impl DirectoryClient {
     /// Only `whoami` confirms the name: neither a module answer on the same
     /// client (the module answers an asker it does not know with a normal empty
     /// `200`) nor the asker's name (the issuer builds it from its own
-    /// configuration) does. A local profile that cannot be read fails the search:
+    /// configuration) does. The module transport asks `whoami` too, with the
+    /// service's own token, and the one that comes first confirms the name for
+    /// both. A local profile that cannot be read fails the search:
     /// its state is unknown, and `invalid` would be a claim about the person. A
     /// profile of another server's user is read for a claim
     /// ([`DidState::Unconfirmed`]) and never fails the search.
@@ -1780,9 +1823,10 @@ impl Inner {
     /// local person into a foreign one: their valid proof ignored, their unsigned
     /// `did` member shown. `local` is a person known to be the homeserver's own.
     ///
-    /// Only the homeserver can say so, and only through `GET /account/whoami`.
-    /// This check alone is a per-call refusal and never confirms anything, and
-    /// neither does a module answer (see `server_name_confirmed`).
+    /// Only the homeserver can say so, and only through `GET /account/whoami`
+    /// (see `confirm_server_name_of_token`). This check alone is a per-call
+    /// refusal and never confirms anything, and neither does a module answer (see
+    /// `server_name_confirmed`).
     fn refuse_other_server(&self, local: &str) -> Result<(), DirectoryError> {
         if !self.is_local(local) {
             return Err(DirectoryError::ServerNameMismatch);
@@ -1790,9 +1834,11 @@ impl Inner {
         Ok(())
     }
 
-    /// The same check for the user transport, which has no asker: the token's
-    /// owner (`GET /account/whoami`) is a person of the homeserver itself. Asked
-    /// once, with the first search, and not again after the name matched; a
+    /// The check by the homeserver's own word: the token's owner
+    /// (`GET /account/whoami`) is a person of the homeserver itself. The token is
+    /// a user's (the user transport has no asker) or the service's (the module
+    /// transport, whose asker string the issuer built). Asked once, with the first
+    /// search of either transport, and not again after the name matched; a
     /// mismatch or a failure is never kept.
     async fn confirm_server_name_of_token(&self, token: &str) -> Result<(), DirectoryError> {
         if self.server_name_confirmed.load(Ordering::Acquire) {

@@ -3481,19 +3481,35 @@ async fn the_homeservers_name_is_asked_once_and_not_again_after_it_matched() {
     );
 }
 
-/// A module answer confirms nothing, not even for an asker on the right name:
-/// the real module answers an asker it does not know with a normal 200, so an
-/// answer cannot tell "my own person" from "a string that matched". Only
-/// `whoami` confirms, and it is asked once, by the first user search.
+/// `whoami` is the one thing that confirms the name, and the module transport
+/// asks it too: with the service's own token, once, by the first search of the
+/// client, before the module is asked. The user transport then finds the name
+/// confirmed and asks nothing more, so one client asks `whoami` once however
+/// many searches it serves on either transport.
 #[tokio::test]
-async fn a_module_answer_never_confirms_the_name_so_the_user_transport_asks_whoami() {
+async fn the_module_transport_asks_whoami_once_and_the_user_transport_reuses_the_answer() {
     let w = World::new().await;
     local_people_with_a_valid_proof(&w);
     let dir = w.directory();
-    dir.search_for_asker(&w.session(), ASKER_DID, "a", 5)
-        .await
-        .unwrap();
-    assert_eq!(w.hs.whoami_calls(), 0, "the module transport never asks");
+    for _ in 0..3 {
+        let got = dir
+            .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+            .await
+            .unwrap();
+        assert_eq!(states(&got), vec![verified(&did_of("alice"))]);
+    }
+    assert_eq!(w.hs.whoami_calls(), 1, "once, however many module searches");
+    let whoami =
+        w.hs.mock
+            .requests()
+            .into_iter()
+            .find(|r| r.path == WHOAMI_PATH)
+            .unwrap();
+    assert_eq!(
+        whoami.bearer().as_deref(),
+        Some("access-1"),
+        "it is the service's own token that asks, not a user's"
+    );
     for _ in 0..2 {
         dir.search_as_user("user-token-fixture", "a", 5)
             .await
@@ -3502,18 +3518,52 @@ async fn a_module_answer_never_confirms_the_name_so_the_user_transport_asks_whoa
     assert_eq!(
         w.hs.whoami_calls(),
         1,
-        "the first user search asks whoami, once; the module answer left nothing confirmed"
+        "the user transport finds the name confirmed"
     );
+    assert_eq!(w.hs.module_calls(), 3);
+}
+
+#[tokio::test]
+async fn whoami_is_asked_once_whichever_transport_searches_first() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    let dir = w.directory();
+    dir.search_as_user("user-token-fixture", "a", 5)
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        dir.search_for_asker(&w.session(), ASKER_DID, "a", 5)
+            .await
+            .unwrap();
+    }
+    assert_eq!(w.hs.whoami_calls(), 1);
+    assert_eq!(w.hs.module_calls(), 3);
+}
+
+#[tokio::test]
+async fn each_client_confirms_the_name_for_itself() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    for _ in 0..2 {
+        let dir = w.directory();
+        for _ in 0..3 {
+            dir.search_for_asker(&w.session(), ASKER_DID, "a", 5)
+                .await
+                .unwrap();
+        }
+    }
+    assert_eq!(w.hs.whoami_calls(), 2, "one per client");
 }
 
 /// The issuer builds the asker's MXID from its own config, so an asker that
 /// matches a wrong `server_name` says nothing about the homeserver: when the
 /// issuer and the client carry the same wrong name, the string matches. Only the
-/// homeserver may confirm the name, and only `whoami` does: a module call that
-/// fails leaves the name unconfirmed, and the user search on the same client
-/// asks whoami and fails closed.
+/// homeserver may confirm the name, and only `whoami` does, so it is asked before
+/// the module on every module search until it has vouched for the name. The
+/// module is then never reached, whatever it would say: it answers an asker it
+/// does not know with a plain empty `200`.
 #[tokio::test]
-async fn an_asker_string_on_a_wrong_name_never_confirms_it_for_the_user_transport() {
+async fn an_asker_string_on_a_wrong_name_never_confirms_it_whoami_refuses_both_transports() {
     for status in [403, 429, 502] {
         let w = World::new().await;
         local_people_with_a_valid_proof(&w);
@@ -3527,20 +3577,20 @@ async fn an_asker_string_on_a_wrong_name_never_confirms_it_for_the_user_transpor
         // The homeserver does not answer for an asker that is not its own.
         w.hs.on_module(move |_, _| Resp::json(status, json!({"errcode": "M_FORBIDDEN"})));
         let dir = misconfigured(&w);
-        assert!(
-            dir.search_for_asker(&w.session(), ASKER_DID, "a", 5)
-                .await
-                .is_err(),
-            "the module refused ({status})"
-        );
-        assert_eq!(w.hs.module_calls(), 1, "the asker matched the wrong name");
+        let err = dir
+            .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+            .await
+            .expect_err("the asker matched the wrong name, the homeserver says otherwise");
+        assert!(is_name_mismatch(&err), "{status}: {err}");
+        assert_eq!(w.hs.whoami_calls(), 1, "{status}: the homeserver was asked");
+        assert_eq!(w.hs.module_calls(), 0, "{status}: the module is not asked");
 
         let err = dir
             .search_as_user("user-token-fixture", "a", 5)
             .await
             .expect_err("local people would be shown as unconfirmed under the wrong name");
         assert!(is_name_mismatch(&err), "{status}: {err}");
-        assert_eq!(w.hs.whoami_calls(), 1, "{status}: the homeserver was asked");
+        assert_eq!(w.hs.whoami_calls(), 2, "{status}: the homeserver was asked");
         assert_eq!(w.hs.user_directory_calls(), 0, "the directory is not asked");
         assert_eq!(w.hs.profile_reads(), 0, "no profile is read");
         // And it stays unconfirmed: the next user search asks again.
@@ -3549,7 +3599,7 @@ async fn an_asker_string_on_a_wrong_name_never_confirms_it_for_the_user_transpor
                 .await
                 .unwrap_err()
         ));
-        assert_eq!(w.hs.whoami_calls(), 2);
+        assert_eq!(w.hs.whoami_calls(), 3);
     }
 }
 
@@ -3557,10 +3607,11 @@ async fn an_asker_string_on_a_wrong_name_never_confirms_it_for_the_user_transpor
 /// not on its homeserver, or not known to it, with a normal
 /// `200 {"results": [], "limited": false}`. With the issuer and the client
 /// sharing one wrong (delegated) name, that is the answer the wrong-name asker
-/// gets, and it must not confirm the name: the following user search still asks
-/// `whoami`, fails closed, and shows no local person as an unconfirmed remote.
+/// gets, and the host would report "ready" and serve empty results for ever.
+/// The module search asks `whoami` with the service's own token first, fails
+/// closed with the mismatch, and never asks the module.
 #[tokio::test]
-async fn an_empty_200_from_the_module_for_a_wrong_name_asker_never_confirms_it() {
+async fn an_empty_200_from_the_module_for_a_wrong_name_asker_is_never_reached() {
     let w = World::new().await;
     local_people_with_a_valid_proof(&w);
     w.issuer.with(|s| {
@@ -3573,29 +3624,52 @@ async fn an_empty_200_from_the_module_for_a_wrong_name_asker_never_confirms_it()
     // does not know, a plain success with nothing in it.
     w.hs.on_module(|_, _| Resp::json(200, json!({"results": [], "limited": false})));
     let dir = misconfigured(&w);
-    let got = dir
+    let err = dir
         .search_for_asker(&w.session(), ASKER_DID, "a", 5)
         .await
-        .expect("the module answered");
-    assert!(states(&got).is_empty(), "the empty answer is passed on");
-    assert_eq!(w.hs.module_calls(), 1);
-    assert_eq!(w.hs.whoami_calls(), 0);
-
-    let err = dir
-        .search_as_user("user-token-fixture", "a", 5)
-        .await
-        .expect_err("local people would come back as unconfirmed remote people");
+        .expect_err("an empty answer under the wrong name is a silent failure");
     assert!(is_name_mismatch(&err), "{err}");
+    assert!(
+        !err.is_retryable(),
+        "the operator fixes it, a retry does not"
+    );
+    let text = err.to_string();
+    assert!(
+        !text.contains("asker-fixture")
+            && !text.contains("whoami-fixture")
+            && !text.contains(SERVER_NAME)
+            && !text.contains(WRONG_NAME),
+        "the message names neither a person nor a server: {text}"
+    );
+    assert_eq!(w.hs.module_calls(), 0, "the module is not asked");
     assert_eq!(w.hs.whoami_calls(), 1, "the homeserver was asked");
-    assert_eq!(w.hs.user_directory_calls(), 0, "the directory is not asked");
+    let whoami =
+        w.hs.mock
+            .requests()
+            .into_iter()
+            .find(|r| r.path == WHOAMI_PATH)
+            .unwrap();
+    assert_eq!(
+        whoami.bearer().as_deref(),
+        Some("access-1"),
+        "it is the service's own token that asks"
+    );
     assert_eq!(w.hs.profile_reads(), 0, "no profile is read");
-    // Nothing was kept: the next user search asks again and says the same.
+    // Nothing was kept: the next module search asks again and says the same.
+    assert!(is_name_mismatch(
+        &dir.search_for_asker(&w.session(), ASKER_DID, "a", 5)
+            .await
+            .unwrap_err()
+    ));
+    assert_eq!(w.hs.whoami_calls(), 2);
+    assert_eq!(w.hs.module_calls(), 0);
+    // Nor does the user transport find it confirmed.
     assert!(is_name_mismatch(
         &dir.search_as_user("user-token-fixture", "a", 5)
             .await
             .unwrap_err()
     ));
-    assert_eq!(w.hs.whoami_calls(), 2);
+    assert_eq!(w.hs.whoami_calls(), 3);
 }
 
 #[tokio::test]
@@ -3623,6 +3697,121 @@ async fn a_whoami_that_fails_is_the_searchs_error_and_is_not_kept() {
     w.hs.on_whoami(|_, _| Resp::json(200, json!({"user_id": mxid("someone")})));
     let got = dir.search_as_user("t", "a", 5).await.unwrap();
     assert_eq!(states(&got), vec![verified(&did_of("alice"))]);
+}
+
+/// The same on the module transport: a `whoami` that fails ends that search with
+/// its own error, the module is not asked, and nothing is kept.
+#[tokio::test]
+async fn a_whoami_that_fails_on_the_module_path_is_the_searchs_error_and_is_not_kept() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    let dir = w.directory();
+    let session = w.session();
+
+    w.hs.on_whoami(|_, _| Resp::json(502, json!({"errcode": "M_UNKNOWN"})));
+    let err = dir
+        .search_for_asker(&session, ASKER_DID, "a", 5)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DirectoryError::Unavailable(_)) && err.is_retryable());
+    w.hs.on_whoami(|_, _| Resp::json(429, json!({"errcode": "M_LIMIT_EXCEEDED"})));
+    let err = dir
+        .search_for_asker(&session, ASKER_DID, "a", 5)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DirectoryError::RateLimited { .. }) && err.is_retryable());
+    w.hs.on_whoami(|_, _| Resp::json(403, json!({"errcode": "M_FORBIDDEN"})));
+    assert!(matches!(
+        dir.search_for_asker(&session, ASKER_DID, "a", 5)
+            .await
+            .unwrap_err(),
+        DirectoryError::UnexpectedStatus { status: 403, .. }
+    ));
+    w.hs.on_whoami(|_, _| Resp::json(200, json!({"device_id": "D"})));
+    assert!(matches!(
+        dir.search_for_asker(&session, ASKER_DID, "a", 5)
+            .await
+            .unwrap_err(),
+        DirectoryError::Protocol(_)
+    ));
+    assert_eq!(w.hs.whoami_calls(), 4);
+    assert_eq!(
+        w.hs.module_calls(),
+        0,
+        "the module is never asked unchecked"
+    );
+
+    // None of it was kept as a verdict: the next honest answer works, and from
+    // then on `whoami` is not asked again.
+    w.hs.on_whoami(|_, _| Resp::json(200, json!({"user_id": mxid("service")})));
+    for _ in 0..2 {
+        let got = dir
+            .search_for_asker(&session, ASKER_DID, "a", 5)
+            .await
+            .unwrap();
+        assert_eq!(states(&got), vec![verified(&did_of("alice"))]);
+    }
+    assert_eq!(w.hs.whoami_calls(), 5);
+    assert_eq!(w.hs.module_calls(), 2);
+}
+
+#[tokio::test]
+async fn a_rejected_service_token_at_whoami_signs_in_again_once_and_retries_once() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    w.hs.on_whoami(|_, n| {
+        if n == 0 {
+            Resp::json(401, json!({"errcode": "M_UNKNOWN_TOKEN"}))
+        } else {
+            Resp::json(200, json!({"user_id": mxid("service")}))
+        }
+    });
+    let got = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .unwrap();
+    assert_eq!(states(&got), vec![verified(&did_of("alice"))]);
+    let bearers = |path: &str| -> Vec<String> {
+        w.hs.mock
+            .requests()
+            .iter()
+            .filter(|r| r.path == path)
+            .map(|r| r.bearer().unwrap())
+            .collect()
+    };
+    assert_eq!(bearers(WHOAMI_PATH), ["access-1", "access-2"]);
+    assert_eq!(bearers(MODULE_PATH), ["access-2"], "with the renewed token");
+    assert_eq!(w.issuer.sign_ins(), 2, "a fresh sign-in, not a refresh");
+}
+
+#[tokio::test]
+async fn a_second_401_at_whoami_is_unauthorized_and_the_module_is_not_asked() {
+    let w = World::new().await;
+    w.hs.on_whoami(|_, _| Resp::json(401, json!({"errcode": "M_UNKNOWN_TOKEN"})));
+    let err = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DirectoryError::Unauthorized), "{err:?}");
+    assert_eq!(w.hs.whoami_calls(), 2);
+    assert_eq!(w.issuer.sign_ins(), 2);
+    assert_eq!(w.hs.module_calls(), 0);
+}
+
+#[tokio::test]
+async fn when_the_host_owns_re_sign_in_a_whoami_401_is_unauthorized_and_nothing_signs_in() {
+    let w = World::new().await;
+    w.hs.on_whoami(|_, _| Resp::json(401, json!({"errcode": "M_UNKNOWN_TOKEN"})));
+    let err = directory_that_leaves_sign_in_to_the_host(&w)
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DirectoryError::Unauthorized), "{err:?}");
+    assert_eq!(w.hs.whoami_calls(), 1, "no retry");
+    assert_eq!(w.issuer.sign_ins(), 1, "and no second sign-in");
+    assert_eq!(w.hs.module_calls(), 0);
 }
 
 // ---------------------------------------------------------------------------

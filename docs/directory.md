@@ -142,19 +142,29 @@ from when the two differ (`matrix.example.org` behind a delegation of
 person of another server, whose claim is only shown, rests on it, and a wrong
 name would turn every local person into a foreign one: their valid proof ignored
 and their unsigned `did` member shown as a claim. So the client checks it. The
-asker of `search_for_asker`, and the owner of the token of `search_as_user`
-(`GET /_matrix/client/v3/account/whoami`, asked once, with the first search),
-are the homeserver's own people; one who is not on `server_name` is the
+asker of `search_for_asker` is the homeserver's own person, and so is the owner
+of the token of `search_as_user`; one who is not on `server_name` is the
 non-retryable `DirectoryError::ServerNameMismatch` and nothing else is asked or
 read. (An asker who does not exist has no MXID to check and gets the empty
 result.) A mismatch is never kept: every search says it again until the
-configuration is corrected. Only the homeserver confirms the name, and only
-through its `whoami`, asked by the first `search_as_user`, after which that
-client asks it no more. Nothing else confirms it: not the asker's MXID, because
-siwx-oidc builds it from its own configuration (with the same wrong name on both
-sides it would match), and not a module answer, because the module answers an
-asker that is not its own with a normal `200` and no results. The check of the
-asker in `search_for_asker` is a refusal for that call only.
+configuration is corrected.
+
+Only the homeserver confirms the name, and only through its
+`GET /_matrix/client/v3/account/whoami`, which each client asks **once**, with
+the first search of either transport and before anything else is asked of the
+homeserver on that search: `search_as_user` with the user's token,
+`search_for_asker` with the service's own token (the service account is a local
+user of the homeserver, so its real MXID is on the real name). After the name
+matched, that client asks it no more, on either transport. A `whoami` that fails
+is the error of the search that asked and is not kept; on the module transport a
+401 there signs the service in again and retries once, as for the module (and
+is `Unauthorized` at once when `with_sign_in_again_on_401(false)`). Nothing else
+confirms the name: not the asker's MXID, because siwx-oidc builds it from its own
+configuration (with the same wrong name on both sides it would match), and not a
+module answer, because the module answers an asker that is not its own with a
+normal `200` and no results, which would leave a host reporting "ready" and
+serving empty results. The check of the asker's string in `search_for_asker` is
+a refusal for that call only.
 
 **Hold one `DirectoryClient` and one `ServiceSession`.** The caches live in the
 client, and the single-flight token renewal lives in the session. The client is
@@ -296,6 +306,10 @@ so a consumer that matched that text keeps working until it matches the type.)
    **empty result**, the same as no match, and the module is not called. An asker
    who is not on the configured `server_name` is `ServerNameMismatch`, and the
    module is not called either.
+   Then, once per client, `GET {homeserver}/_matrix/client/v3/account/whoami`
+   with the service token confirms `server_name` with the homeserver's own word
+   ([Setting up a service](#setting-up-a-service)); another name is
+   `ServerNameMismatch` and the module is not called.
 2. `POST {homeserver}/_synapse/client/io.inblock/directory/v1/search` with the
    service token and `{"asker": "@…", "term": "…", "limit": n}`. The module
    searches as the asker through Synapse's own `search_users`, so the visibility
@@ -326,9 +340,11 @@ are read first, and one that cannot be read ends the search before any foreign
 server is asked; then the profiles of the people of other servers
 ([below](#people-of-other-homeservers)); then the proof check for the local
 ones. A local profile that cannot be read fails the search; a remote one only
-costs that person their claim. The first search of a client also asks
-`GET /account/whoami` with the token, once, to check `server_name` (see
-[Setting up a service](#setting-up-a-service)). The user's token is never
+costs that person their claim. The first search of a client, on either
+transport, also asks `GET /account/whoami` with the token, once, to check
+`server_name` (see [Setting up a service](#setting-up-a-service)); a client that
+has already asked it with the service's token on the module transport does not
+ask again. The user's token is never
 renewed here: a 401 is `Unauthorized` and the caller, who owns the session,
 renews it.
 
@@ -501,7 +517,7 @@ never the search term, a token or a response body.
 | `Unavailable` | network, timeout, 5xx, discovery or key set | yes |
 | `UnexpectedStatus { status, errcode }` | a status the client does not act on | no |
 | `Protocol` | an answer that is not the contract: malformed JSON, a row without a user id, a body over the cap | no |
-| `ServerNameMismatch` | the asker, or the owner of the user's token, is not on the configured `server_name` ([above](#setting-up-a-service)) | no |
+| `ServerNameMismatch` | the asker, the owner of the user's token, or (by `whoami`) the service account itself is not on the configured `server_name` ([above](#setting-up-a-service)) | no |
 
 ## Bounds
 
