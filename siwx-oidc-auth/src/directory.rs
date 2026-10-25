@@ -1389,10 +1389,12 @@ struct Inner {
     /// that finds it changed knows a fetch ran while it waited.
     key_fetches: AtomicU64,
     /// Set once the homeserver itself has vouched for `server_name`: its
-    /// `whoami` named a person on it, or its module answered for an asker on it.
-    /// Never set by a mismatch, and never by a string that the issuer built from
-    /// the same configuration, so a wrong name is answered with an error on
-    /// every user search.
+    /// `whoami` named a person on it, and nothing else sets it. Never a mismatch,
+    /// never a string that the issuer built from the same configuration, and
+    /// never a module answer: the module answers an asker it does not know with
+    /// a normal `200` and no results, so an answer cannot tell the homeserver's
+    /// own person from a string that matched. A wrong name is therefore answered
+    /// with an error on every user search.
     server_name_confirmed: AtomicBool,
 }
 
@@ -1536,8 +1538,8 @@ impl DirectoryClient {
             }
             other => other?,
         };
-        // The homeserver answered for this asker: its own person.
-        inner.server_name_confirmed.store(true, Ordering::Release);
+        // The answer confirms nothing, whatever its status or content: the
+        // module answers an unknown or foreign asker with a plain empty 200.
         inner.build_results(&body, limit).await
     }
 
@@ -1550,10 +1552,11 @@ impl DirectoryClient {
     ///
     /// The first search asks `GET /account/whoami` with the token, once, to learn
     /// that its owner is on [`DirectoryConfig::server_name`]; one who is not is
-    /// [`DirectoryError::ServerNameMismatch`] and the directory is not asked
-    /// (a module answer for an asker on the name, on the same client, already
-    /// makes this unnecessary; the asker's name alone does not, since the issuer
-    /// builds it from its own configuration). A local profile that cannot be read fails the search:
+    /// [`DirectoryError::ServerNameMismatch`] and the directory is not asked.
+    /// Only `whoami` confirms the name: neither a module answer on the same
+    /// client (the module answers an asker it does not know with a normal empty
+    /// `200`) nor the asker's name (the issuer builds it from its own
+    /// configuration) does. A local profile that cannot be read fails the search:
     /// its state is unknown, and `invalid` would be a claim about the person. A
     /// profile of another server's user is read for a claim
     /// ([`DidState::Unconfirmed`]) and never fails the search.
@@ -1777,9 +1780,9 @@ impl Inner {
     /// local person into a foreign one: their valid proof ignored, their unsigned
     /// `did` member shown. `local` is a person known to be the homeserver's own.
     ///
-    /// Only the homeserver can say so: `GET /account/whoami`, or a module answer
-    /// for the asker. This check alone is a refusal and never confirms
-    /// anything (see `server_name_confirmed`).
+    /// Only the homeserver can say so, and only through `GET /account/whoami`.
+    /// This check alone is a per-call refusal and never confirms anything, and
+    /// neither does a module answer (see `server_name_confirmed`).
     fn refuse_other_server(&self, local: &str) -> Result<(), DirectoryError> {
         if !self.is_local(local) {
             return Err(DirectoryError::ServerNameMismatch);

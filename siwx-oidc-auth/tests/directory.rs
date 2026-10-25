@@ -3481,30 +3481,37 @@ async fn the_homeservers_name_is_asked_once_and_not_again_after_it_matched() {
     );
 }
 
+/// A module answer confirms nothing, not even for an asker on the right name:
+/// the real module answers an asker it does not know with a normal 200, so an
+/// answer cannot tell "my own person" from "a string that matched". Only
+/// `whoami` confirms, and it is asked once, by the first user search.
 #[tokio::test]
-async fn an_asker_on_the_server_name_confirms_it_for_the_user_transport_too() {
+async fn a_module_answer_never_confirms_the_name_so_the_user_transport_asks_whoami() {
     let w = World::new().await;
     local_people_with_a_valid_proof(&w);
     let dir = w.directory();
     dir.search_for_asker(&w.session(), ASKER_DID, "a", 5)
         .await
         .unwrap();
-    dir.search_as_user("user-token-fixture", "a", 5)
-        .await
-        .unwrap();
+    assert_eq!(w.hs.whoami_calls(), 0, "the module transport never asks");
+    for _ in 0..2 {
+        dir.search_as_user("user-token-fixture", "a", 5)
+            .await
+            .unwrap();
+    }
     assert_eq!(
         w.hs.whoami_calls(),
-        0,
-        "the same deployment and the same name: nothing left to ask"
+        1,
+        "the first user search asks whoami, once; the module answer left nothing confirmed"
     );
 }
 
 /// The issuer builds the asker's MXID from its own config, so an asker that
 /// matches a wrong `server_name` says nothing about the homeserver: when the
 /// issuer and the client carry the same wrong name, the string matches. Only the
-/// homeserver may confirm the name (whoami, or a module answer for the asker),
-/// so a module call that fails leaves the name unconfirmed, and the user search
-/// on the same client asks whoami and fails closed.
+/// homeserver may confirm the name, and only `whoami` does: a module call that
+/// fails leaves the name unconfirmed, and the user search on the same client
+/// asks whoami and fails closed.
 #[tokio::test]
 async fn an_asker_string_on_a_wrong_name_never_confirms_it_for_the_user_transport() {
     for status in [403, 429, 502] {
@@ -3544,6 +3551,51 @@ async fn an_asker_string_on_a_wrong_name_never_confirms_it_for_the_user_transpor
         ));
         assert_eq!(w.hs.whoami_calls(), 2);
     }
+}
+
+/// The real module (`inblock_directory`, `module.py`) answers an asker that is
+/// not on its homeserver, or not known to it, with a normal
+/// `200 {"results": [], "limited": false}`. With the issuer and the client
+/// sharing one wrong (delegated) name, that is the answer the wrong-name asker
+/// gets, and it must not confirm the name: the following user search still asks
+/// `whoami`, fails closed, and shows no local person as an unconfirmed remote.
+#[tokio::test]
+async fn an_empty_200_from_the_module_for_a_wrong_name_asker_never_confirms_it() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    w.issuer.with(|s| {
+        s.resolve.insert(
+            ASKER_DID.to_string(),
+            format!("@asker-fixture:{WRONG_NAME}"),
+        );
+    });
+    // Not its own person: the module answers as it does for any asker it
+    // does not know, a plain success with nothing in it.
+    w.hs.on_module(|_, _| Resp::json(200, json!({"results": [], "limited": false})));
+    let dir = misconfigured(&w);
+    let got = dir
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .expect("the module answered");
+    assert!(states(&got).is_empty(), "the empty answer is passed on");
+    assert_eq!(w.hs.module_calls(), 1);
+    assert_eq!(w.hs.whoami_calls(), 0);
+
+    let err = dir
+        .search_as_user("user-token-fixture", "a", 5)
+        .await
+        .expect_err("local people would come back as unconfirmed remote people");
+    assert!(is_name_mismatch(&err), "{err}");
+    assert_eq!(w.hs.whoami_calls(), 1, "the homeserver was asked");
+    assert_eq!(w.hs.user_directory_calls(), 0, "the directory is not asked");
+    assert_eq!(w.hs.profile_reads(), 0, "no profile is read");
+    // Nothing was kept: the next user search asks again and says the same.
+    assert!(is_name_mismatch(
+        &dir.search_as_user("user-token-fixture", "a", 5)
+            .await
+            .unwrap_err()
+    ));
+    assert_eq!(w.hs.whoami_calls(), 2);
 }
 
 #[tokio::test]

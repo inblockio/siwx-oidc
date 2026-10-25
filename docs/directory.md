@@ -148,10 +148,13 @@ are the homeserver's own people; one who is not on `server_name` is the
 non-retryable `DirectoryError::ServerNameMismatch` and nothing else is asked or
 read. (An asker who does not exist has no MXID to check and gets the empty
 result.) A mismatch is never kept: every search says it again until the
-configuration is corrected. Only the homeserver confirms the name: its `whoami`,
-or its module answering for the asker, after which a client asks `whoami` no
-more. The asker's MXID alone confirms nothing, because siwx-oidc builds it from
-its own configuration: with the same wrong name on both sides it would match.
+configuration is corrected. Only the homeserver confirms the name, and only
+through its `whoami`, asked by the first `search_as_user`, after which that
+client asks it no more. Nothing else confirms it: not the asker's MXID, because
+siwx-oidc builds it from its own configuration (with the same wrong name on both
+sides it would match), and not a module answer, because the module answers an
+asker that is not its own with a normal `200` and no results. The check of the
+asker in `search_for_asker` is a refusal for that call only.
 
 **Hold one `DirectoryClient` and one `ServiceSession`.** The caches live in the
 client, and the single-flight token renewal lives in the session. The client is
