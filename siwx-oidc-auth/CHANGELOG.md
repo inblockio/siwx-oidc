@@ -292,6 +292,30 @@ matches error text should match the types named here instead.
   (`e.whoami_cause().unwrap_or(&e)`), which a `Resolve(Unauthorized)` is not.
   (The enum is `#[non_exhaustive]`, so a `match` with a wildcard arm still
   compiles.)
+- **A failure to get the issuer's discovery document or key set is
+  `DirectoryError::IssuerKeys(Box<DirectoryError>)`, not the plain error of the
+  directory.** After the module answered, the client fetches the issuer's public
+  `/.well-known/openid-configuration` and the `jwks_uri` it names to verify the
+  proofs of the rows. A failure there (a 401, a 403, a 404, a 429, a 5xx, a
+  timeout, a body that is not the document or the key set, a document that names
+  another issuer) came back as `Unavailable`, the same error as the module being
+  unreachable, so a host could not tell a wall in front of the issuer's public
+  documents from the module, nor see that the module had already taken the token.
+  It is now `IssuerKeys` with that `Unavailable` inside (its text names the step
+  and the status, never a body). Only a search that has no key set to judge by
+  fails like this, as before and still not kept; a proof that is malformed, that
+  the held key set does not verify, or whose `kid` the held set lacks while the
+  refetch for it fails is still `invalid` for its row and fails nothing, and a key
+  set that parses without a usable key still makes each proof `invalid`. New
+  `DirectoryError::is_issuer_keys()` and `issuer_keys_cause()`;
+  `is_retryable()`, `is_rate_limited()`, `retry_after()` and `is_unknown_client()`
+  answer for the cause (so `is_retryable()` is unchanged for these failures), and
+  `std::error::Error::source()` returns it. A host that matched `Unavailable`
+  from a search to mean "the directory or its issuer is down" must also look
+  inside `IssuerKeys`; a host that renews the service token on `Unauthorized`
+  needs no change, and must not renew for an `IssuerKeys`, which holds no token
+  refusal. (The enum is `#[non_exhaustive]`, so a `match` with a wildcard arm
+  still compiles.)
 - `DidState` has a new variant, `Unconfirmed`: a `match` on it that has no
   wildcard arm must handle it. A caller that offers recipients should keep
   offering `Verified` ones only unless it warns for `Unconfirmed`.

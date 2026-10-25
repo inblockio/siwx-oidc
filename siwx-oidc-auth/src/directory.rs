@@ -83,10 +83,12 @@
 //!
 //! # Errors
 //!
-//! An answer that could not be checked is an error, never a state: a network,
-//! discovery or key-set failure fails the whole search with a retryable
-//! [`DirectoryError`] and nothing of it is stored. Only a proof that was read
-//! and does not verify is `invalid`.
+//! An answer that could not be checked is an error, never a state: a network
+//! failure fails the whole search with a retryable [`DirectoryError`], and a
+//! discovery or key-set failure with [`DirectoryError::IssuerKeys`] (the issuer's
+//! public documents, never the module's word and never the service token), and
+//! nothing of either is stored. Only a proof that was read and does not verify
+//! is `invalid`.
 //!
 //! # Secrets
 //!
@@ -292,8 +294,10 @@ pub enum DirectoryError {
     /// refusal the server made is an [`AuthError`] in `source`; a client id the
     /// server does not know is [`DirectoryError::is_unknown_client`].
     SignIn { source: anyhow::Error },
-    /// A network, timeout, discovery, key-set or 5xx failure: the state is
-    /// unknown, try again later.
+    /// A network, timeout or 5xx failure: the state is unknown, try again
+    /// later. (A failure to get the issuer's discovery document or key set is the
+    /// same text inside [`DirectoryError::IssuerKeys`], and the cause of
+    /// that.)
     Unavailable(String),
     /// A status this client does not act on, with the homeserver's `errcode`
     /// when it sent a well-formed one.
@@ -359,6 +363,30 @@ pub enum DirectoryError {
     /// module was asked, and nothing of the failure is kept: the next search asks
     /// again.
     Resolve(Box<DirectoryError>),
+    /// The issuer's discovery document or key set could not be had, and the
+    /// inner error is how. It is the last request of a search: after the module
+    /// answered, the client fetches `/.well-known/openid-configuration` and the
+    /// `jwks_uri` it names (public, no token) to verify the proofs of the rows,
+    /// and it is told apart because the same failure means something else when the
+    /// homeserver or its module answers it: a 401 here is a proxy or a wall in
+    /// front of the issuer's public documents, never the service token refused
+    /// (the module has already taken it), and renewing the token cannot help; a
+    /// 404 is an issuer without discovery or a wrong `issuer_url`, where a 404
+    /// from the module says the module is not registered.
+    ///
+    /// The inner error is [`Unavailable`](DirectoryError::Unavailable), whatever
+    /// the document or the key set did (a status, a body that is not the
+    /// document, an issuer that names another issuer, a timeout): its text names
+    /// the step and the status, never a body. It is never another stage.
+    /// Only a search that has no key set to judge by fails like this. A proof
+    /// that is malformed, or that the key set does not verify, or whose `kid` the
+    /// held key set lacks while the refetch for it fails, is `invalid` for its
+    /// row and fails nothing (see [`DidState::Invalid`]).
+    /// [`is_retryable`](Self::is_retryable), [`is_rate_limited`](Self::is_rate_limited)
+    /// and [`retry_after`](Self::retry_after) answer for the inner error; read it
+    /// with [`issuer_keys_cause`](Self::issuer_keys_cause). The module did answer
+    /// and nothing of the failure is kept: the next search asks again.
+    IssuerKeys(Box<DirectoryError>),
 }
 
 impl DirectoryError {
@@ -401,6 +429,24 @@ impl DirectoryError {
         }
     }
 
+    /// Whether the failure is the issuer's discovery document or key set, not the
+    /// homeserver's or its module's answer: [`DirectoryError::IssuerKeys`]. Match
+    /// this (or [`issuer_keys_cause`](Self::issuer_keys_cause)) before reading
+    /// the failure: the service token was not involved, and the module had
+    /// already answered.
+    pub fn is_issuer_keys(&self) -> bool {
+        matches!(self, DirectoryError::IssuerKeys(_))
+    }
+
+    /// How the issuer's discovery document or key set failed, when it is what
+    /// failed ([`DirectoryError::IssuerKeys`]); `None` for every other error.
+    pub fn issuer_keys_cause(&self) -> Option<&DirectoryError> {
+        match self {
+            DirectoryError::IssuerKeys(cause) => Some(cause),
+            _ => None,
+        }
+    }
+
     /// Whether the service could not sign in because the server does not know its
     /// client id: a dynamic client lapses after 30 days without a use (see
     /// [`register_public_client`]). The remedy is to register again and keep the
@@ -409,9 +455,9 @@ impl DirectoryError {
     pub fn is_unknown_client(&self) -> bool {
         match self {
             DirectoryError::SignIn { source } => crate::is_unknown_client(source),
-            DirectoryError::Whoami(cause) | DirectoryError::Resolve(cause) => {
-                cause.is_unknown_client()
-            }
+            DirectoryError::Whoami(cause)
+            | DirectoryError::Resolve(cause)
+            | DirectoryError::IssuerKeys(cause) => cause.is_unknown_client(),
             _ => false,
         }
     }
@@ -426,9 +472,9 @@ impl DirectoryError {
         match self {
             DirectoryError::RateLimited { .. } => true,
             DirectoryError::SignIn { source } => crate::is_rate_limited(source),
-            DirectoryError::Whoami(cause) | DirectoryError::Resolve(cause) => {
-                cause.is_rate_limited()
-            }
+            DirectoryError::Whoami(cause)
+            | DirectoryError::Resolve(cause)
+            | DirectoryError::IssuerKeys(cause) => cause.is_rate_limited(),
             _ => false,
         }
     }
@@ -443,7 +489,9 @@ impl DirectoryError {
             DirectoryError::SignIn { source } => source
                 .downcast_ref::<AuthError>()
                 .and_then(AuthError::retry_after),
-            DirectoryError::Whoami(cause) | DirectoryError::Resolve(cause) => cause.retry_after(),
+            DirectoryError::Whoami(cause)
+            | DirectoryError::Resolve(cause)
+            | DirectoryError::IssuerKeys(cause) => cause.retry_after(),
             _ => None,
         }
     }
@@ -460,7 +508,9 @@ impl DirectoryError {
                 Some(typed) => typed.is_transient(),
                 None => true,
             },
-            DirectoryError::Whoami(cause) | DirectoryError::Resolve(cause) => cause.is_retryable(),
+            DirectoryError::Whoami(cause)
+            | DirectoryError::Resolve(cause)
+            | DirectoryError::IssuerKeys(cause) => cause.is_retryable(),
             DirectoryError::InvalidInput(_)
             | DirectoryError::NotAdmitted
             | DirectoryError::Unauthorized
@@ -503,6 +553,9 @@ impl fmt::Display for DirectoryError {
             ),
             DirectoryError::Whoami(cause) => write!(f, "whoami failed: {cause}"),
             DirectoryError::Resolve(cause) => write!(f, "resolve failed: {cause}"),
+            DirectoryError::IssuerKeys(cause) => {
+                write!(f, "the issuer's discovery or key set failed: {cause}")
+            }
         }
     }
 }
@@ -511,7 +564,9 @@ impl std::error::Error for DirectoryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             DirectoryError::SignIn { source } => Some(source.as_ref()),
-            DirectoryError::Whoami(cause) | DirectoryError::Resolve(cause) => Some(&**cause),
+            DirectoryError::Whoami(cause)
+            | DirectoryError::Resolve(cause)
+            | DirectoryError::IssuerKeys(cause) => Some(&**cause),
             _ => None,
         }
     }
@@ -1643,7 +1698,15 @@ impl DirectoryClient {
     /// with [`ServiceSession::invalidate_access_token`]); a 403 is
     /// [`DirectoryError::NotAdmitted`]; a 429 is [`DirectoryError::RateLimited`].
     /// Every local hit is then proof-checked; the profile of each hit on another
-    /// server is read for a claim ([`DidState::Unconfirmed`]).
+    /// server is read for a claim ([`DidState::Unconfirmed`]). The proof check
+    /// needs the issuer's discovery document and key set, fetched after the
+    /// module answered; a fetch that fails with none held is the error of that
+    /// search, as [`DirectoryError::IssuerKeys`] with the failure inside (a 401, a
+    /// 404, a 5xx, a timeout, a body that is not the document), never the plain
+    /// error of the same status, which is the module's own, and never the service
+    /// token refused: the module took the token, and the documents are public. It
+    /// is not kept. A proof the held key set cannot judge is `invalid` for its row
+    /// and fails nothing.
     ///
     /// An asker who is not on [`DirectoryConfig::server_name`] is
     /// [`DirectoryError::ServerNameMismatch`]: the asker is the homeserver's own
@@ -1750,7 +1813,9 @@ impl DirectoryClient {
     /// both. A local profile that cannot be read fails the search:
     /// its state is unknown, and `invalid` would be a claim about the person. A
     /// profile of another server's user is read for a claim
-    /// ([`DidState::Unconfirmed`]) and never fails the search.
+    /// ([`DidState::Unconfirmed`]) and never fails the search. A failure to get
+    /// the issuer's discovery document or key set, with none held, fails it as
+    /// [`DirectoryError::IssuerKeys`], never as the plain error of its status.
     pub async fn search_as_user(
         &self,
         user_token: &str,
@@ -2476,12 +2541,19 @@ impl Inner {
     }
 
     /// Discovery and the key set, from the cache or fetched. A failure is never
-    /// stored, so the next search asks again.
+    /// stored, so the next search asks again. It is the issuer's, and is told as
+    /// that ([`DirectoryError::IssuerKeys`]): the same failure from the module
+    /// means something else, and these are public documents that take no token.
+    /// (This is the one place a failure to get keys fails a search. A refetch for
+    /// an unknown `kid` goes through [`Inner::keys_after_unknown_kid`], which
+    /// never fails.)
     async fn keys(&self) -> Result<Arc<IssuerKeys>, DirectoryError> {
         if let Some(keys) = self.cached_keys() {
             return Ok(keys);
         }
-        self.fetch_keys(None).await
+        self.fetch_keys(None)
+            .await
+            .map_err(|cause| DirectoryError::IssuerKeys(Box::new(cause)))
     }
 
     /// The key set after a proof named a `kid` that `stale` lacks. A newer set

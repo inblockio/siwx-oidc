@@ -333,7 +333,11 @@ so a consumer that matched that text keeps working until it matches the type.)
    `{}` (the homeserver's directory is switched off) is an empty result.
 3. The claim read, for each hit on another homeserver
    ([below](#people-of-other-homeservers)).
-4. The proof check, per local hit.
+4. The proof check, per local hit. The first one that needs a key set fetches
+   the issuer's discovery document and key set (cached 5 minutes). A fetch that
+   fails, with none held, is `DirectoryError::IssuerKeys` with the failure inside:
+   the module has answered, the service token is not involved, and nothing is
+   kept.
 
 The status codes: 401 signs the service in again once and retries once (a second
 401 is `Unauthorized`; with `sign_in_again_on_401` off the first one is, and
@@ -442,12 +446,17 @@ Per hit:
 | a verified `(mxid, proof)` still cached | `verified`, no key needed |
 | a malformed proof, a bad signature, an `alg` other than ES256, a `kid` the issuer's current key set lacks (after one refetch, see below), an `iss` other than the issuer, a proof for another MXID | `invalid` |
 | a proof that verifies and names this MXID | `verified`, value = the signed `sub` |
-| the issuer's discovery or key set cannot be fetched and none is held | **an error for the whole search** |
+| the issuer's discovery or key set cannot be fetched and none is held (a status, a body that is not the document, an issuer that names another issuer, a timeout) | **an error for the whole search**: `IssuerKeys` |
+| a key set that parses but holds no usable key (`{"keys": []}`) | `invalid` for each proof; the search is not failed |
 | a `kid` the held key set lacks, and the refetch for it fails or is rate limited | `invalid` in this answer, nothing kept; the search is not failed |
 
 An answer that could not be checked is never turned into a state. Only a proof
 that was read and failed is `invalid`; a failure to get any key set is a retryable
-`Unavailable` error and nothing of it is stored, so the next search asks again.
+`IssuerKeys(Unavailable)` error and nothing of it is stored, so the next search
+asks again. It is told as the issuer's, never as the module's: the module has
+already answered when the keys are wanted, discovery and the key set are public
+and take no token, so a 401 there is a wall in front of the issuer and never the
+service token refused.
 A proof whose header is malformed is judged without any key fetch, so a search
 whose hits carry no proof fetches no keys at all.
 
@@ -469,7 +478,7 @@ fails does not fail the search either: that proof is `invalid` in this answer
 (and no verdict is kept, so the next search after the interval asks again), and
 the other rows are answered from the set held. Only a search that has no usable
 key set at all (none cached, and the fetch fails) fails, with the retryable
-`Unavailable`.
+`IssuerKeys(Unavailable)`.
 
 ## Caching
 
@@ -526,12 +535,13 @@ never the search term, a token or a response body.
 | `RateLimited { retry_after }` | 429 from the homeserver; `is_rate_limited()` and `retry_after()` also answer for a sign-in that was rate limited (below) | yes, after `retry_after` |
 | `Unauthorized` | the token was refused (for the service, even after a fresh sign-in) | no |
 | `SignIn { source }` | the service could not sign in; a 429 there is `AuthError::RateLimited` in the `source` (`is_rate_limited()`, `retry_after()`) | by cause (see above) |
-| `Unavailable` | network, timeout, 5xx, discovery or key set | yes |
+| `Unavailable` | network, timeout or 5xx of the homeserver or its module (the issuer's discovery and key set are `IssuerKeys`, below) | yes |
 | `UnexpectedStatus { status, errcode }` | a status the client does not act on | no |
 | `Protocol` | an answer that is not the contract: malformed JSON, a row without a user id, a body over the cap | no |
 | `ServerNameMismatch` | the asker, the owner of the user's token, or (by `whoami`) the service account itself is not on the configured `server_name` ([above](#setting-up-a-service)) | no |
 | `Whoami(cause)` | `GET /account/whoami`, the check of `server_name` before a client's first search on either transport, failed, and `cause` is how: a status (`UnexpectedStatus`, `Unauthorized`, `RateLimited`), a network failure (`Unavailable`) or a body without a user (`Protocol`). Told apart because the same status means something else from the directory: a 404 here is a homeserver URL (or a proxy) that does not answer `/_matrix/client/v3/account/whoami`, a 404 from the module is a module that is not registered. `is_whoami()` and `whoami_cause()` read it; `is_retryable()`, `is_rate_limited()` and `retry_after()` answer for the cause. A person of another server is `ServerNameMismatch`, not this | by the cause |
 | `Resolve(cause)` | `GET {issuer}/resolve`, the lookup of the asker that comes first in `search_for_asker`, failed, and `cause` is how: a status (`UnexpectedStatus`, `Unauthorized`, `RateLimited`), a network failure or a 5xx (`Unavailable`) or a body that is not the contract (`Protocol`). Told apart because the same status means something else from the homeserver: `/resolve` is public and takes no token, so its 401 is a proxy or a wall in front of the issuer and never a refused service token (renewing the token cannot help, and a host must not count it as one), its 429 is the issuer's rate limit, not the module's, and its 404 is an issuer without `/resolve` or a wrong `issuer_url`, not a module that is not registered. `is_resolve()` and `resolve_cause()` read it; `is_retryable()`, `is_rate_limited()` and `retry_after()` answer for the cause. An asker who does not exist is the empty result, and one of another server is `ServerNameMismatch`, not this | by the cause |
+| `IssuerKeys(cause)` | `GET {issuer}/.well-known/openid-configuration` or the `jwks_uri` it names, fetched after the module answered to verify the proofs of the rows, failed and no key set is held; `cause` is `Unavailable` whatever the document did (a status, a body that is not the document or the key set, an issuer that names another issuer, a timeout), its text naming the step and the status and never a body. Told apart because the same failure means something else from the module: both documents are public and take no token, so a 401 is a wall or proxy in front of the issuer and never the service token refused (renewing the token cannot help, and a host must not count it as one), and a 404 is an issuer without discovery or a wrong `issuer_url`, not a module that is not registered. `is_issuer_keys()` and `issuer_keys_cause()` read it; `is_retryable()`, `is_rate_limited()` and `retry_after()` answer for the cause. Only a search with no key set fails like this: a proof that is malformed, that the held set does not verify, or whose `kid` the held set lacks while the refetch fails (or is rate limited) is `invalid` for its row, and a key set that parses without a usable key makes each proof `invalid`; none of those fails the search | by the cause |
 
 ## Bounds
 

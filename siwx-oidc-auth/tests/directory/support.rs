@@ -401,6 +401,11 @@ pub struct IssuerState {
     pub jwks: Value,
     pub discovery_status: u16,
     pub jwks_status: u16,
+    /// A body, spelled any way (not JSON, JSON of the wrong shape), to answer a
+    /// `200` discovery request with instead of the document.
+    pub discovery_body: Option<String>,
+    /// The same for `/jwk`: what a `200` key-set request answers instead of the set.
+    pub jwks_body: Option<String>,
     pub jwks_delay: Duration,
     /// Answer `/jwk` with a 302 to this URL instead of the key set.
     pub jwks_redirect: Option<String>,
@@ -466,6 +471,8 @@ impl Issuer {
             jwks,
             discovery_status: 200,
             jwks_status: 200,
+            discovery_body: None,
+            jwks_body: None,
             jwks_delay: Duration::ZERO,
             jwks_redirect: None,
             sign_in_delay: Duration::ZERO,
@@ -547,6 +554,9 @@ fn issuer_route(st: &Arc<Mutex<IssuerState>>, r: &Req) -> Resp {
             if s.discovery_status != 200 {
                 return Resp::json(s.discovery_status, json!({"error": "fixture"}));
             }
+            if let Some(body) = &s.discovery_body {
+                return Resp::bytes(200, body.clone().into_bytes());
+            }
             let issuer = s.discovery_issuer.clone().unwrap_or_else(|| base.clone());
             Resp::json(
                 200,
@@ -559,6 +569,9 @@ fn issuer_route(st: &Arc<Mutex<IssuerState>>, r: &Req) -> Resp {
             }
             if s.jwks_status != 200 {
                 return Resp::json(s.jwks_status, json!({"error": "fixture"}));
+            }
+            if let Some(body) = &s.jwks_body {
+                return Resp::bytes(200, body.clone().into_bytes()).delayed(s.jwks_delay);
             }
             Resp::json(200, s.jwks.clone()).delayed(s.jwks_delay)
         }

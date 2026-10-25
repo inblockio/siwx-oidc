@@ -1316,7 +1316,10 @@ async fn a_failure_to_get_the_keys_fails_the_search_and_is_stored_nowhere() {
             .search_for_asker(&session, ASKER_DID, "a", 5)
             .await
             .unwrap_err();
-        assert!(matches!(err, DirectoryError::Unavailable(_)), "{err:?}");
+        assert!(
+            matches!(issuer_keys_cause(&err), DirectoryError::Unavailable(_)),
+            "{err:?}"
+        );
         assert!(err.is_retryable());
         let stats = dir.cache_stats();
         assert_eq!((stats.verified, stats.keys_cached), (0, false));
@@ -1346,7 +1349,10 @@ async fn a_discovery_document_naming_another_issuer_verifies_nothing() {
         .search_for_asker(&w.session(), ASKER_DID, "a", 5)
         .await
         .unwrap_err();
-    assert!(matches!(err, DirectoryError::Unavailable(_)), "{err:?}");
+    assert!(
+        matches!(issuer_keys_cause(&err), DirectoryError::Unavailable(_)),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -1994,7 +2000,10 @@ async fn a_failed_key_set_fetch_is_shared_by_the_searches_that_waited_for_it() {
     }
     for t in tasks {
         let err = t.await.unwrap().unwrap_err();
-        assert!(matches!(err, DirectoryError::Unavailable(_)), "{err:?}");
+        assert!(
+            matches!(issuer_keys_cause(&err), DirectoryError::Unavailable(_)),
+            "{err:?}"
+        );
         assert!(err.is_retryable());
     }
     assert_eq!(w.issuer.mock.count("GET", "/jwk"), 1, "one attempt, shared");
@@ -4376,6 +4385,331 @@ fn the_resolve_error_answers_the_helpers_for_its_cause() {
     assert!(!DirectoryError::Unauthorized.is_resolve());
     assert!(DirectoryError::Unauthorized.resolve_cause().is_none());
     assert!(!DirectoryError::Whoami(Box::new(DirectoryError::Unauthorized)).is_resolve());
+}
+
+// ---------------------------------------------------------------------------
+// An issuer-key failure is told apart from the module's, whoami's and resolve's
+// ---------------------------------------------------------------------------
+
+/// How the issuer's discovery document or key set failed; fails the test when
+/// `e` is not a failure of that stage.
+fn issuer_keys_cause(e: &DirectoryError) -> &DirectoryError {
+    assert!(
+        e.is_issuer_keys(),
+        "not reported as an issuer-key failure: {e:?}"
+    );
+    assert!(
+        !e.is_whoami()
+            && !e.is_resolve()
+            && e.whoami_cause().is_none()
+            && e.resolve_cause().is_none(),
+        "an issuer-key failure is neither a whoami nor a resolve failure: {e:?}"
+    );
+    e.issuer_keys_cause()
+        .unwrap_or_else(|| panic!("is_issuer_keys without a cause: {e:?}"))
+}
+
+/// Ways the issuer's public discovery document or key set can fail. The issuer
+/// answers all of them after the module has answered, and none involves the
+/// service token.
+#[derive(Clone, Copy, Debug)]
+enum KeysFault {
+    DiscoveryStatus(u16),
+    DiscoveryBody(&'static str),
+    KeySetStatus(u16),
+    KeySetBody(&'static str),
+}
+
+const KEYS_FAULTS: [KeysFault; 18] = [
+    KeysFault::DiscoveryStatus(401),
+    KeysFault::DiscoveryStatus(403),
+    KeysFault::DiscoveryStatus(404),
+    KeysFault::DiscoveryStatus(429),
+    KeysFault::DiscoveryStatus(500),
+    KeysFault::DiscoveryStatus(503),
+    KeysFault::DiscoveryBody("this is not json"),
+    KeysFault::DiscoveryBody(""),
+    KeysFault::DiscoveryBody(r#"{"unexpected": true}"#),
+    KeysFault::KeySetStatus(401),
+    KeysFault::KeySetStatus(403),
+    KeysFault::KeySetStatus(404),
+    KeysFault::KeySetStatus(429),
+    KeysFault::KeySetStatus(500),
+    KeysFault::KeySetStatus(503),
+    KeysFault::KeySetBody("this is not json"),
+    KeysFault::KeySetBody(""),
+    KeysFault::KeySetBody(r#"{"keys": "not a list"}"#),
+];
+
+fn break_the_keys(w: &World, fault: KeysFault) {
+    w.issuer.with(|s| match fault {
+        KeysFault::DiscoveryStatus(status) => s.discovery_status = status,
+        KeysFault::DiscoveryBody(body) => s.discovery_body = Some(body.into()),
+        KeysFault::KeySetStatus(status) => s.jwks_status = status,
+        KeysFault::KeySetBody(body) => s.jwks_body = Some(body.into()),
+    });
+}
+
+fn mend_the_keys(w: &World) {
+    w.issuer.with(|s| {
+        s.discovery_status = 200;
+        s.discovery_body = None;
+        s.jwks_status = 200;
+        s.jwks_body = None;
+    });
+}
+
+/// The issuer's discovery document and key set are public: a 401 there is a
+/// proxy or a wall in front of the issuer, never the service token refused, and
+/// renewing the token cannot help. Every way they fail, after the module has
+/// answered, is told as the issuer's: nothing signs in again, the module is not
+/// asked again, and the failure is kept nowhere.
+#[tokio::test]
+async fn an_issuer_keys_failure_is_an_issuer_keys_stage_failure() {
+    for fault in KEYS_FAULTS {
+        let w = World::new().await;
+        w.hs.module_hits(vec![published(&w, "alice")]);
+        let dir = w.directory();
+        let session = w.session();
+        break_the_keys(&w, fault);
+        let err = match dir.search_for_asker(&session, ASKER_DID, "a", 5).await {
+            Err(err) => err,
+            Ok(got) => panic!("{fault:?}: the search did not fail: {got:?}"),
+        };
+        let cause = issuer_keys_cause(&err);
+        assert!(
+            !matches!(
+                cause,
+                DirectoryError::Unauthorized | DirectoryError::NotAdmitted
+            ),
+            "{fault:?}: the service token was not involved: {err:?}"
+        );
+        assert!(
+            matches!(cause, DirectoryError::Unavailable(_)),
+            "{fault:?}: {err:?}"
+        );
+        assert!(err.is_retryable() && !err.is_rate_limited(), "{fault:?}");
+        let text = err.to_string();
+        assert!(
+            text.contains("issuer") && !text.contains("access token was refused"),
+            "{fault:?}: {text}"
+        );
+        if let KeysFault::DiscoveryStatus(status) | KeysFault::KeySetStatus(status) = fault {
+            assert!(text.contains(&status.to_string()), "{fault:?}: {text}");
+        }
+        // The module answered, once; nothing was renewed or retried.
+        assert_eq!(w.hs.module_calls(), 1, "{fault:?}");
+        assert_eq!(
+            w.issuer.sign_ins(),
+            1,
+            "{fault:?}: a signed-in service is not signed in again"
+        );
+        assert_eq!(w.issuer.mock.count("GET", "/resolve"), 1, "{fault:?}");
+        let stats = dir.cache_stats();
+        assert_eq!((stats.verified, stats.keys_cached), (0, false), "{fault:?}");
+
+        // The issuer comes back: the same search verifies, so nothing was kept.
+        mend_the_keys(&w);
+        let again = dir
+            .search_for_asker(&session, ASKER_DID, "a", 5)
+            .await
+            .unwrap();
+        assert!(again.results[0].did.verified_did().is_some(), "{fault:?}");
+    }
+}
+
+/// The same when the key set was held and has lapsed: the refetch is the first
+/// the search needs, and a 401 on it is the issuer's.
+#[tokio::test]
+async fn a_lapsed_key_set_that_cannot_be_fetched_again_is_an_issuer_keys_failure() {
+    let w = World::new().await;
+    w.hs.module_hits(vec![published(&w, "alice")]);
+    let dir = w.directory();
+    let session = w.session();
+    dir.search_for_asker(&session, ASKER_DID, "a", 5)
+        .await
+        .unwrap();
+    // A new verdict is needed: the cached one lapses with the key set.
+    w.clock.advance(11 * MIN);
+    w.issuer.with(|s| s.jwks_status = 401);
+    let err = dir
+        .search_for_asker(&session, ASKER_DID, "a", 5)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(issuer_keys_cause(&err), DirectoryError::Unavailable(_)),
+        "{err:?}"
+    );
+    assert_eq!(
+        w.issuer.sign_ins(),
+        1,
+        "the 401 of the key set renews nothing"
+    );
+}
+
+/// The user's own token is no different: the key set is the issuer's.
+#[tokio::test]
+async fn an_issuer_keys_failure_on_a_user_search_is_an_issuer_keys_failure() {
+    let w = World::new().await;
+    let a = mxid("alice");
+    w.hs.directory_rows(vec![json!({"user_id": a, "display_name": "Alice"})]);
+    w.hs.profile(&a, Some(w.issuer.field(&did_of("Alice"), &a)));
+    w.issuer.with(|s| s.jwks_status = 401);
+    let err = w
+        .directory()
+        .search_as_user("user-token-fixture", "al", 5)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(issuer_keys_cause(&err), DirectoryError::Unavailable(_)),
+        "{err:?}"
+    );
+    assert!(!matches!(err, DirectoryError::Unauthorized), "{err:?}");
+}
+
+/// A module 401 stays the module's: the key set is never fetched for it, and
+/// whatever state the issuer's keys are in changes nothing.
+#[tokio::test]
+async fn a_module_401_is_not_an_issuer_keys_failure() {
+    let w = World::new().await;
+    w.issuer.with(|s| s.jwks_status = 401);
+    w.hs.on_module(|_, _| Resp::json(401, json!({"errcode": "M_UNKNOWN_TOKEN"})));
+    let err = directory_that_leaves_sign_in_to_the_host(&w)
+        .search_for_asker(&w.session(), ASKER_DID, "ada", 5)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DirectoryError::Unauthorized), "{err:?}");
+    assert!(
+        !err.is_issuer_keys() && err.issuer_keys_cause().is_none(),
+        "{err:?}"
+    );
+    assert_eq!(w.issuer.mock.count("GET", "/jwk"), 0);
+    assert_eq!(
+        w.issuer
+            .mock
+            .count("GET", "/.well-known/openid-configuration"),
+        0
+    );
+}
+
+/// Only a failure that fails the search is the stage. A proof the held key set
+/// cannot judge is `invalid` for its row, whatever the refetch for it did: a 401
+/// or a garbage key set there fails nothing.
+#[tokio::test]
+async fn a_failed_refetch_for_an_unknown_kid_stays_a_row_level_invalid() {
+    for fault in [
+        KeysFault::KeySetStatus(401),
+        KeysFault::KeySetStatus(404),
+        KeysFault::KeySetBody("this is not json"),
+        KeysFault::DiscoveryStatus(401),
+    ] {
+        let w = World::new().await;
+        let dir = w.directory();
+        let session = w.session();
+        w.hs.module_hits(vec![published(&w, "alice")]);
+        dir.search_for_asker(&session, ASKER_DID, "a", 5)
+            .await
+            .unwrap();
+
+        let new_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        break_the_keys(&w, fault);
+        w.hs.module_hits(vec![
+            signed_by(&w, &new_key, "fixture-kid-2", "carol"),
+            published(&w, "alice"),
+        ]);
+        w.clock.advance(Duration::from_secs(30));
+        let got = dir
+            .search_for_asker(&session, ASKER_DID, "a", 5)
+            .await
+            .unwrap_or_else(|e| panic!("{fault:?}: a failed refetch fails no search: {e:?}"));
+        assert_eq!(
+            states(&got),
+            vec![json!({"state": "invalid"}), verified(&did_of("alice"))],
+            "{fault:?}"
+        );
+    }
+}
+
+/// A key set that parses is a key set, even one without a usable key: every proof
+/// is judged against it and none verifies, so each row is `invalid` and the
+/// search does not fail. (What cannot be read as a key set at all is the stage.)
+#[tokio::test]
+async fn a_key_set_without_a_usable_key_makes_rows_invalid_and_fails_nothing() {
+    for body in [r#"{"unexpected": true}"#, r#"{"keys": []}"#] {
+        let w = World::new().await;
+        w.hs.module_hits(vec![published(&w, "alice")]);
+        w.issuer.with(|s| s.jwks_body = Some(body.into()));
+        let got = w
+            .directory()
+            .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+            .await
+            .unwrap_or_else(|e| panic!("{body}: a readable key set fails no search: {e:?}"));
+        assert_eq!(states(&got), vec![json!({"state": "invalid"})], "{body}");
+    }
+}
+
+/// A proof that is malformed is judged `invalid` before any key is wanted, so a
+/// dead issuer cannot fail the search for it.
+#[tokio::test]
+async fn a_malformed_proof_needs_no_keys_and_fails_nothing() {
+    let w = World::new().await;
+    let m = mxid("alice");
+    w.hs.module_hits(vec![hit(
+        &m,
+        Some("alice"),
+        Some(json!({"did": did_of("alice"), "proof": "not-a-jws"})),
+    )]);
+    w.issuer.with(|s| s.discovery_status = 401);
+    let got = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .unwrap();
+    assert_eq!(states(&got), vec![json!({"state": "invalid"})]);
+    assert_eq!(
+        w.issuer
+            .mock
+            .count("GET", "/.well-known/openid-configuration"),
+        0
+    );
+}
+
+/// The helpers answer for the inner error, and the error carries its cause.
+#[test]
+fn the_issuer_keys_error_answers_the_helpers_for_its_cause() {
+    use std::error::Error;
+    let wrap = |cause| DirectoryError::IssuerKeys(Box::new(cause));
+
+    let down = wrap(DirectoryError::Unavailable(
+        "the issuer's keys: GET the `jwks_uri` returned 401 Unauthorized".into(),
+    ));
+    assert!(down.is_retryable() && down.is_issuer_keys() && !down.is_rate_limited());
+    for fatal in [
+        DirectoryError::Unauthorized,
+        DirectoryError::Protocol("the key set is something else".into()),
+        DirectoryError::UnexpectedStatus {
+            status: 404,
+            errcode: None,
+        },
+    ] {
+        assert!(!wrap(fatal).is_retryable());
+    }
+    let limited = wrap(DirectoryError::RateLimited {
+        retry_after: Some(Duration::from_secs(3)),
+    });
+    assert!(limited.is_retryable() && limited.is_rate_limited());
+    assert_eq!(limited.retry_after(), Some(Duration::from_secs(3)));
+    assert!(!limited.is_unknown_client());
+
+    assert!(down.source().is_some(), "the cause is the source");
+    let text = down.to_string();
+    assert!(text.contains("issuer") && text.contains("401"), "{text}");
+    assert!(!down.is_whoami() && down.whoami_cause().is_none());
+    assert!(!down.is_resolve() && down.resolve_cause().is_none());
+    assert!(!DirectoryError::Unauthorized.is_issuer_keys());
+    assert!(DirectoryError::Unauthorized.issuer_keys_cause().is_none());
+    assert!(!DirectoryError::Whoami(Box::new(DirectoryError::Unauthorized)).is_issuer_keys());
+    assert!(!DirectoryError::Resolve(Box::new(DirectoryError::Unauthorized)).is_issuer_keys());
 }
 
 // ---------------------------------------------------------------------------
