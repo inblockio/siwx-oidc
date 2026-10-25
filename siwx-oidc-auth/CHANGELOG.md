@@ -270,6 +270,52 @@ matches error text should match the types named here instead.
   `Whoami(Unauthorized)` and a later one, once the name is confirmed, the plain
   `Unauthorized` of the directory call. (The enum is `#[non_exhaustive]`, so a
   `match` with a wildcard arm still compiles.)
+- **A failed lookup of the asker is `DirectoryError::Resolve(Box<DirectoryError>)`,
+  not the plain error of its status.** `search_for_asker` asks the issuer's
+  `GET /resolve` first, and its failure came back as the same error as the
+  homeserver's or the directory module's own answer, so a host could not tell a
+  proxy that answers 401 in front of the issuer from the service token being
+  refused (and renewed it for nothing, or kept a token-refusal backoff it should
+  have cleared), nor the issuer's 429 from the module's, nor an issuer without
+  `/resolve` from a module that is not registered. Every failure of that request
+  (a 401, a 404, a 429, a 5xx, a timeout, a body that is not the contract) is now
+  `Resolve` with the failure inside; neither `whoami` nor the module is asked, the
+  service does not sign in, and nothing is kept. An asker that does not exist, or a
+  DID no sign-in could accept, is still the empty result, and an asker of another
+  server is still `ServerNameMismatch`. New `DirectoryError::is_resolve()` and
+  `resolve_cause()`; `is_retryable()`, `is_rate_limited()`, `retry_after()` and
+  `is_unknown_client()` answer for the cause, and `std::error::Error::source()`
+  returns it. A host that matched `Unauthorized`, `RateLimited`, `Unavailable`,
+  `UnexpectedStatus` or `Protocol` from `search_for_asker` must also look inside
+  `Resolve`; a host that renews the service token on `Unauthorized` should keep
+  matching the module's and `whoami`'s refusal only
+  (`e.whoami_cause().unwrap_or(&e)`), which a `Resolve(Unauthorized)` is not.
+  (The enum is `#[non_exhaustive]`, so a `match` with a wildcard arm still
+  compiles.)
+- **A failure to get the issuer's discovery document or key set is
+  `DirectoryError::IssuerKeys(Box<DirectoryError>)`, not the plain error of the
+  directory.** After the module answered, the client fetches the issuer's public
+  `/.well-known/openid-configuration` and the `jwks_uri` it names to verify the
+  proofs of the rows. A failure there (a 401, a 403, a 404, a 429, a 5xx, a
+  timeout, a body that is not the document or the key set, a document that names
+  another issuer) came back as `Unavailable`, the same error as the module being
+  unreachable, so a host could not tell a wall in front of the issuer's public
+  documents from the module, nor see that the module had already taken the token.
+  It is now `IssuerKeys` with that `Unavailable` inside (its text names the step
+  and the status, never a body). Only a search that has no key set to judge by
+  fails like this, as before and still not kept; a proof that is malformed, that
+  the held key set does not verify, or whose `kid` the held set lacks while the
+  refetch for it fails is still `invalid` for its row and fails nothing, and a key
+  set that parses without a usable key still makes each proof `invalid`. New
+  `DirectoryError::is_issuer_keys()` and `issuer_keys_cause()`;
+  `is_retryable()`, `is_rate_limited()`, `retry_after()` and `is_unknown_client()`
+  answer for the cause (so `is_retryable()` is unchanged for these failures), and
+  `std::error::Error::source()` returns it. A host that matched `Unavailable`
+  from a search to mean "the directory or its issuer is down" must also look
+  inside `IssuerKeys`; a host that renews the service token on `Unauthorized`
+  needs no change, and must not renew for an `IssuerKeys`, which holds no token
+  refusal. (The enum is `#[non_exhaustive]`, so a `match` with a wildcard arm
+  still compiles.)
 - `DidState` has a new variant, `Unconfirmed`: a `match` on it that has no
   wildcard arm must handle it. A caller that offers recipients should keep
   offering `Verified` ones only unless it warns for `Unconfirmed`.

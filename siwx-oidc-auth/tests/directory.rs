@@ -547,7 +547,10 @@ async fn an_issuer_that_cannot_answer_resolve_fails_the_search_retryably() {
         .search_for_asker(&w.session(), ASKER_DID, "ada", 5)
         .await
         .unwrap_err();
-    assert!(matches!(err, DirectoryError::Unavailable(_)), "{err:?}");
+    assert!(
+        matches!(resolve_cause(&err), DirectoryError::Unavailable(_)),
+        "{err:?}"
+    );
     assert!(err.is_retryable());
     assert_eq!(w.hs.module_calls(), 0);
 }
@@ -1313,7 +1316,10 @@ async fn a_failure_to_get_the_keys_fails_the_search_and_is_stored_nowhere() {
             .search_for_asker(&session, ASKER_DID, "a", 5)
             .await
             .unwrap_err();
-        assert!(matches!(err, DirectoryError::Unavailable(_)), "{err:?}");
+        assert!(
+            matches!(issuer_keys_cause(&err), DirectoryError::Unavailable(_)),
+            "{err:?}"
+        );
         assert!(err.is_retryable());
         let stats = dir.cache_stats();
         assert_eq!((stats.verified, stats.keys_cached), (0, false));
@@ -1343,7 +1349,10 @@ async fn a_discovery_document_naming_another_issuer_verifies_nothing() {
         .search_for_asker(&w.session(), ASKER_DID, "a", 5)
         .await
         .unwrap_err();
-    assert!(matches!(err, DirectoryError::Unavailable(_)), "{err:?}");
+    assert!(
+        matches!(issuer_keys_cause(&err), DirectoryError::Unavailable(_)),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -1991,7 +2000,10 @@ async fn a_failed_key_set_fetch_is_shared_by_the_searches_that_waited_for_it() {
     }
     for t in tasks {
         let err = t.await.unwrap().unwrap_err();
-        assert!(matches!(err, DirectoryError::Unavailable(_)), "{err:?}");
+        assert!(
+            matches!(issuer_keys_cause(&err), DirectoryError::Unavailable(_)),
+            "{err:?}"
+        );
         assert!(err.is_retryable());
     }
     assert_eq!(w.issuer.mock.count("GET", "/jwk"), 1, "one attempt, shared");
@@ -3935,6 +3947,10 @@ async fn when_the_host_owns_re_sign_in_a_whoami_401_is_unauthorized_and_nothing_
 /// of that stage.
 fn whoami_cause(e: &DirectoryError) -> &DirectoryError {
     assert!(e.is_whoami(), "not reported as a whoami failure: {e:?}");
+    assert!(
+        !e.is_resolve() && e.resolve_cause().is_none(),
+        "a whoami failure is not a resolve failure: {e:?}"
+    );
     e.whoami_cause()
         .unwrap_or_else(|| panic!("is_whoami without a cause: {e:?}"))
 }
@@ -4074,6 +4090,8 @@ async fn a_module_failure_is_still_a_module_failure() {
             .unwrap_err();
         assert!(!err.is_whoami(), "{status}: {err:?}");
         assert!(err.whoami_cause().is_none(), "{status}: {err:?}");
+        assert!(!err.is_resolve(), "{status}: {err:?}");
+        assert!(err.resolve_cause().is_none(), "{status}: {err:?}");
         match status {
             404 => assert!(
                 matches!(err, DirectoryError::UnexpectedStatus { status: 404, .. }),
@@ -4142,6 +4160,556 @@ fn the_whoami_error_answers_the_helpers_for_its_cause() {
     );
     assert!(!DirectoryError::Unauthorized.is_whoami());
     assert!(DirectoryError::Unauthorized.whoami_cause().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// A resolve failure is told apart from the homeserver's and the module's answer
+// ---------------------------------------------------------------------------
+
+/// How `GET /resolve` failed; fails the test when `e` is not a failure of that
+/// stage.
+fn resolve_cause(e: &DirectoryError) -> &DirectoryError {
+    assert!(e.is_resolve(), "not reported as a resolve failure: {e:?}");
+    assert!(
+        !e.is_whoami() && e.whoami_cause().is_none(),
+        "a resolve failure is not a whoami failure: {e:?}"
+    );
+    e.resolve_cause()
+        .unwrap_or_else(|| panic!("is_resolve without a cause: {e:?}"))
+}
+
+/// The lookup of the asker is the issuer's, and every way it fails is told as
+/// that: a 401 is not the module refusing the service token, a 429 not the
+/// module's rate limit, a 404 not a module that is not registered. Nothing else
+/// is asked (not `whoami`, not the module) and the service does not sign in.
+#[tokio::test]
+async fn a_resolve_failure_is_a_resolve_stage_failure() {
+    for status in [401u16, 404, 429, 500, 502, 503] {
+        let w = World::new().await;
+        w.issuer.with(|s| s.resolve_status = status);
+        let err = w
+            .directory()
+            .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+            .await
+            .unwrap_err();
+        let cause = resolve_cause(&err);
+        match status {
+            401 => assert!(matches!(cause, DirectoryError::Unauthorized), "{err:?}"),
+            404 => assert!(
+                matches!(cause, DirectoryError::UnexpectedStatus { status: 404, .. }),
+                "{err:?}"
+            ),
+            429 => assert!(
+                matches!(cause, DirectoryError::RateLimited { .. }),
+                "{err:?}"
+            ),
+            _ => assert!(matches!(cause, DirectoryError::Unavailable(_)), "{err:?}"),
+        }
+        assert_eq!(
+            err.is_retryable(),
+            status == 429 || status >= 500,
+            "{status}"
+        );
+        assert_eq!(err.is_rate_limited(), status == 429, "{status}");
+        assert_eq!(w.hs.whoami_calls(), 0, "{status}");
+        assert_eq!(w.hs.module_calls(), 0, "{status}");
+        assert_eq!(
+            w.issuer.mock.count("POST", "/token"),
+            0,
+            "{status}: a resolve failure signs the service in for nothing"
+        );
+    }
+}
+
+/// An answer of `/resolve` that is not the contract is a resolve failure too:
+/// not JSON, JSON of another shape, an account without an MXID.
+#[tokio::test]
+async fn a_resolve_body_that_is_garbage_is_a_resolve_stage_failure() {
+    for body in [
+        "this is not json",
+        "",
+        r#"{"unexpected": true}"#,
+        r#"{"exists": true}"#,
+        r#"{"exists": true, "mxid": "not an mxid"}"#,
+    ] {
+        let w = World::new().await;
+        w.issuer.with(|s| s.resolve_body = Some(body.to_string()));
+        let err = w
+            .directory()
+            .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(resolve_cause(&err), DirectoryError::Protocol(_)),
+            "{body:?}: {err:?}"
+        );
+        assert!(!err.is_retryable(), "{body:?}");
+        assert_eq!(w.hs.whoami_calls(), 0, "{body:?}");
+        assert_eq!(w.hs.module_calls(), 0, "{body:?}");
+    }
+}
+
+/// The rate limit of `/resolve` keeps its hint inside the wrapper.
+#[tokio::test]
+async fn a_resolve_rate_limit_keeps_its_hint() {
+    let w = World::new().await;
+    w.issuer.with(|s| {
+        s.resolve_status = 429;
+        s.resolve_retry_after = Some("7".into());
+    });
+    let err = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(resolve_cause(&err), DirectoryError::RateLimited { .. }),
+        "{err:?}"
+    );
+    assert!(err.is_rate_limited() && err.is_retryable());
+    assert_eq!(err.retry_after(), Some(Duration::from_secs(7)));
+}
+
+/// A resolve failure is the error of that search and is kept nowhere: the next
+/// search asks again, and an honest answer works.
+#[tokio::test]
+async fn a_resolve_failure_is_not_kept() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    let dir = w.directory();
+    let session = w.session();
+    w.issuer.with(|s| s.resolve_status = 429);
+    for _ in 0..2 {
+        let err = dir
+            .search_for_asker(&session, ASKER_DID, "a", 5)
+            .await
+            .unwrap_err();
+        assert!(resolve_cause(&err).is_rate_limited());
+    }
+    assert_eq!(w.issuer.mock.count("GET", "/resolve"), 2, "asked again");
+    w.issuer.with(|s| s.resolve_status = 200);
+    dir.search_for_asker(&session, ASKER_DID, "a", 5)
+        .await
+        .unwrap();
+    assert_eq!(w.issuer.mock.count("GET", "/resolve"), 3);
+}
+
+/// What `/resolve` answers without failing stays what it was: a DID no sign-in
+/// could accept (400) and an unknown asker are the empty result, and an asker of
+/// another server is the name mismatch, not a resolve failure.
+#[tokio::test]
+async fn an_answer_of_resolve_is_not_a_resolve_failure() {
+    let w = World::new().await;
+    w.issuer.with(|s| s.resolve_status = 400);
+    let got = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .unwrap();
+    assert!(got.results.is_empty());
+
+    let w = World::new().await;
+    let got = w
+        .directory()
+        .search_for_asker(&w.session(), "did:key:zNoSuchAccountFixture", "a", 5)
+        .await
+        .unwrap();
+    assert!(got.results.is_empty());
+    assert!(!got.homeserver_answered());
+
+    // An invalid input is checked before any request and is neither stage.
+    let err = w
+        .directory()
+        .search_for_asker(&w.session(), "", "a", 5)
+        .await
+        .unwrap_err();
+    assert!(!err.is_resolve() && !err.is_whoami(), "{err:?}");
+
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    let err = misconfigured(&w)
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .unwrap_err();
+    assert!(is_name_mismatch(&err), "{err:?}");
+    assert!(!err.is_resolve(), "{err:?}");
+}
+
+/// A `whoami` failure stays `Whoami` after a `/resolve` that answered.
+#[tokio::test]
+async fn a_whoami_failure_after_a_good_resolve_stays_a_whoami_failure() {
+    let w = World::new().await;
+    w.hs.on_whoami(|_, _| Resp::json(401, json!({"errcode": "M_UNKNOWN_TOKEN"})));
+    let err = directory_that_leaves_sign_in_to_the_host(&w)
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(whoami_cause(&err), DirectoryError::Unauthorized),
+        "{err:?}"
+    );
+    assert_eq!(w.issuer.mock.count("GET", "/resolve"), 1);
+}
+
+/// The helpers answer for the inner error, and the error carries its cause.
+#[test]
+fn the_resolve_error_answers_the_helpers_for_its_cause() {
+    use std::error::Error;
+    let wrap = |cause| DirectoryError::Resolve(Box::new(cause));
+
+    let down = wrap(DirectoryError::Unavailable(
+        "the server answered 502".into(),
+    ));
+    assert!(down.is_retryable() && down.is_resolve() && !down.is_rate_limited());
+    for fatal in [
+        DirectoryError::Unauthorized,
+        DirectoryError::Protocol("/resolve answered something else".into()),
+        DirectoryError::UnexpectedStatus {
+            status: 404,
+            errcode: None,
+        },
+    ] {
+        assert!(!wrap(fatal).is_retryable());
+    }
+    let limited = wrap(DirectoryError::RateLimited {
+        retry_after: Some(Duration::from_secs(3)),
+    });
+    assert!(limited.is_retryable() && limited.is_rate_limited());
+    assert_eq!(limited.retry_after(), Some(Duration::from_secs(3)));
+    assert!(!limited.is_unknown_client());
+
+    assert!(down.source().is_some(), "the cause is the source");
+    let text = down.to_string();
+    assert!(text.contains("resolve") && text.contains("502"), "{text}");
+    assert!(!down.is_whoami() && down.whoami_cause().is_none());
+    assert!(!DirectoryError::Unauthorized.is_resolve());
+    assert!(DirectoryError::Unauthorized.resolve_cause().is_none());
+    assert!(!DirectoryError::Whoami(Box::new(DirectoryError::Unauthorized)).is_resolve());
+}
+
+// ---------------------------------------------------------------------------
+// An issuer-key failure is told apart from the module's, whoami's and resolve's
+// ---------------------------------------------------------------------------
+
+/// How the issuer's discovery document or key set failed; fails the test when
+/// `e` is not a failure of that stage.
+fn issuer_keys_cause(e: &DirectoryError) -> &DirectoryError {
+    assert!(
+        e.is_issuer_keys(),
+        "not reported as an issuer-key failure: {e:?}"
+    );
+    assert!(
+        !e.is_whoami()
+            && !e.is_resolve()
+            && e.whoami_cause().is_none()
+            && e.resolve_cause().is_none(),
+        "an issuer-key failure is neither a whoami nor a resolve failure: {e:?}"
+    );
+    e.issuer_keys_cause()
+        .unwrap_or_else(|| panic!("is_issuer_keys without a cause: {e:?}"))
+}
+
+/// Ways the issuer's public discovery document or key set can fail. The issuer
+/// answers all of them after the module has answered, and none involves the
+/// service token.
+#[derive(Clone, Copy, Debug)]
+enum KeysFault {
+    DiscoveryStatus(u16),
+    DiscoveryBody(&'static str),
+    KeySetStatus(u16),
+    KeySetBody(&'static str),
+}
+
+const KEYS_FAULTS: [KeysFault; 18] = [
+    KeysFault::DiscoveryStatus(401),
+    KeysFault::DiscoveryStatus(403),
+    KeysFault::DiscoveryStatus(404),
+    KeysFault::DiscoveryStatus(429),
+    KeysFault::DiscoveryStatus(500),
+    KeysFault::DiscoveryStatus(503),
+    KeysFault::DiscoveryBody("this is not json"),
+    KeysFault::DiscoveryBody(""),
+    KeysFault::DiscoveryBody(r#"{"unexpected": true}"#),
+    KeysFault::KeySetStatus(401),
+    KeysFault::KeySetStatus(403),
+    KeysFault::KeySetStatus(404),
+    KeysFault::KeySetStatus(429),
+    KeysFault::KeySetStatus(500),
+    KeysFault::KeySetStatus(503),
+    KeysFault::KeySetBody("this is not json"),
+    KeysFault::KeySetBody(""),
+    KeysFault::KeySetBody(r#"{"keys": "not a list"}"#),
+];
+
+fn break_the_keys(w: &World, fault: KeysFault) {
+    w.issuer.with(|s| match fault {
+        KeysFault::DiscoveryStatus(status) => s.discovery_status = status,
+        KeysFault::DiscoveryBody(body) => s.discovery_body = Some(body.into()),
+        KeysFault::KeySetStatus(status) => s.jwks_status = status,
+        KeysFault::KeySetBody(body) => s.jwks_body = Some(body.into()),
+    });
+}
+
+fn mend_the_keys(w: &World) {
+    w.issuer.with(|s| {
+        s.discovery_status = 200;
+        s.discovery_body = None;
+        s.jwks_status = 200;
+        s.jwks_body = None;
+    });
+}
+
+/// The issuer's discovery document and key set are public: a 401 there is a
+/// proxy or a wall in front of the issuer, never the service token refused, and
+/// renewing the token cannot help. Every way they fail, after the module has
+/// answered, is told as the issuer's: nothing signs in again, the module is not
+/// asked again, and the failure is kept nowhere.
+#[tokio::test]
+async fn an_issuer_keys_failure_is_an_issuer_keys_stage_failure() {
+    for fault in KEYS_FAULTS {
+        let w = World::new().await;
+        w.hs.module_hits(vec![published(&w, "alice")]);
+        let dir = w.directory();
+        let session = w.session();
+        break_the_keys(&w, fault);
+        let err = match dir.search_for_asker(&session, ASKER_DID, "a", 5).await {
+            Err(err) => err,
+            Ok(got) => panic!("{fault:?}: the search did not fail: {got:?}"),
+        };
+        let cause = issuer_keys_cause(&err);
+        assert!(
+            !matches!(
+                cause,
+                DirectoryError::Unauthorized | DirectoryError::NotAdmitted
+            ),
+            "{fault:?}: the service token was not involved: {err:?}"
+        );
+        assert!(
+            matches!(cause, DirectoryError::Unavailable(_)),
+            "{fault:?}: {err:?}"
+        );
+        assert!(err.is_retryable() && !err.is_rate_limited(), "{fault:?}");
+        let text = err.to_string();
+        assert!(
+            text.contains("issuer") && !text.contains("access token was refused"),
+            "{fault:?}: {text}"
+        );
+        if let KeysFault::DiscoveryStatus(status) | KeysFault::KeySetStatus(status) = fault {
+            assert!(text.contains(&status.to_string()), "{fault:?}: {text}");
+        }
+        // The module answered, once; nothing was renewed or retried.
+        assert_eq!(w.hs.module_calls(), 1, "{fault:?}");
+        assert_eq!(
+            w.issuer.sign_ins(),
+            1,
+            "{fault:?}: a signed-in service is not signed in again"
+        );
+        assert_eq!(w.issuer.mock.count("GET", "/resolve"), 1, "{fault:?}");
+        let stats = dir.cache_stats();
+        assert_eq!((stats.verified, stats.keys_cached), (0, false), "{fault:?}");
+
+        // The issuer comes back: the same search verifies, so nothing was kept.
+        mend_the_keys(&w);
+        let again = dir
+            .search_for_asker(&session, ASKER_DID, "a", 5)
+            .await
+            .unwrap();
+        assert!(again.results[0].did.verified_did().is_some(), "{fault:?}");
+    }
+}
+
+/// The same when the key set was held and has lapsed: the refetch is the first
+/// the search needs, and a 401 on it is the issuer's.
+#[tokio::test]
+async fn a_lapsed_key_set_that_cannot_be_fetched_again_is_an_issuer_keys_failure() {
+    let w = World::new().await;
+    w.hs.module_hits(vec![published(&w, "alice")]);
+    let dir = w.directory();
+    let session = w.session();
+    dir.search_for_asker(&session, ASKER_DID, "a", 5)
+        .await
+        .unwrap();
+    // A new verdict is needed: the cached one lapses with the key set.
+    w.clock.advance(11 * MIN);
+    w.issuer.with(|s| s.jwks_status = 401);
+    let err = dir
+        .search_for_asker(&session, ASKER_DID, "a", 5)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(issuer_keys_cause(&err), DirectoryError::Unavailable(_)),
+        "{err:?}"
+    );
+    assert_eq!(
+        w.issuer.sign_ins(),
+        1,
+        "the 401 of the key set renews nothing"
+    );
+}
+
+/// The user's own token is no different: the key set is the issuer's.
+#[tokio::test]
+async fn an_issuer_keys_failure_on_a_user_search_is_an_issuer_keys_failure() {
+    let w = World::new().await;
+    let a = mxid("alice");
+    w.hs.directory_rows(vec![json!({"user_id": a, "display_name": "Alice"})]);
+    w.hs.profile(&a, Some(w.issuer.field(&did_of("Alice"), &a)));
+    w.issuer.with(|s| s.jwks_status = 401);
+    let err = w
+        .directory()
+        .search_as_user("user-token-fixture", "al", 5)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(issuer_keys_cause(&err), DirectoryError::Unavailable(_)),
+        "{err:?}"
+    );
+    assert!(!matches!(err, DirectoryError::Unauthorized), "{err:?}");
+}
+
+/// A module 401 stays the module's: the key set is never fetched for it, and
+/// whatever state the issuer's keys are in changes nothing.
+#[tokio::test]
+async fn a_module_401_is_not_an_issuer_keys_failure() {
+    let w = World::new().await;
+    w.issuer.with(|s| s.jwks_status = 401);
+    w.hs.on_module(|_, _| Resp::json(401, json!({"errcode": "M_UNKNOWN_TOKEN"})));
+    let err = directory_that_leaves_sign_in_to_the_host(&w)
+        .search_for_asker(&w.session(), ASKER_DID, "ada", 5)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DirectoryError::Unauthorized), "{err:?}");
+    assert!(
+        !err.is_issuer_keys() && err.issuer_keys_cause().is_none(),
+        "{err:?}"
+    );
+    assert_eq!(w.issuer.mock.count("GET", "/jwk"), 0);
+    assert_eq!(
+        w.issuer
+            .mock
+            .count("GET", "/.well-known/openid-configuration"),
+        0
+    );
+}
+
+/// Only a failure that fails the search is the stage. A proof the held key set
+/// cannot judge is `invalid` for its row, whatever the refetch for it did: a 401
+/// or a garbage key set there fails nothing.
+#[tokio::test]
+async fn a_failed_refetch_for_an_unknown_kid_stays_a_row_level_invalid() {
+    for fault in [
+        KeysFault::KeySetStatus(401),
+        KeysFault::KeySetStatus(404),
+        KeysFault::KeySetBody("this is not json"),
+        KeysFault::DiscoveryStatus(401),
+    ] {
+        let w = World::new().await;
+        let dir = w.directory();
+        let session = w.session();
+        w.hs.module_hits(vec![published(&w, "alice")]);
+        dir.search_for_asker(&session, ASKER_DID, "a", 5)
+            .await
+            .unwrap();
+
+        let new_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        break_the_keys(&w, fault);
+        w.hs.module_hits(vec![
+            signed_by(&w, &new_key, "fixture-kid-2", "carol"),
+            published(&w, "alice"),
+        ]);
+        w.clock.advance(Duration::from_secs(30));
+        let got = dir
+            .search_for_asker(&session, ASKER_DID, "a", 5)
+            .await
+            .unwrap_or_else(|e| panic!("{fault:?}: a failed refetch fails no search: {e:?}"));
+        assert_eq!(
+            states(&got),
+            vec![json!({"state": "invalid"}), verified(&did_of("alice"))],
+            "{fault:?}"
+        );
+    }
+}
+
+/// A key set that parses is a key set, even one without a usable key: every proof
+/// is judged against it and none verifies, so each row is `invalid` and the
+/// search does not fail. (What cannot be read as a key set at all is the stage.)
+#[tokio::test]
+async fn a_key_set_without_a_usable_key_makes_rows_invalid_and_fails_nothing() {
+    for body in [r#"{"unexpected": true}"#, r#"{"keys": []}"#] {
+        let w = World::new().await;
+        w.hs.module_hits(vec![published(&w, "alice")]);
+        w.issuer.with(|s| s.jwks_body = Some(body.into()));
+        let got = w
+            .directory()
+            .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+            .await
+            .unwrap_or_else(|e| panic!("{body}: a readable key set fails no search: {e:?}"));
+        assert_eq!(states(&got), vec![json!({"state": "invalid"})], "{body}");
+    }
+}
+
+/// A proof that is malformed is judged `invalid` before any key is wanted, so a
+/// dead issuer cannot fail the search for it.
+#[tokio::test]
+async fn a_malformed_proof_needs_no_keys_and_fails_nothing() {
+    let w = World::new().await;
+    let m = mxid("alice");
+    w.hs.module_hits(vec![hit(
+        &m,
+        Some("alice"),
+        Some(json!({"did": did_of("alice"), "proof": "not-a-jws"})),
+    )]);
+    w.issuer.with(|s| s.discovery_status = 401);
+    let got = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .unwrap();
+    assert_eq!(states(&got), vec![json!({"state": "invalid"})]);
+    assert_eq!(
+        w.issuer
+            .mock
+            .count("GET", "/.well-known/openid-configuration"),
+        0
+    );
+}
+
+/// The helpers answer for the inner error, and the error carries its cause.
+#[test]
+fn the_issuer_keys_error_answers_the_helpers_for_its_cause() {
+    use std::error::Error;
+    let wrap = |cause| DirectoryError::IssuerKeys(Box::new(cause));
+
+    let down = wrap(DirectoryError::Unavailable(
+        "the issuer's keys: GET the `jwks_uri` returned 401 Unauthorized".into(),
+    ));
+    assert!(down.is_retryable() && down.is_issuer_keys() && !down.is_rate_limited());
+    for fatal in [
+        DirectoryError::Unauthorized,
+        DirectoryError::Protocol("the key set is something else".into()),
+        DirectoryError::UnexpectedStatus {
+            status: 404,
+            errcode: None,
+        },
+    ] {
+        assert!(!wrap(fatal).is_retryable());
+    }
+    let limited = wrap(DirectoryError::RateLimited {
+        retry_after: Some(Duration::from_secs(3)),
+    });
+    assert!(limited.is_retryable() && limited.is_rate_limited());
+    assert_eq!(limited.retry_after(), Some(Duration::from_secs(3)));
+    assert!(!limited.is_unknown_client());
+
+    assert!(down.source().is_some(), "the cause is the source");
+    let text = down.to_string();
+    assert!(text.contains("issuer") && text.contains("401"), "{text}");
+    assert!(!down.is_whoami() && down.whoami_cause().is_none());
+    assert!(!down.is_resolve() && down.resolve_cause().is_none());
+    assert!(!DirectoryError::Unauthorized.is_issuer_keys());
+    assert!(DirectoryError::Unauthorized.issuer_keys_cause().is_none());
+    assert!(!DirectoryError::Whoami(Box::new(DirectoryError::Unauthorized)).is_issuer_keys());
+    assert!(!DirectoryError::Resolve(Box::new(DirectoryError::Unauthorized)).is_issuer_keys());
 }
 
 // ---------------------------------------------------------------------------
