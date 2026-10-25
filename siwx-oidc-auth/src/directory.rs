@@ -74,7 +74,12 @@
 //! its own configuration: an issuer and a client that share one wrong name agree
 //! on it, and the module answers that unknown asker with a plain empty `200`, so
 //! a host would report "ready" and serve empty results. A `whoami` that fails is
-//! the error of that search and is not kept.
+//! the error of that search and is not kept. It is [`DirectoryError::Whoami`]
+//! with the failure inside, never the plain error of the same status: a 404 from
+//! `whoami` says the homeserver URL does not answer the Matrix client API, a 404
+//! from the directory module says the module is not registered, and a host must
+//! be able to tell the two apart. (A person of another server is not a failure
+//! of `whoami`: it answered, and it is [`DirectoryError::ServerNameMismatch`].)
 //!
 //! # Errors
 //!
@@ -280,9 +285,49 @@ pub enum DirectoryError {
     /// Not retryable: the operator corrects the configuration. The message names
     /// neither the person nor either server.
     ServerNameMismatch,
+    /// The homeserver's `GET /account/whoami` failed, and the inner error is how.
+    /// This is the check of [`DirectoryConfig::server_name`] that comes before
+    /// the first search of a client, on either transport (see the module
+    /// documentation, "The server name"). It is told apart because the same
+    /// inner error means something else when the directory itself answers it: a
+    /// 404 here says the homeserver URL does not answer the Matrix client API
+    /// (a wrong `homeserver_url`, a proxy), where a 404 from the directory
+    /// module says the module is not registered. A 401 is the token refused at
+    /// `whoami`, a 429 its rate limit.
+    ///
+    /// The inner error is one of [`Unauthorized`](DirectoryError::Unauthorized),
+    /// [`RateLimited`](DirectoryError::RateLimited),
+    /// [`Unavailable`](DirectoryError::Unavailable),
+    /// [`UnexpectedStatus`](DirectoryError::UnexpectedStatus) or
+    /// [`Protocol`](DirectoryError::Protocol) (an answer without a user id); it
+    /// is never another `Whoami`. A `whoami` that answers and names a person of
+    /// another server is not this: it is [`DirectoryError::ServerNameMismatch`].
+    /// [`is_retryable`](Self::is_retryable), [`is_rate_limited`](Self::is_rate_limited)
+    /// and [`retry_after`](Self::retry_after) answer for the inner error; read it
+    /// with [`whoami_cause`](Self::whoami_cause). Nothing of the directory was
+    /// asked, and nothing of the failure is kept: the next search asks again.
+    Whoami(Box<DirectoryError>),
 }
 
 impl DirectoryError {
+    /// Whether the failure is the homeserver's `GET /account/whoami`, not the
+    /// directory's own answer: [`DirectoryError::Whoami`]. Match this (or
+    /// [`whoami_cause`](Self::whoami_cause)) before reading the status of an
+    /// [`UnexpectedStatus`](DirectoryError::UnexpectedStatus), which means
+    /// something else at `whoami`.
+    pub fn is_whoami(&self) -> bool {
+        matches!(self, DirectoryError::Whoami(_))
+    }
+
+    /// How `GET /account/whoami` failed, when it is what failed
+    /// ([`DirectoryError::Whoami`]); `None` for every other error.
+    pub fn whoami_cause(&self) -> Option<&DirectoryError> {
+        match self {
+            DirectoryError::Whoami(cause) => Some(cause),
+            _ => None,
+        }
+    }
+
     /// Whether the service could not sign in because the server does not know its
     /// client id: a dynamic client lapses after 30 days without a use (see
     /// [`register_public_client`]). The remedy is to register again and keep the
@@ -291,6 +336,7 @@ impl DirectoryError {
     pub fn is_unknown_client(&self) -> bool {
         match self {
             DirectoryError::SignIn { source } => crate::is_unknown_client(source),
+            DirectoryError::Whoami(cause) => cause.is_unknown_client(),
             _ => false,
         }
     }
@@ -305,6 +351,7 @@ impl DirectoryError {
         match self {
             DirectoryError::RateLimited { .. } => true,
             DirectoryError::SignIn { source } => crate::is_rate_limited(source),
+            DirectoryError::Whoami(cause) => cause.is_rate_limited(),
             _ => false,
         }
     }
@@ -319,6 +366,7 @@ impl DirectoryError {
             DirectoryError::SignIn { source } => source
                 .downcast_ref::<AuthError>()
                 .and_then(AuthError::retry_after),
+            DirectoryError::Whoami(cause) => cause.retry_after(),
             _ => None,
         }
     }
@@ -335,6 +383,7 @@ impl DirectoryError {
                 Some(typed) => typed.is_transient(),
                 None => true,
             },
+            DirectoryError::Whoami(cause) => cause.is_retryable(),
             DirectoryError::InvalidInput(_)
             | DirectoryError::NotAdmitted
             | DirectoryError::Unauthorized
@@ -375,6 +424,7 @@ impl fmt::Display for DirectoryError {
                 f,
                 "the homeserver's users are not on the configured server_name"
             ),
+            DirectoryError::Whoami(cause) => write!(f, "whoami failed: {cause}"),
         }
     }
 }
@@ -383,6 +433,7 @@ impl std::error::Error for DirectoryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             DirectoryError::SignIn { source } => Some(source.as_ref()),
+            DirectoryError::Whoami(cause) => Some(&**cause),
             _ => None,
         }
     }
@@ -1523,10 +1574,13 @@ impl DirectoryClient {
     /// (the service account is a local user of the homeserver, so its real MXID
     /// is on the real name), once per client and before the module; a name that
     /// is not the one configured is [`DirectoryError::ServerNameMismatch`] and the
-    /// module is not asked. A `whoami` that fails is the error of that search
-    /// (a 401 signs in again and retries once under the same rule as the module's)
-    /// and is not kept, so the next search asks again. An asker that does not
-    /// exist has no MXID, gets the empty result and asks nothing.
+    /// module is not asked. A `whoami` that fails is the error of that search,
+    /// as [`DirectoryError::Whoami`] with the failure inside (a 401 signs in
+    /// again and retries once under the same rule as the module's, and with
+    /// `sign_in_again_on_401` off it is `Whoami(Unauthorized)` at once), and is
+    /// not kept, so the next search asks again. The plain error of the same
+    /// status is the module's own answer, so the two are never confused. An asker
+    /// that does not exist has no MXID, gets the empty result and asks nothing.
     ///
     /// `session` must belong to the deployment this client was made for, so its
     /// token is never sent to a homeserver it was not issued for.
@@ -1565,7 +1619,8 @@ impl DirectoryClient {
         let mut token = session.access_token().await?;
         if !inner.server_name_confirmed.load(Ordering::Acquire) {
             if let Err(e) = inner.confirm_server_name_of_token(&token).await {
-                if !(matches!(e, DirectoryError::Unauthorized) && inner.sign_in_again_on_401) {
+                let refused = matches!(e.whoami_cause(), Some(DirectoryError::Unauthorized));
+                if !(refused && inner.sign_in_again_on_401) {
                     return Err(e);
                 }
                 token = session.token_after_rejection(&token).await?;
@@ -1589,11 +1644,15 @@ impl DirectoryClient {
     /// Synapse's standard `user_directory/search`, then each hit's
     /// `io.inblock.did` profile field, read without a credential, at most eight
     /// at a time. A 401 is [`DirectoryError::Unauthorized`] (the token is the
-    /// caller's to renew).
+    /// caller's to renew), or `Whoami(Unauthorized)` when `whoami` refused it.
     ///
     /// The first search asks `GET /account/whoami` with the token, once, to learn
     /// that its owner is on [`DirectoryConfig::server_name`]; one who is not is
-    /// [`DirectoryError::ServerNameMismatch`] and the directory is not asked.
+    /// [`DirectoryError::ServerNameMismatch`] and the directory is not asked. A
+    /// `whoami` that fails is [`DirectoryError::Whoami`] with the failure inside,
+    /// so the first search of a client with a stale token is
+    /// `Whoami(Unauthorized)`, and a later one, once the name is confirmed, is
+    /// the plain `Unauthorized` of the directory call.
     /// Only `whoami` confirms the name: neither a module answer on the same
     /// client (the module answers an asker it does not know with a normal empty
     /// `200`) nor the asker's name (the issuer builds it from its own
@@ -1840,10 +1899,29 @@ impl Inner {
     /// transport, whose asker string the issuer built). Asked once, with the first
     /// search of either transport, and not again after the name matched; a
     /// mismatch or a failure is never kept.
+    ///
+    /// A failure to get an answer from `whoami` is [`DirectoryError::Whoami`],
+    /// whatever it was (a status, a timeout, a body without a user): the same
+    /// status means something else from the directory itself, and a host cannot
+    /// tell the two apart otherwise. A person of another server is
+    /// [`DirectoryError::ServerNameMismatch`]: `whoami` answered.
     async fn confirm_server_name_of_token(&self, token: &str) -> Result<(), DirectoryError> {
         if self.server_name_confirmed.load(Ordering::Acquire) {
             return Ok(());
         }
+        let user = self
+            .whoami_user(token)
+            .await
+            .map_err(|cause| DirectoryError::Whoami(Box::new(cause)))?;
+        self.refuse_other_server(&user)?;
+        self.server_name_confirmed.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// `GET /account/whoami` with `token`: the MXID it names. Its errors are the
+    /// plain ones of the request; [`confirm_server_name_of_token`] marks them as
+    /// the `whoami` stage's.
+    async fn whoami_user(&self, token: &str) -> Result<String, DirectoryError> {
         let reply = self
             .send(
                 self.http
@@ -1855,14 +1933,11 @@ impl Inner {
             )
             .await?;
         let body = reply.ok_body()?;
-        let user = serde_json::from_slice::<Value>(&body)
+        serde_json::from_slice::<Value>(&body)
             .ok()
             .and_then(|v| v.get("user_id")?.as_str().map(str::to_string))
             .filter(|user| is_mxid(user))
-            .ok_or_else(|| DirectoryError::Protocol("whoami names no user".into()))?;
-        self.refuse_other_server(&user)?;
-        self.server_name_confirmed.store(true, Ordering::Release);
-        Ok(())
+            .ok_or_else(|| DirectoryError::Protocol("whoami names no user".into()))
     }
 
     /// Send, read the body under the size cap (a success over it is a protocol

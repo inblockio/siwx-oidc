@@ -3679,18 +3679,20 @@ async fn a_whoami_that_fails_is_the_searchs_error_and_is_not_kept() {
     let dir = w.directory();
 
     w.hs.on_whoami(|_, _| Resp::json(401, json!({"errcode": "M_UNKNOWN_TOKEN"})));
-    assert!(matches!(
-        dir.search_as_user("stale", "a", 5).await.unwrap_err(),
-        DirectoryError::Unauthorized
-    ));
+    let err = dir.search_as_user("stale", "a", 5).await.unwrap_err();
+    assert!(
+        matches!(whoami_cause(&err), DirectoryError::Unauthorized),
+        "{err:?}"
+    );
     w.hs.on_whoami(|_, _| Resp::json(502, json!({"errcode": "M_UNKNOWN"})));
     let err = dir.search_as_user("t", "a", 5).await.unwrap_err();
-    assert!(matches!(err, DirectoryError::Unavailable(_)) && err.is_retryable());
+    assert!(matches!(whoami_cause(&err), DirectoryError::Unavailable(_)) && err.is_retryable());
     w.hs.on_whoami(|_, _| Resp::json(200, json!({"device_id": "D"})));
-    assert!(matches!(
-        dir.search_as_user("t", "a", 5).await.unwrap_err(),
-        DirectoryError::Protocol(_)
-    ));
+    let err = dir.search_as_user("t", "a", 5).await.unwrap_err();
+    assert!(
+        matches!(whoami_cause(&err), DirectoryError::Protocol(_)),
+        "{err:?}"
+    );
     assert_eq!(w.hs.user_directory_calls(), 0);
 
     // None of it was kept as a verdict: the next honest answer works.
@@ -3713,27 +3715,34 @@ async fn a_whoami_that_fails_on_the_module_path_is_the_searchs_error_and_is_not_
         .search_for_asker(&session, ASKER_DID, "a", 5)
         .await
         .unwrap_err();
-    assert!(matches!(err, DirectoryError::Unavailable(_)) && err.is_retryable());
+    assert!(matches!(whoami_cause(&err), DirectoryError::Unavailable(_)) && err.is_retryable());
     w.hs.on_whoami(|_, _| Resp::json(429, json!({"errcode": "M_LIMIT_EXCEEDED"})));
     let err = dir
         .search_for_asker(&session, ASKER_DID, "a", 5)
         .await
         .unwrap_err();
-    assert!(matches!(err, DirectoryError::RateLimited { .. }) && err.is_retryable());
+    assert!(matches!(whoami_cause(&err), DirectoryError::RateLimited { .. }) && err.is_retryable());
     w.hs.on_whoami(|_, _| Resp::json(403, json!({"errcode": "M_FORBIDDEN"})));
-    assert!(matches!(
-        dir.search_for_asker(&session, ASKER_DID, "a", 5)
-            .await
-            .unwrap_err(),
-        DirectoryError::UnexpectedStatus { status: 403, .. }
-    ));
+    let err = dir
+        .search_for_asker(&session, ASKER_DID, "a", 5)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            whoami_cause(&err),
+            DirectoryError::UnexpectedStatus { status: 403, .. }
+        ),
+        "{err:?}"
+    );
     w.hs.on_whoami(|_, _| Resp::json(200, json!({"device_id": "D"})));
-    assert!(matches!(
-        dir.search_for_asker(&session, ASKER_DID, "a", 5)
-            .await
-            .unwrap_err(),
-        DirectoryError::Protocol(_)
-    ));
+    let err = dir
+        .search_for_asker(&session, ASKER_DID, "a", 5)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(whoami_cause(&err), DirectoryError::Protocol(_)),
+        "{err:?}"
+    );
     assert_eq!(w.hs.whoami_calls(), 4);
     assert_eq!(
         w.hs.module_calls(),
@@ -3794,7 +3803,10 @@ async fn a_second_401_at_whoami_is_unauthorized_and_the_module_is_not_asked() {
         .search_for_asker(&w.session(), ASKER_DID, "a", 5)
         .await
         .unwrap_err();
-    assert!(matches!(err, DirectoryError::Unauthorized), "{err:?}");
+    assert!(
+        matches!(whoami_cause(&err), DirectoryError::Unauthorized),
+        "{err:?}"
+    );
     assert_eq!(w.hs.whoami_calls(), 2);
     assert_eq!(w.issuer.sign_ins(), 2);
     assert_eq!(w.hs.module_calls(), 0);
@@ -3808,10 +3820,230 @@ async fn when_the_host_owns_re_sign_in_a_whoami_401_is_unauthorized_and_nothing_
         .search_for_asker(&w.session(), ASKER_DID, "a", 5)
         .await
         .unwrap_err();
-    assert!(matches!(err, DirectoryError::Unauthorized), "{err:?}");
+    assert!(
+        matches!(whoami_cause(&err), DirectoryError::Unauthorized),
+        "{err:?}"
+    );
     assert_eq!(w.hs.whoami_calls(), 1, "no retry");
     assert_eq!(w.issuer.sign_ins(), 1, "and no second sign-in");
     assert_eq!(w.hs.module_calls(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// A whoami failure is told apart from the directory's own answer
+// ---------------------------------------------------------------------------
+
+/// How `GET /account/whoami` failed; fails the test when `e` is not a failure
+/// of that stage.
+fn whoami_cause(e: &DirectoryError) -> &DirectoryError {
+    assert!(e.is_whoami(), "not reported as a whoami failure: {e:?}");
+    e.whoami_cause()
+        .unwrap_or_else(|| panic!("is_whoami without a cause: {e:?}"))
+}
+
+/// A `whoami` that answers 404 is not "the module is missing": the homeserver
+/// URL does not answer the Matrix client API (a wrong `homeserver_url`, a proxy
+/// in front). It used to come back as `UnexpectedStatus { status: 404 }`, the
+/// error of a module that is not registered, and a host told the operator to
+/// admit the service.
+#[tokio::test]
+async fn a_whoami_404_is_reported_as_the_whoami_stage_not_a_missing_module() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    w.hs.on_whoami(|_, _| Resp::json(404, json!({"errcode": "M_UNRECOGNIZED"})));
+    let err = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            whoami_cause(&err),
+            DirectoryError::UnexpectedStatus { status: 404, errcode: Some(code) } if code == "M_UNRECOGNIZED"
+        ),
+        "{err:?}"
+    );
+    assert!(!err.is_retryable() && !err.is_rate_limited());
+    assert_eq!(w.hs.whoami_calls(), 1);
+    assert_eq!(w.hs.module_calls(), 0, "the module is not asked");
+}
+
+/// The token refused at `whoami`, after the one fresh sign-in, is the whoami
+/// stage too, and not retryable. (With `sign_in_again_on_401` off, the host's
+/// own renewal reads the cause the same way.)
+#[tokio::test]
+async fn a_whoami_401_is_reported_as_the_whoami_stage() {
+    for host_signs_in in [false, true] {
+        let w = World::new().await;
+        w.hs.on_whoami(|_, _| Resp::json(401, json!({"errcode": "M_UNKNOWN_TOKEN"})));
+        let dir = if host_signs_in {
+            directory_that_leaves_sign_in_to_the_host(&w)
+        } else {
+            w.directory()
+        };
+        let err = dir
+            .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(whoami_cause(&err), DirectoryError::Unauthorized),
+            "{err:?}"
+        );
+        assert!(!err.is_retryable());
+        assert_eq!(w.hs.module_calls(), 0);
+    }
+}
+
+/// A 429 at `whoami` keeps its hint through the wrapper: a host that waits for
+/// `retry_after` waits for the right thing, and knows which request to repeat.
+#[tokio::test]
+async fn a_whoami_429_is_reported_as_the_whoami_stage_and_keeps_its_hint() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    w.hs.on_whoami(|_, _| {
+        Resp::json(
+            429,
+            json!({"errcode": "M_LIMIT_EXCEEDED", "retry_after_ms": 1500}),
+        )
+    });
+    let err = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(whoami_cause(&err), DirectoryError::RateLimited { .. }),
+        "{err:?}"
+    );
+    assert!(err.is_rate_limited() && err.is_retryable());
+    assert_eq!(err.retry_after(), Some(Duration::from_millis(1500)));
+    assert_eq!(w.hs.module_calls(), 0);
+}
+
+/// An answer without a user id is the whoami's protocol fault, not the module's.
+#[tokio::test]
+async fn a_whoami_body_without_a_user_id_is_reported_as_the_whoami_stage() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    w.hs.on_whoami(|_, _| Resp::json(200, json!({"device_id": "D"})));
+    let err = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(whoami_cause(&err), DirectoryError::Protocol(_)),
+        "{err:?}"
+    );
+    assert!(!err.is_retryable());
+    assert_eq!(w.hs.module_calls(), 0);
+}
+
+/// The user transport asks the same `whoami`, so its failures are told apart the
+/// same way: a 404 here is not the user directory's.
+#[tokio::test]
+async fn a_whoami_failure_on_the_user_transport_is_reported_as_the_whoami_stage() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    w.hs.on_whoami(|_, _| Resp::json(404, json!({"errcode": "M_UNRECOGNIZED"})));
+    let err = w
+        .directory()
+        .search_as_user("user-token-fixture", "a", 5)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            whoami_cause(&err),
+            DirectoryError::UnexpectedStatus { status: 404, .. }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(w.hs.user_directory_calls(), 0);
+}
+
+/// What the directory module itself answers stays what it was: a 404 is a
+/// module that is not registered, a 401 and a 429 are the module's, none of
+/// them a whoami failure, and `whoami` was asked once and succeeded.
+#[tokio::test]
+async fn a_module_failure_is_still_a_module_failure() {
+    for status in [404, 401, 429] {
+        let w = World::new().await;
+        local_people_with_a_valid_proof(&w);
+        w.hs.on_module(move |_, _| Resp::json(status, json!({"errcode": "M_FOO"})));
+        let err = directory_that_leaves_sign_in_to_the_host(&w)
+            .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+            .await
+            .unwrap_err();
+        assert!(!err.is_whoami(), "{status}: {err:?}");
+        assert!(err.whoami_cause().is_none(), "{status}: {err:?}");
+        match status {
+            404 => assert!(
+                matches!(err, DirectoryError::UnexpectedStatus { status: 404, .. }),
+                "{err:?}"
+            ),
+            401 => assert!(matches!(err, DirectoryError::Unauthorized), "{err:?}"),
+            _ => assert!(matches!(err, DirectoryError::RateLimited { .. }), "{err:?}"),
+        }
+        assert_eq!(w.hs.whoami_calls(), 1, "{status}");
+        assert_eq!(w.hs.module_calls(), 1, "{status}");
+    }
+}
+
+/// A `whoami` that answers and names another server's person is the name
+/// mismatch, not a failure of the stage: the operator corrects the
+/// configuration, and the homeserver URL is fine.
+#[tokio::test]
+async fn a_server_name_mismatch_stays_its_own_error_and_is_not_a_whoami_failure() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    let dir = misconfigured(&w);
+    let err = dir
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .unwrap_err();
+    assert!(is_name_mismatch(&err), "{err:?}");
+    assert!(!err.is_whoami() && err.whoami_cause().is_none());
+    let err = dir
+        .search_as_user("user-token-fixture", "a", 5)
+        .await
+        .unwrap_err();
+    assert!(is_name_mismatch(&err), "{err:?}");
+    assert!(!err.is_whoami());
+}
+
+/// The helpers answer for the inner error, and the error carries its cause.
+#[test]
+fn the_whoami_error_answers_the_helpers_for_its_cause() {
+    use std::error::Error;
+    let wrap = |cause| DirectoryError::Whoami(Box::new(cause));
+
+    let down = wrap(DirectoryError::Unavailable("the request timed out".into()));
+    assert!(down.is_retryable() && down.is_whoami() && !down.is_rate_limited());
+    for fatal in [
+        DirectoryError::Unauthorized,
+        DirectoryError::Protocol("whoami names no user".into()),
+        DirectoryError::UnexpectedStatus {
+            status: 404,
+            errcode: None,
+        },
+    ] {
+        assert!(!wrap(fatal).is_retryable());
+    }
+    let limited = wrap(DirectoryError::RateLimited {
+        retry_after: Some(Duration::from_secs(3)),
+    });
+    assert!(limited.is_retryable() && limited.is_rate_limited());
+    assert_eq!(limited.retry_after(), Some(Duration::from_secs(3)));
+    assert!(!limited.is_unknown_client());
+
+    assert!(down.source().is_some(), "the cause is the source");
+    let text = down.to_string();
+    assert!(
+        text.contains("whoami") && text.contains("timed out"),
+        "{text}"
+    );
+    assert!(!DirectoryError::Unauthorized.is_whoami());
+    assert!(DirectoryError::Unauthorized.whoami_cause().is_none());
 }
 
 // ---------------------------------------------------------------------------

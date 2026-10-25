@@ -18,8 +18,9 @@ matches error text should match the types named here instead.
   client, before the module: another name is `DirectoryError::ServerNameMismatch`
   and the module is not asked. It shares the one latch with `search_as_user`
   (only `whoami` sets it, so a client asks once on either transport); a `whoami`
-  that fails is the error of that search and is not kept, and a 401 signs in
-  again and retries once unless `sign_in_again_on_401` is `false`. The refusal of
+  that fails is the error of that search (`DirectoryError::Whoami`, see Breaking)
+  and is not kept, and a 401 signs in again and retries once unless
+  `sign_in_again_on_401` is `false`. The refusal of
   an asker string that is not on the name stays. An asker that does not exist
   still gets the empty result and asks nothing.
 - **A rate limit is transient.** `AuthError::is_transient` (and
@@ -228,14 +229,34 @@ matches error text should match the types named here instead.
 - `search_for_asker` makes one more request, `GET /account/whoami` with the
   service's token, in the first search of a client that finds the asker (none
   after the name matched, on either transport). A homeserver that refuses `whoami`
-  for the service account fails that search the way it would have failed the
-  module call (401 `Unauthorized`, 403 `UnexpectedStatus`, 5xx `Unavailable`).
+  for the service account fails that search with `DirectoryError::Whoami` (below),
+  not the plain error the module call would have had.
   A deployment whose issuer and client share a wrong `server_name` now gets
   `ServerNameMismatch` where it got an empty result.
 - `search_as_user` makes one more request, `GET /account/whoami` with the user's
   token, in the first search of a client (none after the name matched). A homeserver
-  that refuses `whoami` for the token fails the search the way it would have failed
-  the directory call (401 `Unauthorized`, 5xx `Unavailable`).
+  that refuses `whoami` for the token fails the search with `DirectoryError::Whoami`
+  (below), not the plain error the directory call would have had.
+- **A `whoami` failure is `DirectoryError::Whoami(Box<DirectoryError>)`, not the
+  plain error of its status.** The request of the `server_name` check came back as
+  the same error as the directory module's own answer, so a host could not tell a
+  homeserver URL (or a proxy) that does not answer `/_matrix/client/v3/account/whoami`
+  from a module that is not registered or a service that is not admitted: a
+  `whoami` 404 was `UnexpectedStatus { status: 404 }`, as the module's is. Every
+  failure to get an answer from `whoami` (a 401 after the fresh sign-in, or at
+  once with `sign_in_again_on_401` off, a 403, a 404, a 429, a 5xx, a timeout, a
+  body without a user id) is now `Whoami` with the failure inside, on both
+  transports. `ServerNameMismatch` stays its own error: `whoami` answered. New
+  `DirectoryError::is_whoami()` and `whoami_cause()`; `is_retryable()`,
+  `is_rate_limited()`, `retry_after()` and `is_unknown_client()` answer for the
+  cause, and `std::error::Error::source()` returns it. A host that matched
+  `Unauthorized`, `RateLimited`, `Unavailable`, `UnexpectedStatus` or `Protocol`
+  from a first search must also look inside `Whoami`:
+  `e.whoami_cause().unwrap_or(&e)` is the error whichever request failed. This
+  includes `search_as_user` with a stale token, whose first search is
+  `Whoami(Unauthorized)` and a later one, once the name is confirmed, the plain
+  `Unauthorized` of the directory call. (The enum is `#[non_exhaustive]`, so a
+  `match` with a wildcard arm still compiles.)
 - `DidState` has a new variant, `Unconfirmed`: a `match` on it that has no
   wildcard arm must handle it. A caller that offers recipients should keep
   offering `Verified` ones only unless it warns for `Unconfirmed`.
