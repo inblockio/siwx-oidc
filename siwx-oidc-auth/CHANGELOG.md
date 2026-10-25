@@ -136,7 +136,9 @@ matches error text should match the types named here instead.
   proof ignored and their unsigned `did` shown as a claim. The search is now this
   error and nothing else is asked, and a mismatch is never kept. `search_as_user`
   learns the name from `GET /account/whoami` with the user's token, once per
-  client (a search for an asker that matched the name makes it unnecessary).
+  client. Only `whoami` confirms the name: a module answer or an asker that
+  matched the name does not, since the module answers an asker it does not know
+  with a normal empty `200`.
 - **`DirectoryClient` and `ServiceSession` hold a `Tuning` to bounds when made**:
   every duration is taken at most a year (`Duration::MAX` for "never" is a year,
   not an overflow and a panic at `remote_profiles_timeout` or inside a spawned
