@@ -229,9 +229,10 @@ let directory = DirectoryClient::new(
 
 let token = session.access_token().await?;      // through your gate
 match directory.search_for_asker(&session, asker, term, 10).await {
-    Err(DirectoryError::Unauthorized) => {
-        // The module refused the token this call used. Drop it, then renew
-        // through your gate and search again.
+    // The module, or `whoami` (`Whoami(Unauthorized)`), refused the token.
+    Err(e) if matches!(e.whoami_cause().unwrap_or(&e), DirectoryError::Unauthorized) => {
+        // Drop the token this call used, then renew through your gate and
+        // search again.
         session.invalidate_access_token(&token).await;
         let _renewed = session.access_token().await?;
         /* search again */
@@ -241,8 +242,8 @@ match directory.search_for_asker(&session, asker, term, 10).await {
 ```
 
 With `sign_in_again_on_401` off (default `true`, the behaviour above), a 401 from
-the directory module is `DirectoryError::Unauthorized` at once: no sign-in, no
-retry. `ServiceSession::invalidate_access_token(rejected)` discards the session's
+the directory module is `DirectoryError::Unauthorized` at once, and one from
+`whoami` is `Whoami(Unauthorized)`: no sign-in, no retry. `ServiceSession::invalidate_access_token(rejected)` discards the session's
 access token and its refresh token when the access token is `rejected`, so the
 next `access_token()` signs in with the key (a refused access token says nothing
 good of its refresh token, and this is what the client's own retry does). It
@@ -309,7 +310,10 @@ so a consumer that matched that text keeps working until it matches the type.)
    Then, once per client, `GET {homeserver}/_matrix/client/v3/account/whoami`
    with the service token confirms `server_name` with the homeserver's own word
    ([Setting up a service](#setting-up-a-service)); another name is
-   `ServerNameMismatch` and the module is not called.
+   `ServerNameMismatch` and the module is not called. A `whoami` that fails
+   (a 404 from a homeserver URL that does not answer the Matrix client API or a
+   proxy in front of it, a 401, a 429, a body without a user id) is
+   `DirectoryError::Whoami`, with the failure inside; the module is not called.
 2. `POST {homeserver}/_synapse/client/io.inblock/directory/v1/search` with the
    service token and `{"asker": "@…", "term": "…", "limit": n}`. The module
    searches as the asker through Synapse's own `search_users`, so the visibility
@@ -518,6 +522,7 @@ never the search term, a token or a response body.
 | `UnexpectedStatus { status, errcode }` | a status the client does not act on | no |
 | `Protocol` | an answer that is not the contract: malformed JSON, a row without a user id, a body over the cap | no |
 | `ServerNameMismatch` | the asker, the owner of the user's token, or (by `whoami`) the service account itself is not on the configured `server_name` ([above](#setting-up-a-service)) | no |
+| `Whoami(cause)` | `GET /account/whoami`, the check of `server_name` before a client's first search on either transport, failed, and `cause` is how: a status (`UnexpectedStatus`, `Unauthorized`, `RateLimited`), a network failure (`Unavailable`) or a body without a user (`Protocol`). Told apart because the same status means something else from the directory: a 404 here is a homeserver URL (or a proxy) that does not answer `/_matrix/client/v3/account/whoami`, a 404 from the module is a module that is not registered. `is_whoami()` and `whoami_cause()` read it; `is_retryable()`, `is_rate_limited()` and `retry_after()` answer for the cause. A person of another server is `ServerNameMismatch`, not this | by the cause |
 
 ## Bounds
 

@@ -342,7 +342,7 @@ doc; read it before changing the code the rule covers.
   searches that want one person share one read; a read never replaces an entry stored after it began), and
   never failing a search; a `server_name` that is not the homeserver's is `DirectoryError::ServerNameMismatch`
   (the asker, or the `whoami` of the user's token, must be on it), never an answer in which local people
-  look foreign; the claimed value and the search term are never logged. Tokens stay in memory: no file API and no output macro in the module
+  look foreign; a `whoami` that fails is `DirectoryError::Whoami(cause)` (a 404 there is the homeserver URL, not a missing module); the claimed value and the search term are never logged. Tokens stay in memory: no file API and no output macro in the module
   outside its tests. The key set is fetched by one request pair at a time and a waiter shares the
   fetch's outcome; a proof with a `kid` the cached set lacks refetches it, at most once per 30 s; a
   failed renewal of the service session is shared by its waiters and answered for 5 s; an error
