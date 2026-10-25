@@ -8,6 +8,20 @@ matches error text should match the types named here instead.
 
 ### Changed
 
+- **`search_for_asker` confirms `server_name` with the homeserver too.** The
+  asker's MXID is built by the issuer from its own configuration, so an issuer
+  and a client that shared one wrong (delegated) name agreed on it, the module
+  answered the unknown asker with a plain empty `200`, and a host reported "ready"
+  and served silent empty results. The first module search of a client now asks
+  `GET /account/whoami` with the service's own token (the service account is a
+  local user of the homeserver, so its real MXID is on the real name), once per
+  client, before the module: another name is `DirectoryError::ServerNameMismatch`
+  and the module is not asked. It shares the one latch with `search_as_user`
+  (only `whoami` sets it, so a client asks once on either transport); a `whoami`
+  that fails is the error of that search and is not kept, and a 401 signs in
+  again and retries once unless `sign_in_again_on_401` is `false`. The refusal of
+  an asker string that is not on the name stays. An asker that does not exist
+  still gets the empty result and asks nothing.
 - **A rate limit is transient.** `AuthError::is_transient` (and
   `siwx_oidc_auth::is_transient`) is now also true for `AuthError::RateLimited`,
   and `DirectoryError::is_retryable()` for a sign-in rate limited at the server:
@@ -211,6 +225,13 @@ matches error text should match the types named here instead.
 
 ### Breaking
 
+- `search_for_asker` makes one more request, `GET /account/whoami` with the
+  service's token, in the first search of a client that finds the asker (none
+  after the name matched, on either transport). A homeserver that refuses `whoami`
+  for the service account fails that search the way it would have failed the
+  module call (401 `Unauthorized`, 403 `UnexpectedStatus`, 5xx `Unavailable`).
+  A deployment whose issuer and client share a wrong `server_name` now gets
+  `ServerNameMismatch` where it got an empty result.
 - `search_as_user` makes one more request, `GET /account/whoami` with the user's
   token, in the first search of a client (none after the name matched). A homeserver
   that refuses `whoami` for the token fails the search the way it would have failed
