@@ -139,18 +139,44 @@ const DID_MAX: usize = 2048;
 /// Serializes as `{"results": [...], "limited": bool}`. `limited` is true when
 /// the homeserver says more people matched than it returned, or when this
 /// client cut the answer to the `limit` that was asked for.
+///
+/// An empty result is two different things: the homeserver answered and found
+/// nobody, or no homeserver was asked at all (the asker is not known to the
+/// issuer). [`DirectoryResults::homeserver_answered`] tells them apart; it is
+/// not part of the serialized form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DirectoryResults {
     pub results: Vec<DirectoryEntry>,
     pub limited: bool,
+    /// See [`DirectoryResults::homeserver_answered`]. Private, and skipped by
+    /// `Serialize`, so the wire shape is unchanged.
+    #[serde(skip)]
+    homeserver_answered: bool,
 }
 
 impl DirectoryResults {
-    fn empty() -> Self {
+    /// The result of a search that asked no homeserver.
+    fn unasked() -> Self {
         DirectoryResults {
             results: Vec::new(),
             limited: false,
+            homeserver_answered: false,
         }
+    }
+
+    /// Whether the homeserver itself answered this search: the directory module
+    /// for [`DirectoryClient::search_for_asker`], the user directory for
+    /// [`DirectoryClient::search_as_user`]. An answer of nobody is still an
+    /// answer.
+    ///
+    /// `false` when no homeserver was asked: `search_for_asker` returns the empty
+    /// result, before the service's token and before the module, for an asker the
+    /// issuer does not know (or would not sign in). A host that treats a search as
+    /// proof that the homeserver is reachable and configured as expected (for
+    /// example to clear a backoff it keeps against the service's token) must not
+    /// count such a result.
+    pub fn homeserver_answered(&self) -> bool {
+        self.homeserver_answered
     }
 }
 
@@ -1601,7 +1627,7 @@ impl DirectoryClient {
         }
 
         let Some(asker) = inner.resolve_asker(asker_did).await? else {
-            return Ok(DirectoryResults::empty());
+            return Ok(DirectoryResults::unasked());
         };
         // The asker comes from our own issuer, so it is a person of the
         // homeserver itself. One that is not on `server_name` says the name is
@@ -2308,6 +2334,8 @@ impl Inner {
         Ok(DirectoryResults {
             results,
             limited: rows.limited,
+            // `assemble` is only reached with rows the homeserver sent.
+            homeserver_answered: true,
         })
     }
 

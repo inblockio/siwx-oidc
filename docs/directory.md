@@ -304,7 +304,9 @@ so a consumer that matched that text keeps working until it matches the type.)
 1. `GET {issuer}/resolve?did=<asker>` maps the asker to an MXID
    ([identity-model.md](identity-model.md#looking-up-an-identity-get-resolve)). An
    account that does not exist, or a DID no sign-in could accept (a 400), gets the
-   **empty result**, the same as no match, and the module is not called. An asker
+   **empty result**, the same as no match, and the module is not called; that
+   result says so with `DirectoryResults::homeserver_answered() == false`, where a
+   module's own empty answer is `true`. An asker
    who is not on the configured `server_name` is `ServerNameMismatch`, and the
    module is not called either.
    Then, once per client, `GET {homeserver}/_matrix/client/v3/account/whoami`
