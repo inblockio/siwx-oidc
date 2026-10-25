@@ -88,7 +88,10 @@
 //! discovery or key-set failure with [`DirectoryError::IssuerKeys`] (the issuer's
 //! public documents, never the module's word and never the service token), and
 //! nothing of either is stored. Only a proof that was read and does not verify
-//! is `invalid`.
+//! is `invalid`. A local person's profile that cannot be read fails a user search
+//! as [`DirectoryError::Profile`]: that read is sent without a credential, so its
+//! 401 is never the user's token refused, and its 429 is not the rate limit of
+//! the directory call, which stays the plain error of its status.
 //!
 //! # Secrets
 //!
@@ -387,6 +390,39 @@ pub enum DirectoryError {
     /// with [`issuer_keys_cause`](Self::issuer_keys_cause). The module did answer
     /// and nothing of the failure is kept: the next search asks again.
     IssuerKeys(Box<DirectoryError>),
+    /// The read of a local person's `io.inblock.did` profile field failed, and
+    /// the inner error is how. It is the failure of
+    /// [`DirectoryClient::search_as_user`] to read
+    /// `GET /_matrix/client/v3/profile/{mxid}/io.inblock.did` for a hit on this
+    /// homeserver, and it is told apart because the same inner error means
+    /// something else when the search itself answers it: the profile read is
+    /// sent **without a credential**, so a 401 here is a homeserver that refuses
+    /// the anonymous read (`require_auth_for_profile_requests`) or a proxy in
+    /// front of it, never the user's token refused, and asking the user to sign
+    /// in again cannot help; a 429 is the rate limit of the profile route, not of
+    /// `user_directory/search`; a 5xx is the profile of that account (an account
+    /// with no `profiles` row, element-hq/synapse#19702), not a homeserver that
+    /// is down. The `user_directory/search` call itself, which does carry the
+    /// token, stays the plain error of its status.
+    ///
+    /// The inner error is one of [`Unauthorized`](DirectoryError::Unauthorized),
+    /// [`RateLimited`](DirectoryError::RateLimited),
+    /// [`Unavailable`](DirectoryError::Unavailable),
+    /// [`UnexpectedStatus`](DirectoryError::UnexpectedStatus) or
+    /// [`Protocol`](DirectoryError::Protocol) (an answer that is not JSON, or a
+    /// body over the cap); it is never another stage. Only a **local** profile
+    /// that cannot be read fails a search like this, because its state is unknown:
+    /// a profile that is absent (404), or whose field is absent, `null` or not a
+    /// proof, is that person's `not_yet_published` (or `invalid`) and fails
+    /// nothing, and the profile of a person of another server never fails a
+    /// search. The module transport ([`DirectoryClient::search_for_asker`]) reads
+    /// no local profile, so it never returns this.
+    /// [`is_retryable`](Self::is_retryable), [`is_rate_limited`](Self::is_rate_limited)
+    /// and [`retry_after`](Self::retry_after) answer for the inner error; read it
+    /// with [`profile_cause`](Self::profile_cause). The first failure ends the
+    /// search, the reads still running are dropped, and nothing of the failure is
+    /// kept: the next search asks again.
+    Profile(Box<DirectoryError>),
 }
 
 impl DirectoryError {
@@ -447,6 +483,25 @@ impl DirectoryError {
         }
     }
 
+    /// Whether the failure is the read of a local person's profile in a user
+    /// search, which is sent without a credential:
+    /// [`DirectoryError::Profile`]. Match this (or
+    /// [`profile_cause`](Self::profile_cause)) before reading a bare
+    /// [`Unauthorized`](DirectoryError::Unauthorized) as the user's token being
+    /// refused: the profile read carries no token.
+    pub fn is_profile(&self) -> bool {
+        matches!(self, DirectoryError::Profile(_))
+    }
+
+    /// The error inside, when the read of a local person's profile failed
+    /// ([`DirectoryError::Profile`]); `None` for every other error.
+    pub fn profile_cause(&self) -> Option<&DirectoryError> {
+        match self {
+            DirectoryError::Profile(cause) => Some(cause),
+            _ => None,
+        }
+    }
+
     /// Whether the service could not sign in because the server does not know its
     /// client id: a dynamic client lapses after 30 days without a use (see
     /// [`register_public_client`]). The remedy is to register again and keep the
@@ -457,7 +512,8 @@ impl DirectoryError {
             DirectoryError::SignIn { source } => crate::is_unknown_client(source),
             DirectoryError::Whoami(cause)
             | DirectoryError::Resolve(cause)
-            | DirectoryError::IssuerKeys(cause) => cause.is_unknown_client(),
+            | DirectoryError::IssuerKeys(cause)
+            | DirectoryError::Profile(cause) => cause.is_unknown_client(),
             _ => false,
         }
     }
@@ -474,7 +530,8 @@ impl DirectoryError {
             DirectoryError::SignIn { source } => crate::is_rate_limited(source),
             DirectoryError::Whoami(cause)
             | DirectoryError::Resolve(cause)
-            | DirectoryError::IssuerKeys(cause) => cause.is_rate_limited(),
+            | DirectoryError::IssuerKeys(cause)
+            | DirectoryError::Profile(cause) => cause.is_rate_limited(),
             _ => false,
         }
     }
@@ -491,7 +548,8 @@ impl DirectoryError {
                 .and_then(AuthError::retry_after),
             DirectoryError::Whoami(cause)
             | DirectoryError::Resolve(cause)
-            | DirectoryError::IssuerKeys(cause) => cause.retry_after(),
+            | DirectoryError::IssuerKeys(cause)
+            | DirectoryError::Profile(cause) => cause.retry_after(),
             _ => None,
         }
     }
@@ -510,7 +568,8 @@ impl DirectoryError {
             },
             DirectoryError::Whoami(cause)
             | DirectoryError::Resolve(cause)
-            | DirectoryError::IssuerKeys(cause) => cause.is_retryable(),
+            | DirectoryError::IssuerKeys(cause)
+            | DirectoryError::Profile(cause) => cause.is_retryable(),
             DirectoryError::InvalidInput(_)
             | DirectoryError::NotAdmitted
             | DirectoryError::Unauthorized
@@ -556,6 +615,9 @@ impl fmt::Display for DirectoryError {
             DirectoryError::IssuerKeys(cause) => {
                 write!(f, "the issuer's discovery or key set failed: {cause}")
             }
+            DirectoryError::Profile(cause) => {
+                write!(f, "reading a local person's profile failed: {cause}")
+            }
         }
     }
 }
@@ -566,7 +628,8 @@ impl std::error::Error for DirectoryError {
             DirectoryError::SignIn { source } => Some(source.as_ref()),
             DirectoryError::Whoami(cause)
             | DirectoryError::Resolve(cause)
-            | DirectoryError::IssuerKeys(cause) => Some(&**cause),
+            | DirectoryError::IssuerKeys(cause)
+            | DirectoryError::Profile(cause) => Some(&**cause),
             _ => None,
         }
     }
@@ -1811,7 +1874,14 @@ impl DirectoryClient {
     /// configuration) does. The module transport asks `whoami` too, with the
     /// service's own token, and the one that comes first confirms the name for
     /// both. A local profile that cannot be read fails the search:
-    /// its state is unknown, and `invalid` would be a claim about the person. A
+    /// its state is unknown, and `invalid` would be a claim about the person. It
+    /// is [`DirectoryError::Profile`] with the failure inside (a 401, 403, 429,
+    /// 5xx, a timeout, a body that is not JSON), because that read carries no
+    /// credential: a `Profile(Unauthorized)` is not the user's token refused, and
+    /// only the plain [`Unauthorized`](DirectoryError::Unauthorized) of the
+    /// `user_directory/search` call (or of `whoami`) is. A person with no profile,
+    /// or no field, or a field that is no proof, fails nothing: it is that
+    /// person's `not_yet_published` (or `invalid`). A
     /// profile of another server's user is read for a claim
     /// ([`DidState::Unconfirmed`]) and never fails the search. A failure to get
     /// the issuer's discovery document or key set, with none held, fails it as
@@ -2255,7 +2325,11 @@ impl Inner {
 
     /// The local rows' profiles, whose field is the proof to check. A read can
     /// fail, and then the first failure ends the search and aborts the reads
-    /// still running: that person's state is unknown.
+    /// still running: that person's state is unknown. The failure is
+    /// [`DirectoryError::Profile`], so that it is not mistaken for the answer of
+    /// the user-directory call, which carries the token this read does not. What
+    /// touches one person only (no profile, no field, a field that is no proof)
+    /// is not a failure here: it is that row's state.
     async fn read_local_profiles(self: &Arc<Self>, rows: &mut Rows) -> Result<(), DirectoryError> {
         let permits = Arc::new(Semaphore::new(PROFILE_READS_AT_ONCE));
         let mut reads = JoinSet::new();
@@ -2270,9 +2344,13 @@ impl Inner {
             });
         }
         while let Some(done) = reads.join_next().await {
-            let (index, field) =
-                done.map_err(|_| DirectoryError::Unavailable("a profile read was lost".into()))?;
-            rows.rows[index].field = field?;
+            let (index, field) = done.map_err(|_| {
+                DirectoryError::Profile(Box::new(DirectoryError::Unavailable(
+                    "a profile read was lost".into(),
+                )))
+            })?;
+            rows.rows[index].field =
+                field.map_err(|cause| DirectoryError::Profile(Box::new(cause)))?;
         }
         Ok(())
     }
