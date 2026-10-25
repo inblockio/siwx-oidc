@@ -201,6 +201,19 @@ matches error text should match the types named here instead.
   session's own cap on the whole sign-in is still an untyped error, as before.
 - **`Tuning::flow_request_timeout`** (default `FLOW_REQUEST_TIMEOUT`, 10 s): the
   per-request timeout of the directory session's sign-in and refresh.
+- **`DirectoryResults::homeserver_answered()`**: true only when the homeserver
+  itself answered the search (the directory module for `search_for_asker`, the user
+  directory for `search_as_user`); an answer of nobody counts. It is false for the
+  one result that asks no homeserver: `search_for_asker` returns the empty result
+  for an asker the issuer does not know (or would not sign in) before the
+  service's token and before the module, and a host could not tell that from a
+  real, possibly empty, module answer. A host that takes a search for proof that
+  the homeserver was reached (for example to clear a backoff it keeps against the
+  service's token) should count a result only when this is true. It is not part of
+  the serialized form (`{"results", "limited"}` is unchanged) and is kept in a
+  private field, so `DirectoryResults` still cannot be deserialized and, as the
+  one source-level catch, can no longer be built by a struct literal outside this
+  crate (nothing but a search constructs it).
 
 ### Changed (remote reads)
 

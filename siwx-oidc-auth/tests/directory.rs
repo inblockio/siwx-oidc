@@ -428,6 +428,104 @@ async fn an_unknown_asker_gets_the_empty_result_and_the_module_is_not_called() {
 }
 
 #[tokio::test]
+async fn an_unknown_asker_result_says_no_homeserver_answered() {
+    let w = World::new().await;
+    w.hs.module_hits(vec![published(&w, "alice")]);
+    let got = w
+        .directory()
+        .search_for_asker(&w.session(), "did:key:zNobodyKnowsThisOne", "ada", 5)
+        .await
+        .unwrap();
+    assert!(got.results.is_empty() && !got.limited);
+    assert!(
+        !got.homeserver_answered(),
+        "the shortcut asked no homeserver: it must not look like a module answer"
+    );
+    assert_eq!(w.hs.module_calls(), 0);
+    assert_eq!(w.hs.whoami_calls(), 0);
+}
+
+#[tokio::test]
+async fn an_asker_no_sign_in_could_accept_says_no_homeserver_answered() {
+    let w = World::new().await;
+    w.issuer.with(|s| s.resolve_status = 400);
+    let got = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "ada", 5)
+        .await
+        .unwrap();
+    assert!(got.results.is_empty());
+    assert!(!got.homeserver_answered());
+    assert_eq!(w.hs.module_calls(), 0);
+}
+
+#[tokio::test]
+async fn an_empty_module_answer_is_an_answer() {
+    let w = World::new().await;
+    w.hs.module_hits(vec![]);
+    let got = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "nobody", 5)
+        .await
+        .unwrap();
+    assert!(got.results.is_empty() && !got.limited);
+    assert!(
+        got.homeserver_answered(),
+        "the module was asked and found nobody: that is an answer, not the shortcut"
+    );
+    assert_eq!(w.hs.module_calls(), 1);
+    assert_eq!(
+        serde_json::to_value(&got).unwrap(),
+        json!({"results": [], "limited": false}),
+        "the signal is not part of the wire shape"
+    );
+}
+
+#[tokio::test]
+async fn a_module_answer_with_people_says_the_homeserver_answered() {
+    let w = World::new().await;
+    w.hs.module_hits(vec![published(&w, "alice")]);
+    let got = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "ada", 5)
+        .await
+        .unwrap();
+    assert_eq!(got.results.len(), 1);
+    assert!(got.homeserver_answered());
+}
+
+#[tokio::test]
+async fn the_user_directory_answers_empty_and_with_people_and_both_count() {
+    let w = World::new().await;
+    let dir = w.directory();
+    w.hs.directory_rows(vec![]);
+    let empty = dir
+        .search_as_user("user-token-fixture", "nobody", 5)
+        .await
+        .unwrap();
+    assert!(empty.results.is_empty());
+    assert!(
+        empty.homeserver_answered(),
+        "the user directory was asked and found nobody"
+    );
+    assert_eq!(w.hs.user_directory_calls(), 1);
+    assert_eq!(
+        serde_json::to_value(&empty).unwrap(),
+        json!({"results": [], "limited": false})
+    );
+
+    w.hs.directory_rows(vec![
+        json!({"user_id": mxid("alice"), "display_name": "alice"}),
+    ]);
+    let some = dir
+        .search_as_user("user-token-fixture", "ali", 5)
+        .await
+        .unwrap();
+    assert_eq!(some.results.len(), 1);
+    assert!(some.homeserver_answered());
+}
+
+#[tokio::test]
 async fn an_asker_no_sign_in_could_accept_gets_the_same_empty_result() {
     let w = World::new().await;
     w.issuer.with(|s| s.resolve_status = 400);
