@@ -355,8 +355,12 @@ homeserver polled who is asking), at most eight at a time. The local profiles
 are read first, and one that cannot be read ends the search before any foreign
 server is asked; then the profiles of the people of other servers
 ([below](#people-of-other-homeservers)); then the proof check for the local
-ones. A local profile that cannot be read fails the search; a remote one only
-costs that person their claim. The first search of a client, on either
+ones. A local profile that cannot be read fails the search, as
+`DirectoryError::Profile` with the failure inside (the read carries no
+credential, so a `Profile(Unauthorized)` is not the user's token refused, which
+is the plain `Unauthorized` of the directory call); a profile that is absent, or
+has no field, or a field that is no proof, is that person's state and fails
+nothing; a remote one only costs that person their claim. The first search of a client, on either
 transport, also asks `GET /account/whoami` with the token, once, to check
 `server_name` (see [Setting up a service](#setting-up-a-service)); a client that
 has already asked it with the service's token on the module transport does not
@@ -542,6 +546,7 @@ never the search term, a token or a response body.
 | `Whoami(cause)` | `GET /account/whoami`, the check of `server_name` before a client's first search on either transport, failed, and `cause` is how: a status (`UnexpectedStatus`, `Unauthorized`, `RateLimited`), a network failure (`Unavailable`) or a body without a user (`Protocol`). Told apart because the same status means something else from the directory: a 404 here is a homeserver URL (or a proxy) that does not answer `/_matrix/client/v3/account/whoami`, a 404 from the module is a module that is not registered. `is_whoami()` and `whoami_cause()` read it; `is_retryable()`, `is_rate_limited()` and `retry_after()` answer for the cause. A person of another server is `ServerNameMismatch`, not this | by the cause |
 | `Resolve(cause)` | `GET {issuer}/resolve`, the lookup of the asker that comes first in `search_for_asker`, failed, and `cause` is how: a status (`UnexpectedStatus`, `Unauthorized`, `RateLimited`), a network failure or a 5xx (`Unavailable`) or a body that is not the contract (`Protocol`). Told apart because the same status means something else from the homeserver: `/resolve` is public and takes no token, so its 401 is a proxy or a wall in front of the issuer and never a refused service token (renewing the token cannot help, and a host must not count it as one), its 429 is the issuer's rate limit, not the module's, and its 404 is an issuer without `/resolve` or a wrong `issuer_url`, not a module that is not registered. `is_resolve()` and `resolve_cause()` read it; `is_retryable()`, `is_rate_limited()` and `retry_after()` answer for the cause. An asker who does not exist is the empty result, and one of another server is `ServerNameMismatch`, not this | by the cause |
 | `IssuerKeys(cause)` | `GET {issuer}/.well-known/openid-configuration` or the `jwks_uri` it names, fetched after the module answered to verify the proofs of the rows, failed and no key set is held; `cause` is `Unavailable` whatever the document did (a status, a body that is not the document or the key set, an issuer that names another issuer, a timeout), its text naming the step and the status and never a body. Told apart because the same failure means something else from the module: both documents are public and take no token, so a 401 is a wall or proxy in front of the issuer and never the service token refused (renewing the token cannot help, and a host must not count it as one), and a 404 is an issuer without discovery or a wrong `issuer_url`, not a module that is not registered. `is_issuer_keys()` and `issuer_keys_cause()` read it; `is_retryable()`, `is_rate_limited()` and `retry_after()` answer for the cause. Only a search with no key set fails like this: a proof that is malformed, that the held set does not verify, or whose `kid` the held set lacks while the refetch fails (or is rate limited) is `invalid` for its row, and a key set that parses without a usable key makes each proof `invalid`; none of those fails the search | by the cause |
+| `Profile(cause)` | `GET {homeserver}/_matrix/client/v3/profile/{mxid}/io.inblock.did`, the read of a **local** person's profile in `search_as_user`, failed, and `cause` is how: a status (`Unauthorized`, `RateLimited`, `UnexpectedStatus`), a network failure, timeout or 5xx (`Unavailable`) or a body that is not JSON or over the cap (`Protocol`). Told apart because the read is sent **without a credential**: a 401 or 403 is a homeserver that refuses the anonymous read (`require_auth_for_profile_requests`) or a proxy in front of the route, never the user's token refused, so asking the user to sign in again cannot help (the plain `Unauthorized` of `user_directory/search`, which does carry the token, stays the token's); a 429 is the rate limit of the profile route, not of the directory call; a 500 is that account's profile (no `profiles` row), not a homeserver that is down. The first failure ends the search and the reads still running are dropped. A profile that is absent (404), whose field is absent or `null`, or that is no proof, is that person's `not_yet_published` (or `invalid`) and is no error; the profile of a person of another server is never an error; the module transport reads no local profile and never returns this. `is_profile()` and `profile_cause()` read it; `is_retryable()`, `is_rate_limited()`, `retry_after()` and `is_unknown_client()` answer for the cause, and `source()` returns it | by the cause |
 
 ## Bounds
 
@@ -647,7 +652,8 @@ DIRECTORY_VECTORS_OUT=siwx-oidc-auth/tests/vectors/directory \
 - **One unreadable profile fails a `search_as_user`.** A profile read that answers
   500 (an account with a `users` row and no `profiles` row, element-hq/synapse#19702)
   has an unknown state, and the result type has no state for "unknown". The whole
-  search is a retryable error rather than a claim about one person. The module
+  search is a retryable error (`Profile(Unavailable)`) rather than a claim about
+  one person. The module
   transport is unaffected: it reads the profiles on the homeserver.
 - **`search_as_user` needs the profile route to be public.** A homeserver that sets
   `require_auth_for_profile_requests` refuses the anonymous read; use

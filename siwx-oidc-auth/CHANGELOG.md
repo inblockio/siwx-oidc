@@ -316,6 +316,33 @@ matches error text should match the types named here instead.
   needs no change, and must not renew for an `IssuerKeys`, which holds no token
   refusal. (The enum is `#[non_exhaustive]`, so a `match` with a wildcard arm
   still compiles.)
+- **A failed read of a local person's profile in `search_as_user` is
+  `DirectoryError::Profile(Box<DirectoryError>)`, not the plain error of its
+  status.** The read of `GET /_matrix/client/v3/profile/{mxid}/io.inblock.did` is
+  sent without a credential, and its failure came back as the same error as the
+  `user_directory/search` call, which does carry the user's token, so a host could
+  not tell the profile route refusing the anonymous read (or a proxy in front of
+  it) from the user's token being refused (and asked the user to sign in again for
+  nothing), nor the rate limit of the profile route from that of the directory
+  call. Every failure of a local profile read (a 401, a 403, a 429, a 5xx, a
+  timeout, a body that is not JSON or over the cap) is now `Profile` with the
+  failure inside; the first one still ends the search, aborts the reads running
+  and keeps nothing. `user_directory/search` itself stays the plain error of its
+  status (`Unauthorized`, `RateLimited`, `Unavailable`, ...). What touches one
+  person only is unchanged and is no error: a profile that is absent (404), whose
+  field is absent or `null`, or that is no proof is `not_yet_published`, a proof
+  that does not verify is `invalid`; the profile of a person of another server
+  still never fails a search; the module transport (`search_for_asker`) reads no
+  local profile and never returns this. New `DirectoryError::is_profile()` and
+  `profile_cause()`; `is_retryable()`, `is_rate_limited()`, `retry_after()` and
+  `is_unknown_client()` answer for the cause (so `is_retryable()` is unchanged for
+  these failures), and `std::error::Error::source()` returns it. A host that
+  matched `Unavailable`, `RateLimited` or `Unauthorized` from `search_as_user` to
+  mean "the directory is down", "the directory call is rate limited" or "the
+  user's token is stale" must also look inside `Profile`, and must not ask the
+  user to sign in again for a `Profile(Unauthorized)`: the profile read carries no
+  token. (The enum is `#[non_exhaustive]`, so a `match` with a wildcard arm still
+  compiles.)
 - `DidState` has a new variant, `Unconfirmed`: a `match` on it that has no
   wildcard arm must handle it. A caller that offers recipients should keep
   offering `Verified` ones only unless it warns for `Unconfirmed`.

@@ -1480,7 +1480,10 @@ async fn a_failing_local_profile_fails_the_search_and_a_failing_remote_one_does_
     // A local profile that cannot be read is an unknown state, not a verdict about the person.
     w.hs.profile_status(&a, 500);
     let err = w.directory().search_as_user("t", "a", 5).await.unwrap_err();
-    assert!(matches!(err, DirectoryError::Unavailable(_)), "{err:?}");
+    assert!(
+        matches!(err.profile_cause(), Some(DirectoryError::Unavailable(_))),
+        "{err:?}"
+    );
     assert!(err.is_retryable());
 
     // A remote one that cannot be read is only that person's missing claim.
@@ -1883,7 +1886,7 @@ async fn an_error_status_is_classified_by_its_status_however_large_its_body() {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, DirectoryError::Unavailable(_)),
+            matches!(err.profile_cause(), Some(DirectoryError::Unavailable(_))),
             "chunked {chunked}: {err:?}"
         );
     }
@@ -4710,6 +4713,346 @@ fn the_issuer_keys_error_answers_the_helpers_for_its_cause() {
     assert!(DirectoryError::Unauthorized.issuer_keys_cause().is_none());
     assert!(!DirectoryError::Whoami(Box::new(DirectoryError::Unauthorized)).is_issuer_keys());
     assert!(!DirectoryError::Resolve(Box::new(DirectoryError::Unauthorized)).is_issuer_keys());
+}
+
+// ---------------------------------------------------------------------------
+// A local profile read that fails is told apart from the user directory's call
+// ---------------------------------------------------------------------------
+
+/// How the read of a local person's profile failed; fails the test when `e` is
+/// not a failure of that stage.
+fn profile_stage_cause(e: &DirectoryError) -> &DirectoryError {
+    assert!(e.is_profile(), "not reported as a profile failure: {e:?}");
+    assert!(
+        !e.is_whoami()
+            && !e.is_resolve()
+            && !e.is_issuer_keys()
+            && e.whoami_cause().is_none()
+            && e.resolve_cause().is_none()
+            && e.issuer_keys_cause().is_none(),
+        "a profile failure is no other stage's: {e:?}"
+    );
+    let cause = e
+        .profile_cause()
+        .unwrap_or_else(|| panic!("is_profile without a cause: {e:?}"));
+    assert!(
+        !cause.is_profile(),
+        "a profile failure nests no other: {e:?}"
+    );
+    cause
+}
+
+/// One thing a profile route can answer that is not a person's field: its name,
+/// the answer, whether the cause is the one expected, and whether it is retryable.
+type ProfileFault = (&'static str, Resp, fn(&DirectoryError) -> bool, bool);
+
+/// What a local profile route can answer that is not a person's field, with
+/// what a search must make of it.
+fn profile_faults() -> Vec<ProfileFault> {
+    let errcode = |status| Resp::json(status, json!({"errcode": "M_UNKNOWN"}));
+    let mut over_the_cap = br#"{"io.inblock.did": null}"#.to_vec();
+    over_the_cap.resize(256 * 1024 + 1, b' ');
+    vec![
+        (
+            "401 (the anonymous read refused, or a wall in front of it)",
+            errcode(401),
+            |c| matches!(c, DirectoryError::Unauthorized),
+            false,
+        ),
+        (
+            "403 (M_FORBIDDEN)",
+            errcode(403),
+            |c| matches!(c, DirectoryError::UnexpectedStatus { status: 403, .. }),
+            false,
+        ),
+        (
+            "400",
+            errcode(400),
+            |c| matches!(c, DirectoryError::UnexpectedStatus { status: 400, .. }),
+            false,
+        ),
+        (
+            "429 with a Retry-After",
+            errcode(429).header("Retry-After", "7"),
+            |c| {
+                matches!(c, DirectoryError::RateLimited { .. })
+                    && c.retry_after() == Some(Duration::from_secs(7))
+            },
+            true,
+        ),
+        (
+            "500 (an account with no profile row)",
+            errcode(500),
+            |c| matches!(c, DirectoryError::Unavailable(_)),
+            true,
+        ),
+        (
+            "502",
+            errcode(502),
+            |c| matches!(c, DirectoryError::Unavailable(_)),
+            true,
+        ),
+        (
+            "503",
+            errcode(503),
+            |c| matches!(c, DirectoryError::Unavailable(_)),
+            true,
+        ),
+        (
+            "200 with a body that is not JSON",
+            Resp::bytes(200, b"this is not json".to_vec()),
+            |c| matches!(c, DirectoryError::Protocol(_)),
+            false,
+        ),
+        (
+            "200 with no body",
+            Resp::bytes(200, Vec::new()),
+            |c| matches!(c, DirectoryError::Protocol(_)),
+            false,
+        ),
+        (
+            "200 over the body cap",
+            Resp::bytes(200, over_the_cap),
+            |c| matches!(c, DirectoryError::Protocol(_)),
+            false,
+        ),
+        (
+            "no answer within the request timeout",
+            Resp::json(200, json!({"io.inblock.did": null})).delayed(Duration::from_secs(3)),
+            |c| matches!(c, DirectoryError::Unavailable(_)),
+            true,
+        ),
+    ]
+}
+
+/// The profile is read with no credential, so none of these is the user's token
+/// refused, and none is the user directory's own answer: every way a local
+/// profile read fails is `Profile` with the failure inside, the search is
+/// failed, and nothing signs in or is kept.
+#[tokio::test]
+async fn a_local_profile_failure_is_a_profile_stage_failure() {
+    for (label, answer, expect, retryable) in profile_faults() {
+        let w = World::new().await;
+        let (a, b) = (mxid("alice"), mxid("bob"));
+        w.hs.directory_rows(vec![json!({"user_id": a}), json!({"user_id": b})]);
+        w.hs.profile(&a, Some(w.issuer.field(&did_of("Alice"), &a)));
+        w.hs.profile_answer(&b, answer);
+        let tuning = Tuning {
+            request_timeout: Duration::from_millis(300),
+            ..Tuning::default()
+        };
+        let dir = w.directory_with(tuning);
+        for attempt in 0..2 {
+            let err = dir
+                .search_as_user("user-token-fixture", "a", 5)
+                .await
+                .unwrap_err();
+            let cause = profile_stage_cause(&err);
+            assert!(expect(cause), "{label} (attempt {attempt}): {err:?}");
+            assert_eq!(err.is_retryable(), retryable, "{label}: {err:?}");
+            assert_eq!(err.is_rate_limited(), cause.is_rate_limited(), "{label}");
+            assert_eq!(err.retry_after(), cause.retry_after(), "{label}");
+            assert!(!err.is_unknown_client(), "{label}");
+            assert!(
+                err.to_string().contains("profile"),
+                "{label}: the text names the stage: {err}"
+            );
+        }
+        assert_eq!(
+            w.hs.mock.count("POST", USER_DIRECTORY_PATH),
+            2,
+            "{label}: the directory call itself went through, and nothing was kept"
+        );
+        assert_eq!(
+            w.issuer.mock.count("POST", "/token"),
+            0,
+            "{label}: the user's search signs the service in for nothing"
+        );
+    }
+}
+
+/// The directory call is the only one that carries the token: its 401 and 429
+/// stay the plain errors of their status, and no profile is read after them.
+#[tokio::test]
+async fn the_user_directory_call_stays_the_plain_error_of_its_status() {
+    let w = World::new().await;
+    let a = mxid("alice");
+    w.hs.profile(&a, Some(w.issuer.field(&did_of("Alice"), &a)));
+
+    w.hs.on_user_directory(|_, _| Resp::json(401, json!({"errcode": "M_UNKNOWN_TOKEN"})));
+    let err = w
+        .directory()
+        .search_as_user("stale", "a", 5)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DirectoryError::Unauthorized), "{err:?}");
+    assert!(!err.is_profile() && err.profile_cause().is_none());
+
+    w.hs.on_user_directory(|_, _| {
+        Resp::json(429, json!({"errcode": "M_LIMIT_EXCEEDED"})).header("Retry-After", "9")
+    });
+    let err = w.directory().search_as_user("t", "a", 5).await.unwrap_err();
+    assert!(
+        matches!(err, DirectoryError::RateLimited { retry_after: Some(d) } if d == Duration::from_secs(9)),
+        "{err:?}"
+    );
+    assert!(!err.is_profile() && err.profile_cause().is_none());
+
+    w.hs.on_user_directory(|_, _| Resp::json(503, json!({"errcode": "M_UNKNOWN"})));
+    let err = w.directory().search_as_user("t", "a", 5).await.unwrap_err();
+    assert!(matches!(err, DirectoryError::Unavailable(_)), "{err:?}");
+    assert!(!err.is_profile());
+
+    assert_eq!(
+        w.hs.profile_reads(),
+        0,
+        "no profile is read for a refused call"
+    );
+}
+
+/// A profile problem that touches one person is that person's state, not the
+/// search's error: an absent profile, an absent or null field, a field that is
+/// no proof, a proof that does not verify. The others of the search are answered.
+#[tokio::test]
+async fn a_profile_problem_that_touches_one_row_fails_nothing() {
+    let w = World::new().await;
+    let names = [
+        "alice", "bob", "carol", "dave", "erin", "frank", "gina", "hank", "ida",
+    ];
+    w.hs.directory_rows(names.iter().map(|n| json!({"user_id": mxid(n)})).collect());
+    let m = |n: &str| mxid(n);
+    w.hs.profile(
+        &m("alice"),
+        Some(w.issuer.field(&did_of("Alice"), &m("alice"))),
+    );
+    w.hs.profile(&m("bob"), None); // 404: no profile
+    w.hs.profile_answer(&m("carol"), Resp::json(200, json!({}))); // a profile without the field
+    w.hs.profile_answer(&m("dave"), Resp::json(200, json!({"io.inblock.did": null})));
+    w.hs.profile(&m("erin"), Some(json!(did_of("Erin")))); // the legacy bare string
+    w.hs.profile(&m("frank"), Some(json!({"did": did_of("Frank")}))); // no proof
+    w.hs.profile(
+        &m("gina"),
+        Some(json!({"did": did_of("Gina"), "proof": ""})),
+    );
+    w.hs.profile(
+        &m("hank"),
+        Some(w.issuer.field(&did_of("Hank"), &m("alice"))), // a proof for another MXID
+    );
+    w.hs.profile(
+        &m("ida"),
+        Some(json!({"did": did_of("Ida"), "proof": "not.a.proof"})),
+    );
+
+    let got = w
+        .directory()
+        .search_as_user("user-token-fixture", "a", 20)
+        .await
+        .unwrap();
+    assert_eq!(
+        states(&got),
+        vec![
+            verified(&did_of("Alice")),
+            not_yet(),
+            not_yet(),
+            not_yet(),
+            not_yet(),
+            not_yet(),
+            not_yet(),
+            json!({"state": "invalid"}),
+            json!({"state": "invalid"}),
+        ]
+    );
+    assert_eq!(w.hs.profile_reads(), names.len());
+}
+
+/// The profile of a person of another server never fails a search, whatever the
+/// foreign homeserver (through ours) answers: it costs that person their claim.
+#[tokio::test]
+async fn no_answer_for_a_remote_profile_fails_a_user_search() {
+    for (label, answer, _, _) in profile_faults() {
+        let w = World::new().await;
+        let (foreign, a) = (remote("carol"), mxid("alice"));
+        w.hs.directory_rows(vec![json!({"user_id": foreign}), json!({"user_id": a})]);
+        w.hs.profile(&a, Some(w.issuer.field(&did_of("Alice"), &a)));
+        w.hs.profile_answer(&foreign, answer);
+        let tuning = Tuning {
+            request_timeout: Duration::from_millis(300),
+            remote_profile_timeout: Duration::from_millis(300),
+            remote_profiles_timeout: Duration::from_millis(600),
+            ..Tuning::default()
+        };
+        let got = w
+            .directory_with(tuning)
+            .search_as_user("user-token-fixture", "a", 5)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: a remote profile failed the search: {e:?}"));
+        assert_eq!(
+            states(&got),
+            vec![not_yet(), verified(&did_of("Alice"))],
+            "{label}"
+        );
+    }
+}
+
+/// The module transport reads no local profile (the module carries the field),
+/// so a local profile that would fail a user search changes nothing there.
+#[tokio::test]
+async fn the_module_transport_never_reads_a_local_profile() {
+    let w = World::new().await;
+    let a = published(&w, "alice");
+    w.hs.module_hits(vec![a]);
+    w.hs.profile_status(&mxid("alice"), 500);
+    let got = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .unwrap();
+    assert_eq!(states(&got), vec![verified(&did_of("alice"))]);
+    assert_eq!(w.hs.profile_reads(), 0);
+}
+
+/// The helpers answer for the inner error, and the error carries its cause.
+#[test]
+fn the_profile_error_answers_the_helpers_for_its_cause() {
+    use std::error::Error;
+    let wrap = |cause| DirectoryError::Profile(Box::new(cause));
+
+    let down = wrap(DirectoryError::Unavailable(
+        "directory unavailable: the server answered 500".into(),
+    ));
+    assert!(down.is_retryable() && down.is_profile() && !down.is_rate_limited());
+    for fatal in [
+        DirectoryError::Unauthorized,
+        DirectoryError::Protocol("a profile answer is not JSON".into()),
+        DirectoryError::UnexpectedStatus {
+            status: 403,
+            errcode: Some("M_FORBIDDEN".into()),
+        },
+    ] {
+        assert!(!wrap(fatal).is_retryable());
+    }
+    let limited = wrap(DirectoryError::RateLimited {
+        retry_after: Some(Duration::from_secs(3)),
+    });
+    assert!(limited.is_retryable() && limited.is_rate_limited());
+    assert_eq!(limited.retry_after(), Some(Duration::from_secs(3)));
+    assert!(!limited.is_unknown_client());
+
+    assert!(down.source().is_some(), "the cause is the source");
+    let text = down.to_string();
+    assert!(text.contains("profile") && text.contains("500"), "{text}");
+    assert!(matches!(
+        down.profile_cause(),
+        Some(DirectoryError::Unavailable(_))
+    ));
+    assert!(!down.is_whoami() && down.whoami_cause().is_none());
+    assert!(!down.is_resolve() && down.resolve_cause().is_none());
+    assert!(!down.is_issuer_keys() && down.issuer_keys_cause().is_none());
+    assert!(!DirectoryError::Unauthorized.is_profile());
+    assert!(DirectoryError::Unauthorized.profile_cause().is_none());
+    assert!(!DirectoryError::Whoami(Box::new(DirectoryError::Unauthorized)).is_profile());
+    assert!(!DirectoryError::Resolve(Box::new(DirectoryError::Unauthorized)).is_profile());
+    assert!(!DirectoryError::IssuerKeys(Box::new(DirectoryError::Unauthorized)).is_profile());
 }
 
 // ---------------------------------------------------------------------------
