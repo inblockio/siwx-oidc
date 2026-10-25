@@ -3249,6 +3249,54 @@ async fn a_dead_foreign_server_costs_one_wait_and_not_one_per_search() {
     assert_eq!(w.hs.profile_reads(), 1);
 }
 
+/// The wait for a place is held to the total, but tokio polls the inner future
+/// first, so a place freed at the deadline is still taken. A read that begins
+/// there is cancelled on its first poll, and what it "learned" (nothing) must
+/// not be kept as a one-minute miss for a server that was never asked.
+#[tokio::test]
+async fn a_place_taken_at_the_remote_deadline_is_never_kept_as_a_miss() {
+    let w = World::new().await;
+    let names: Vec<String> = (0..24).map(|i| format!("dead{i}")).collect();
+    people(
+        &w,
+        &names.iter().map(|n| (remote(n), None)).collect::<Vec<_>>(),
+    );
+    for n in &names {
+        w.hs.profile_answer(
+            &remote(n),
+            Resp::json(200, json!({"io.inblock.did": {"did": "did:key:zDead"}}))
+                .delayed(Duration::from_secs(5)),
+        );
+    }
+    // The total is one read's bound: the places free exactly when it ends.
+    let tuning = Tuning {
+        remote_profile_timeout: Duration::from_millis(300),
+        remote_profiles_timeout: Duration::from_millis(300),
+        ..Tuning::default()
+    };
+    let dir = w.directory_with(tuning);
+    let session = w.session();
+    let mut asked_before = 0;
+    for search in 1..=3 {
+        let got = dir
+            .search_for_asker(&session, ASKER_DID, "dead", 20)
+            .await
+            .unwrap();
+        assert_eq!(states(&got), vec![not_yet(); 20]);
+        let asked = w.hs.profile_reads();
+        assert_eq!(
+            dir.cache_stats().remote_claims,
+            asked,
+            "search {search}: a miss is kept for a server that was asked, and only for those"
+        );
+        assert!(
+            asked > asked_before,
+            "search {search}: the people not asked before are asked now ({asked})"
+        );
+        asked_before = asked;
+    }
+}
+
 #[tokio::test]
 async fn local_and_remote_profile_reads_are_never_more_than_eight_at_once() {
     let w = World::new().await;
@@ -3449,6 +3497,53 @@ async fn an_asker_on_the_server_name_confirms_it_for_the_user_transport_too() {
         0,
         "the same deployment and the same name: nothing left to ask"
     );
+}
+
+/// The issuer builds the asker's MXID from its own config, so an asker that
+/// matches a wrong `server_name` says nothing about the homeserver: when the
+/// issuer and the client carry the same wrong name, the string matches. Only the
+/// homeserver may confirm the name (whoami, or a module answer for the asker),
+/// so a module call that fails leaves the name unconfirmed, and the user search
+/// on the same client asks whoami and fails closed.
+#[tokio::test]
+async fn an_asker_string_on_a_wrong_name_never_confirms_it_for_the_user_transport() {
+    for status in [403, 429, 502] {
+        let w = World::new().await;
+        local_people_with_a_valid_proof(&w);
+        // The issuer is misconfigured the same way as the client.
+        w.issuer.with(|s| {
+            s.resolve.insert(
+                ASKER_DID.to_string(),
+                format!("@asker-fixture:{WRONG_NAME}"),
+            );
+        });
+        // The homeserver does not answer for an asker that is not its own.
+        w.hs.on_module(move |_, _| Resp::json(status, json!({"errcode": "M_FORBIDDEN"})));
+        let dir = misconfigured(&w);
+        assert!(
+            dir.search_for_asker(&w.session(), ASKER_DID, "a", 5)
+                .await
+                .is_err(),
+            "the module refused ({status})"
+        );
+        assert_eq!(w.hs.module_calls(), 1, "the asker matched the wrong name");
+
+        let err = dir
+            .search_as_user("user-token-fixture", "a", 5)
+            .await
+            .expect_err("local people would be shown as unconfirmed under the wrong name");
+        assert!(is_name_mismatch(&err), "{status}: {err}");
+        assert_eq!(w.hs.whoami_calls(), 1, "{status}: the homeserver was asked");
+        assert_eq!(w.hs.user_directory_calls(), 0, "the directory is not asked");
+        assert_eq!(w.hs.profile_reads(), 0, "no profile is read");
+        // And it stays unconfirmed: the next user search asks again.
+        assert!(is_name_mismatch(
+            &dir.search_as_user("user-token-fixture", "a", 5)
+                .await
+                .unwrap_err()
+        ));
+        assert_eq!(w.hs.whoami_calls(), 2);
+    }
 }
 
 #[tokio::test]

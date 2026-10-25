@@ -1388,9 +1388,11 @@ struct Inner {
     /// Fetches that have finished, read before waiting at `key_fetch`: a caller
     /// that finds it changed knows a fetch ran while it waited.
     key_fetches: AtomicU64,
-    /// Set once a person of the homeserver itself was seen on `server_name`.
-    /// Never set by a mismatch, so a wrong name is answered with an error on
-    /// every search.
+    /// Set once the homeserver itself has vouched for `server_name`: its
+    /// `whoami` named a person on it, or its module answered for an asker on it.
+    /// Never set by a mismatch, and never by a string that the issuer built from
+    /// the same configuration, so a wrong name is answered with an error on
+    /// every user search.
     server_name_confirmed: AtomicBool,
 }
 
@@ -1522,7 +1524,9 @@ impl DirectoryClient {
         // The asker comes from our own issuer, so it is a person of the
         // homeserver itself. One that is not on `server_name` says the name is
         // wrong, and then every local person would be taken for a foreign one.
-        inner.confirm_server_name(&asker)?;
+        // That is a refusal only: the issuer builds the MXID from its own
+        // configuration, so a match proves nothing about the homeserver.
+        inner.refuse_other_server(&asker)?;
 
         let token = session.access_token().await?;
         let body = match inner.ask_module(&token, &asker, term, limit).await {
@@ -1532,6 +1536,8 @@ impl DirectoryClient {
             }
             other => other?,
         };
+        // The homeserver answered for this asker: its own person.
+        inner.server_name_confirmed.store(true, Ordering::Release);
         inner.build_results(&body, limit).await
     }
 
@@ -1545,8 +1551,9 @@ impl DirectoryClient {
     /// The first search asks `GET /account/whoami` with the token, once, to learn
     /// that its owner is on [`DirectoryConfig::server_name`]; one who is not is
     /// [`DirectoryError::ServerNameMismatch`] and the directory is not asked
-    /// (a search for an asker that matched the name already makes this
-    /// unnecessary). A local profile that cannot be read fails the search:
+    /// (a module answer for an asker on the name, on the same client, already
+    /// makes this unnecessary; the asker's name alone does not, since the issuer
+    /// builds it from its own configuration). A local profile that cannot be read fails the search:
     /// its state is unknown, and `invalid` would be a claim about the person. A
     /// profile of another server's user is read for a claim
     /// ([`DidState::Unconfirmed`]) and never fails the search.
@@ -1769,11 +1776,14 @@ impl Inner {
     /// that is not the homeserver's (a delegated host, a typo) would turn every
     /// local person into a foreign one: their valid proof ignored, their unsigned
     /// `did` member shown. `local` is a person known to be the homeserver's own.
-    fn confirm_server_name(&self, local: &str) -> Result<(), DirectoryError> {
+    ///
+    /// Only the homeserver can say so: `GET /account/whoami`, or a module answer
+    /// for the asker. This check alone is a refusal and never confirms
+    /// anything (see `server_name_confirmed`).
+    fn refuse_other_server(&self, local: &str) -> Result<(), DirectoryError> {
         if !self.is_local(local) {
             return Err(DirectoryError::ServerNameMismatch);
         }
-        self.server_name_confirmed.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -1801,7 +1811,9 @@ impl Inner {
             .and_then(|v| v.get("user_id")?.as_str().map(str::to_string))
             .filter(|user| is_mxid(user))
             .ok_or_else(|| DirectoryError::Protocol("whoami names no user".into()))?;
-        self.confirm_server_name(&user)
+        self.refuse_other_server(&user)?;
+        self.server_name_confirmed.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Send, read the body under the size cap (a success over it is a protocol
@@ -2064,6 +2076,15 @@ impl Inner {
                     // too, but by its own bound (see `read_claim`), so that what
                     // it learns is kept.
                     match tokio::time::timeout_at(deadline, permits.clone().acquire_owned()).await {
+                        // `timeout_at` polls the wait first, so a place that is
+                        // free is taken even after the deadline. A read that
+                        // began there would be cancelled on its first poll and
+                        // kept as a miss for a server that was never asked, and
+                        // the searches waiting on it would adopt that.
+                        Ok(Ok(place)) if tokio::time::Instant::now() >= deadline => {
+                            drop(place);
+                            return None;
+                        }
                         Ok(Ok(place)) => permit = Some(place),
                         _ => return None,
                     }
@@ -2813,6 +2834,46 @@ mod tests {
                 std::fs::create_dir_all(dir).unwrap();
                 std::fs::write(dir.join(format!("{name}.json")), text).unwrap();
             }
+        }
+    }
+
+    /// The wait for a place is held to the deadline, but tokio polls the inner
+    /// future first, so a place that is free is taken even when the deadline has
+    /// passed. A read that begins there is cancelled on its first poll: it must
+    /// not be started, and no miss may be kept for a server that was never asked.
+    #[tokio::test]
+    async fn a_place_taken_at_the_deadline_starts_no_read_and_keeps_no_miss() {
+        // Nothing listens there: a read that did start would find no one.
+        let client = DirectoryClient::new(DirectoryConfig::new(
+            "http://127.0.0.1:9",
+            "http://127.0.0.1:9",
+            "example.org",
+        ))
+        .unwrap();
+        let inner = &client.inner;
+        let permits = Arc::new(Semaphore::new(PROFILE_READS_AT_ONCE));
+        for ahead in [Duration::ZERO, Duration::from_secs(1)] {
+            let deadline = tokio::time::Instant::now()
+                .checked_sub(ahead)
+                .unwrap_or_else(tokio::time::Instant::now);
+            assert!(inner
+                .claim_of("@far:other.example", &permits, deadline)
+                .await
+                .is_none());
+            assert_eq!(
+                client.cache_stats().remote_claims,
+                0,
+                "no miss is kept (deadline {ahead:?} past)"
+            );
+            assert!(
+                inner.caches.lock().unwrap().flights.is_empty(),
+                "no read is registered"
+            );
+            assert_eq!(
+                permits.available_permits(),
+                PROFILE_READS_AT_ONCE,
+                "the place is given back"
+            );
         }
     }
 }
