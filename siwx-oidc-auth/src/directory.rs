@@ -71,7 +71,7 @@ use anyhow::anyhow;
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{watch, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use url::Url;
 
@@ -1192,8 +1192,71 @@ struct Caches {
     verified: TtlCache<(String, String), String>,
     /// A remote person's MXID to the DID they claim; `None` is "no usable
     /// claim". Not the verified cache: nothing in here was ever checked.
-    claims: TtlCache<String, Option<ClaimedDid>>,
+    claims: TtlCache<String, KeptClaim>,
+    /// The reads of a remote person's profile that are running now, one per
+    /// person: a search that wants one that is running waits for it.
+    flights: HashMap<String, Arc<Flight>>,
+    /// How many entries were ever stored in `claims`; a read notes it when it
+    /// begins (see [`Caches::store_claim`]).
+    claim_writes: u64,
     keys: Option<(Arc<IssuerKeys>, Instant)>,
+}
+
+/// What `claims` holds for one person.
+#[derive(Clone)]
+struct KeptClaim {
+    claim: Option<ClaimedDid>,
+    /// Which store this was, counting from one (`Caches::claim_writes`).
+    written: u64,
+}
+
+/// A running read: `None` while it runs, then its outcome. The sender is dropped
+/// when the read ends without one (its caller went away), which wakes the
+/// waiters to look again.
+type Flight = watch::Sender<Option<Option<ClaimedDid>>>;
+
+impl Caches {
+    fn new() -> Self {
+        Caches {
+            resolved: TtlCache::new(),
+            verified: TtlCache::new(),
+            claims: TtlCache::new(),
+            flights: HashMap::new(),
+            claim_writes: 0,
+            keys: None,
+        }
+    }
+
+    /// Keep what a read of `mxid` found, unless the entry for that person is
+    /// newer than the read: one stored after the read began (`began` is the
+    /// count of stores when it did) came from a read that began later, and a
+    /// slower read that ends last must not put its older, or failed, answer in
+    /// its place. Reads of one person do not overlap (see `Inner::claim_of`), so
+    /// this is a second line.
+    fn store_claim(
+        &mut self,
+        mxid: &str,
+        claim: Option<ClaimedDid>,
+        began: u64,
+        now: Instant,
+        ttl: Duration,
+        cap: usize,
+    ) {
+        if let Some(kept) = self.claims.get(&mxid.to_string(), now) {
+            if kept.written > began {
+                return;
+            }
+        }
+        self.claim_writes += 1;
+        let written = self.claim_writes;
+        self.claims.put(
+            mxid.to_string(),
+            KeptClaim { claim, written },
+            now,
+            ttl,
+            cap,
+        );
+    }
 }
 
 /// How full the caches are; for a service's own diagnostics.
@@ -1371,12 +1434,7 @@ impl DirectoryClient {
                 tuning,
                 clock,
                 http,
-                caches: Mutex::new(Caches {
-                    resolved: TtlCache::new(),
-                    verified: TtlCache::new(),
-                    claims: TtlCache::new(),
-                    keys: None,
-                }),
+                caches: Mutex::new(Caches::new()),
                 key_fetch: AsyncMutex::new(KeyFetch::default()),
                 key_fetches: AtomicU64::new(0),
                 server_name_confirmed: AtomicBool::new(false),
@@ -1603,6 +1661,67 @@ impl Rows {
         if self.rows.len() > limit as usize {
             self.rows.truncate(limit as usize);
             self.limited = true;
+        }
+    }
+}
+
+/// What a search finds when it looks for a remote person's claim.
+enum Look {
+    /// In the cache: a claim, or `None` for "no usable claim".
+    Kept(Option<ClaimedDid>),
+    /// Another search is reading; the outcome arrives here.
+    Running(watch::Receiver<Option<Option<ClaimedDid>>>),
+    /// Nothing kept or running, and the caller holds no place yet.
+    Idle,
+    /// Nothing kept or running: this caller reads.
+    Lead(Lead),
+}
+
+/// The one read of a remote person's profile that is running. Dropping it, as a
+/// cancelled search does, ends the read with no outcome and removes it, so the
+/// searches that waited look again instead of waiting for a read nobody runs.
+struct Lead {
+    inner: Arc<Inner>,
+    mxid: String,
+    flight: Arc<Flight>,
+    /// `Caches::claim_writes` when the read began.
+    began: u64,
+}
+
+impl Lead {
+    /// Keep the outcome (a claim for `unconfirmed_ttl`, "no usable claim" for
+    /// `remote_miss_ttl`) and hand it to the searches that waited. The outcome is
+    /// kept before the read is removed, so nobody finds neither.
+    fn finish(self, claim: Option<ClaimedDid>) {
+        let tuning = &self.inner.tuning;
+        let ttl = if claim.is_some() {
+            tuning.unconfirmed_ttl
+        } else {
+            tuning.remote_miss_ttl
+        };
+        let now = self.inner.now();
+        self.inner.caches.lock().unwrap().store_claim(
+            &self.mxid,
+            claim.clone(),
+            self.began,
+            now,
+            ttl,
+            tuning.max_cache_entries,
+        );
+        self.flight.send_replace(Some(claim));
+    }
+}
+
+impl Drop for Lead {
+    fn drop(&mut self) {
+        if let Ok(mut caches) = self.inner.caches.lock() {
+            if caches
+                .flights
+                .get(&self.mxid)
+                .is_some_and(|running| Arc::ptr_eq(running, &self.flight))
+            {
+                caches.flights.remove(&self.mxid);
+            }
         }
     }
 }
@@ -1867,18 +1986,10 @@ impl Inner {
             }
             let (inner, permits, mxid) = (self.clone(), permits.clone(), row.mxid.clone());
             reads.spawn(async move {
-                if let Some(kept) = inner.kept_claim(&mxid) {
-                    return (index, kept);
-                }
-                // The wait for a place is held to the total; the read is too, but
-                // by its own bound (see `read_claim`), so that what it learns is
-                // kept.
-                let Ok(Ok(_permit)) =
-                    tokio::time::timeout_at(remote_deadline, permits.acquire_owned()).await
-                else {
-                    return (index, None);
-                };
-                (index, inner.read_claim(&mxid, remote_deadline).await)
+                (
+                    index,
+                    inner.claim_of(&mxid, &permits, remote_deadline).await,
+                )
             });
         }
         while let Some(done) = reads.join_next().await {
@@ -1889,17 +2000,88 @@ impl Inner {
         Ok(())
     }
 
-    /// A remote person's claim still in the cache: `Some(None)` is "no usable
-    /// claim", kept for less time.
-    fn kept_claim(&self, mxid: &str) -> Option<Option<ClaimedDid>> {
-        let now = self.now();
-        let mut caches = self.caches.lock().unwrap();
-        caches.claims.get(&mxid.to_string(), now)
+    /// What the search learns of one remote person: their claim, or `None` for
+    /// "no usable claim", whether kept, read now by this call, or read now by
+    /// another search that this one waited for. Never fails.
+    ///
+    /// - A claim in the cache, or a read of this person already running, costs no
+    ///   place: concurrent searches for the same person make **one** read, and
+    ///   the others take its outcome.
+    /// - Otherwise this call needs one of the `permits` (held to `deadline`, the
+    ///   end of the search's total) and then leads: it registers the read, so
+    ///   that everyone arriving meanwhile waits, reads, keeps the outcome and
+    ///   hands it on.
+    /// - A leader that is dropped (its search was) ends the read with no outcome;
+    ///   the searches that waited look again, and one of them reads.
+    async fn claim_of(
+        self: &Arc<Self>,
+        mxid: &str,
+        permits: &Arc<Semaphore>,
+        deadline: tokio::time::Instant,
+    ) -> Option<ClaimedDid> {
+        let mut permit: Option<OwnedSemaphorePermit> = None;
+        loop {
+            match self.look_for_claim(mxid, permit.is_some()) {
+                Look::Kept(claim) => return claim,
+                Look::Running(mut outcome) => {
+                    // Someone else is reading: this call needs no place.
+                    permit = None;
+                    match tokio::time::timeout_at(deadline, outcome.wait_for(Option::is_some)).await
+                    {
+                        Ok(Ok(done)) => return done.clone().flatten(),
+                        // The read ended with no outcome: look again.
+                        Ok(Err(_)) => {}
+                        // The total ended first.
+                        Err(_) => return None,
+                    }
+                }
+                Look::Idle => {
+                    // The wait for a place is held to the total; the read is
+                    // too, but by its own bound (see `read_claim`), so that what
+                    // it learns is kept.
+                    match tokio::time::timeout_at(deadline, permits.clone().acquire_owned()).await {
+                        Ok(Ok(place)) => permit = Some(place),
+                        _ => return None,
+                    }
+                }
+                Look::Lead(lead) => {
+                    let _place = permit;
+                    let claim = self.read_claim(mxid, deadline).await;
+                    lead.finish(claim.clone());
+                    return claim;
+                }
+            }
+        }
     }
 
-    /// Read a remote person's profile for a claim, and keep what came of it. It
-    /// never fails: anything but a well-formed DID in the field, or no answer
-    /// within the read's bound, is "no usable claim", and that is kept as well.
+    /// One look at the person's entry, under one lock. With `may_lead` (the
+    /// caller holds a place) and nothing kept or running, the caller becomes the
+    /// one that reads; without it, `Idle` says a place is needed first.
+    fn look_for_claim(self: &Arc<Self>, mxid: &str, may_lead: bool) -> Look {
+        let now = self.now();
+        let mut caches = self.caches.lock().unwrap();
+        if let Some(kept) = caches.claims.get(&mxid.to_string(), now) {
+            return Look::Kept(kept.claim);
+        }
+        if let Some(flight) = caches.flights.get(mxid) {
+            return Look::Running(flight.subscribe());
+        }
+        if !may_lead {
+            return Look::Idle;
+        }
+        let flight = Arc::new(watch::channel(None).0);
+        caches.flights.insert(mxid.to_string(), flight.clone());
+        Look::Lead(Lead {
+            inner: self.clone(),
+            mxid: mxid.to_string(),
+            flight,
+            began: caches.claim_writes,
+        })
+    }
+
+    /// Read a remote person's profile for a claim. It never fails: anything but a
+    /// well-formed DID in the field, or no answer within the read's bound, is "no
+    /// usable claim". The caller keeps the outcome (see [`Lead::finish`]).
     ///
     /// The bound is the earlier of [`Tuning::remote_profile_timeout`] from now
     /// and `deadline`, the end of the search's total. The read ends by that
@@ -1913,23 +2095,10 @@ impl Inner {
             .checked_add(self.tuning.remote_profile_timeout)
             .map_or(deadline, |own| own.min(deadline));
         let read = tokio::time::timeout_at(bound, self.read_profile(mxid)).await;
-        let claim = match read {
+        match read {
             Ok(Ok(Some(field))) => claim_from_field(&field),
             _ => None,
-        };
-        let ttl = if claim.is_some() {
-            self.tuning.unconfirmed_ttl
-        } else {
-            self.tuning.remote_miss_ttl
-        };
-        self.caches.lock().unwrap().claims.put(
-            mxid.to_string(),
-            claim.clone(),
-            self.now(),
-            ttl,
-            self.tuning.max_cache_entries,
-        );
-        claim
+        }
     }
 
     /// `GET /profile/{mxid}/io.inblock.did`, with no credential: the route is
@@ -2265,6 +2434,45 @@ mod tests {
                 "missing vector {required}"
             );
         }
+    }
+
+    // -- the claims cache: a read never puts an older answer over a newer one ---
+
+    #[test]
+    fn a_read_never_puts_its_answer_over_one_stored_after_it_began() {
+        let mut caches = Caches::new();
+        let (now, ttl, cap) = (Instant::now(), Duration::from_secs(300), 16);
+        let person = "@a:other.example";
+        let claim = |did: &str| Some(ClaimedDid(did.to_string()));
+        let kept = |caches: &mut Caches| {
+            caches
+                .claims
+                .get(&person.to_string(), now)
+                .map(|kept| kept.claim)
+        };
+
+        // A slow read begins; a fresher one begins after it, ends first and is stored.
+        let slow = caches.claim_writes;
+        let fresh = caches.claim_writes;
+        caches.store_claim(person, claim("did:key:zFresh"), fresh, now, ttl, cap);
+        assert_eq!(kept(&mut caches), Some(claim("did:key:zFresh")));
+
+        // The slow one ends last. A failure of it is not put over the claim ...
+        caches.store_claim(person, None, slow, now, ttl, cap);
+        assert_eq!(kept(&mut caches), Some(claim("did:key:zFresh")), "a miss");
+        // ... and neither is an older claim.
+        caches.store_claim(person, claim("did:key:zOld"), slow, now, ttl, cap);
+        assert_eq!(kept(&mut caches), Some(claim("did:key:zFresh")), "a claim");
+
+        // A read that began after the entry was stored does replace it.
+        let later = caches.claim_writes;
+        caches.store_claim(person, None, later, now, ttl, cap);
+        assert_eq!(kept(&mut caches), Some(None));
+
+        // And one entry's age says nothing about another person's.
+        let other = "@b:other.example";
+        caches.store_claim(other, claim("did:key:zB"), slow, now, ttl, cap);
+        assert!(caches.claims.get(&other.to_string(), now).is_some());
     }
 
     // -- the DID syntax of a claim -------------------------------------------

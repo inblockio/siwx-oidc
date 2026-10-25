@@ -3753,3 +3753,158 @@ async fn a_failing_local_read_ends_the_search_before_any_foreign_server_is_asked
         "the state of a local person is unknown, and no foreign server was bothered for the answer"
     );
 }
+
+// ---------------------------------------------------------------------------
+// One read per person at a time, whoever asks
+// ---------------------------------------------------------------------------
+
+/// `n` searches of the same people at once, over both transports alternately.
+async fn concurrently(
+    w: &World,
+    dir: &DirectoryClient,
+    n: usize,
+    transport: usize,
+) -> Vec<DirectoryResults> {
+    let session = Arc::new(w.session());
+    let mut tasks = Vec::new();
+    for i in 0..n {
+        let (dir, session) = (dir.clone(), session.clone());
+        tasks.push(tokio::spawn(async move {
+            if i % 2 == transport % 2 {
+                dir.search_for_asker(&session, ASKER_DID, "p", 20).await
+            } else {
+                dir.search_as_user("user-token-fixture", "p", 20).await
+            }
+        }));
+    }
+    let mut out = Vec::new();
+    for t in tasks {
+        out.push(t.await.unwrap().unwrap());
+    }
+    out
+}
+
+#[tokio::test]
+async fn searches_at_the_same_time_make_one_read_of_the_same_person() {
+    for answer in [
+        Resp::json(200, json!({"io.inblock.did": {"did": "did:key:zCarol"}})),
+        Resp::json(502, json!({"errcode": "M_UNKNOWN"})),
+    ] {
+        let found = answer.status == 200;
+        let w = World::new().await;
+        let carol = remote("carol");
+        people(&w, &[(carol.clone(), None)]);
+        w.hs.profile_answer(&carol, answer.delayed(Duration::from_millis(300)));
+        let dir = w.directory();
+        let got = concurrently(&w, &dir, 5, 0).await;
+        assert_eq!(
+            w.hs.profile_reads(),
+            1,
+            "five searches wait for one read ({})",
+            if found { "a claim" } else { "a failure" }
+        );
+        let expected = if found {
+            unconfirmed("did:key:zCarol")
+        } else {
+            not_yet()
+        };
+        for g in got {
+            assert_eq!(states(&g), vec![expected.clone()]);
+        }
+        assert_eq!(dir.cache_stats().remote_claims, 1);
+    }
+}
+
+#[tokio::test]
+async fn one_person_twice_in_an_answer_is_read_once() {
+    let w = World::new().await;
+    let carol = remote("carol");
+    people(&w, &[(carol.clone(), None), (carol.clone(), None)]);
+    w.hs.profile_answer(
+        &carol,
+        Resp::json(200, json!({"io.inblock.did": {"did": "did:key:zCarol"}}))
+            .delayed(Duration::from_millis(100)),
+    );
+    let got = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "p", 20)
+        .await
+        .unwrap();
+    assert_eq!(
+        states(&got),
+        vec![unconfirmed("did:key:zCarol"); 2],
+        "both rows have the claim"
+    );
+    assert_eq!(w.hs.profile_reads(), 1);
+}
+
+#[tokio::test]
+async fn a_search_that_is_dropped_leaves_the_others_their_answer() {
+    let w = World::new().await;
+    let carol = remote("carol");
+    people(&w, &[(carol.clone(), None)]);
+    w.hs.profile_answer(
+        &carol,
+        Resp::json(200, json!({"io.inblock.did": {"did": "did:key:zCarol"}}))
+            .delayed(Duration::from_millis(400)),
+    );
+    let dir = w.directory();
+    let session = Arc::new(w.session());
+    let (first, second) = (
+        {
+            let (dir, session) = (dir.clone(), session.clone());
+            tokio::spawn(async move { dir.search_for_asker(&session, ASKER_DID, "p", 5).await })
+        },
+        {
+            let (dir, session) = (dir.clone(), session.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                dir.search_for_asker(&session, ASKER_DID, "p", 5).await
+            })
+        },
+    );
+    // The first search is the one reading when its caller gives up.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    first.abort();
+    let got = second.await.unwrap().unwrap();
+    assert_eq!(
+        states(&got),
+        vec![unconfirmed("did:key:zCarol")],
+        "the second search was not left waiting for a read nobody runs"
+    );
+}
+
+#[tokio::test]
+async fn searches_waiting_for_a_slow_server_share_its_one_bound_and_its_one_miss() {
+    let w = World::new().await;
+    let carol = remote("carol");
+    people(&w, &[(carol.clone(), None)]);
+    w.hs.profile_answer(
+        &carol,
+        Resp::json(200, json!({"io.inblock.did": {"did": "did:key:zLate"}}))
+            .delayed(Duration::from_secs(3)),
+    );
+    let tuning = Tuning {
+        remote_profile_timeout: Duration::from_millis(300),
+        remote_profiles_timeout: Duration::from_millis(600),
+        ..Tuning::default()
+    };
+    let dir = w.directory_with(tuning);
+    let started = std::time::Instant::now();
+    for g in concurrently(&w, &dir, 5, 1).await {
+        assert_eq!(states(&g), vec![not_yet()]);
+    }
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "five searches did not wait one after another: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(w.hs.profile_reads(), 1);
+    // The miss is kept for the next search, which does not wait at all.
+    let again = std::time::Instant::now();
+    dir.search_as_user("user-token-fixture", "p", 20)
+        .await
+        .unwrap();
+    assert!(again.elapsed() < Duration::from_millis(250));
+    assert_eq!(w.hs.profile_reads(), 1);
+}

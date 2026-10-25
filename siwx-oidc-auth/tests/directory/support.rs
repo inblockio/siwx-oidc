@@ -721,6 +721,8 @@ pub struct HsState {
     /// mxid to the profile answer; an mxid that is absent answers 404.
     profiles: HashMap<String, Resp>,
     profile_delay: Duration,
+    /// mxid to answers given in turn, one per read; the last repeats. Wins over `profiles`.
+    profile_scripts: HashMap<String, (usize, Vec<Resp>)>,
     /// `GET /account/whoami`, which the user transport asks once to learn the
     /// homeserver's own name.
     whoami: Handler,
@@ -758,6 +760,7 @@ impl Homeserver {
             whoami_calls: 0,
             profiles: HashMap::new(),
             profile_delay: Duration::ZERO,
+            profile_scripts: HashMap::new(),
             whoami: Arc::new(|_, _| {
                 Resp::json(
                     200,
@@ -834,6 +837,15 @@ impl Homeserver {
             .insert(mxid.to_string(), resp);
     }
 
+    /// The answers to the reads of one profile, in the order the reads arrive.
+    pub fn profile_script(&self, mxid: &str, answers: Vec<Resp>) {
+        self.st
+            .lock()
+            .unwrap()
+            .profile_scripts
+            .insert(mxid.to_string(), (0, answers));
+    }
+
     pub fn profile_delay(&self, d: Duration) {
         self.st.lock().unwrap().profile_delay = d;
     }
@@ -876,10 +888,16 @@ fn hs_route(st: &Arc<Mutex<HsState>>, r: &Req) -> Resp {
     const PREFIX: &str = "/_matrix/client/v3/profile/";
     if r.method == "GET" {
         if let Some(rest) = r.path.strip_prefix(PREFIX) {
-            let s = st.lock().unwrap();
+            let mut s = st.lock().unwrap();
             let delay = s.profile_delay;
             let mxid = rest.strip_suffix("/io.inblock.did").unwrap_or(rest);
-            return match s.profiles.get(mxid) {
+            let scripted = s.profile_scripts.get_mut(mxid).map(|(next, answers)| {
+                let answer = answers[(*next).min(answers.len() - 1)].clone();
+                *next += 1;
+                answer
+            });
+            let found = scripted.as_ref().or_else(|| s.profiles.get(mxid));
+            return match found {
                 Some(p) => Resp {
                     status: p.status,
                     headers: p.headers.clone(),
