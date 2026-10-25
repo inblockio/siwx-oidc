@@ -118,7 +118,7 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   helpers and the 169 unit and hermetic tests of the rotation canary
   (`siwx-oidc-auth/tests/rotation_canary_unit.rs`, which compiles the modules of
   `examples/rotation_canary.rs`; the hermetic ones talk to a fake server inside the test process),
-  and the directory client's suites: `siwx-oidc-auth/tests/directory.rs` (99 tests through the
+  and the directory client's suites: `siwx-oidc-auth/tests/directory.rs` (114 tests through the
   public API against a fake siwx-oidc and a fake homeserver on local sockets, `tests/directory/support.rs`,
   with a clock the tests move by hand) and the shared vectors in `siwx-oidc-auth/tests/vectors/directory/`
   (`every_vector_gives_its_expected_result`; the `#[ignore]`d `regenerate_directory_vectors` makes them
@@ -337,8 +337,12 @@ doc; read it before changing the code the rule covers.
   types derive `Serialize` only, like `VerifiedDid`. The verified cache is keyed by `(mxid, proof)`
   and lives at most 10 minutes. A person on another homeserver is never `Verified`: a well-formed DID in
   their profile is `DidState::Unconfirmed` (a `ClaimedDid`, the wire form `{"state":"unconfirmed","value":…}`),
-  kept at most 5 minutes in a cache of its own, read under a 3 s bound each and 6 s in all, and never
-  failing a search; the claimed value and the search term are never logged. Tokens stay in memory: no file API and no output macro in the module
+  kept at most 5 minutes in a cache of its own, read under a 3 s bound each and 6 s in all (a read ends by
+  the earlier of its own bound and the total and keeps its miss; the local profiles are read first, and
+  searches that want one person share one read; a read never replaces an entry stored after it began), and
+  never failing a search; a `server_name` that is not the homeserver's is `DirectoryError::ServerNameMismatch`
+  (the asker, or the `whoami` of the user's token, must be on it), never an answer in which local people
+  look foreign; the claimed value and the search term are never logged. Tokens stay in memory: no file API and no output macro in the module
   outside its tests. The key set is fetched by one request pair at a time and a waiter shares the
   fetch's outcome; a proof with a `kid` the cached set lacks refetches it, at most once per 30 s; a
   failed renewal of the service session is shared by its waiters and answered for 5 s; an error
@@ -355,7 +359,13 @@ doc; read it before changing the code the rule covers.
   `an_error_status_is_classified_by_its_status_however_large_its_body`,
   `the_public_verifier_follows_no_redirect_for_the_key_set`,
   `a_failed_unknown_kid_refetch_never_fails_a_search`,
-  `fetch_and_verify_did_follows_up_to_three_redirects_for_the_profile_read`.
+  `fetch_and_verify_did_follows_up_to_three_redirects_for_the_profile_read`,
+  `a_wrong_server_name_fails_the_module_search_closed`, `a_wrong_server_name_fails_the_user_search_closed`,
+  `the_second_wave_of_slow_reads_is_remembered_like_the_first`,
+  `local_people_are_read_before_any_foreign_server_is_asked`,
+  `searches_at_the_same_time_make_one_read_of_the_same_person`,
+  `a_read_never_puts_its_answer_over_one_stored_after_it_began`,
+  `no_duration_of_the_tuning_can_make_a_search_panic`.
 
 ### Publication and the Synapse client ([docs/matrix-integration.md](docs/matrix-integration.md))
 

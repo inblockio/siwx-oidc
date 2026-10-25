@@ -46,6 +46,26 @@
 //! the verified cache. The claimed DID is never logged (this module logs
 //! nothing).
 //!
+//! - **Show a claim as it is.** `%XX` escapes are legal DID syntax and change the
+//!   identifier, so a client displays and compares a claimed DID byte for byte,
+//!   never percent-decoded.
+//! - **Budget for the reads.** They add up to
+//!   [`Tuning::remote_profiles_timeout`] (6 s) to a search's critical path; a
+//!   host with a deadline of its own for a search sets it above that.
+//! - The local people of an answer are read first, so a slow foreign server never
+//!   delays their check; the foreign reads have eight places of their own and a
+//!   read ends by the earlier of its own bound and the total, keeping what it
+//!   found. Searches that want the same person at once share one read.
+//!
+//! # The server name
+//!
+//! The split above rests on [`DirectoryConfig::server_name`], which must be the
+//! homeserver's own name (the part after the colon of its users' MXIDs), not a
+//! delegated host. The asker of a module search and the owner of the token of a
+//! user search are the homeserver's own people, so one who is not on the
+//! configured name is the error [`DirectoryError::ServerNameMismatch`], never an
+//! answer in which every local person looks foreign.
+//!
 //! # Errors
 //!
 //! An answer that could not be checked is an error, never a state: a network,

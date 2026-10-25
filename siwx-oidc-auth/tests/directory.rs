@@ -3250,7 +3250,7 @@ async fn a_dead_foreign_server_costs_one_wait_and_not_one_per_search() {
 }
 
 #[tokio::test]
-async fn local_and_remote_profile_reads_share_the_same_eight_places() {
+async fn local_and_remote_profile_reads_are_never_more_than_eight_at_once() {
     let w = World::new().await;
     let locals: Vec<String> = (0..10).map(|i| mxid(&format!("l{i}"))).collect();
     let remotes: Vec<String> = (0..10).map(|i| remote(&format!("r{i}"))).collect();

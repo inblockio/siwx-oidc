@@ -129,11 +129,26 @@ let session = ServiceSession::new(ServiceSessionConfig::new(
 let directory = DirectoryClient::new(DirectoryConfig::new(
     "https://auth.example.org",
     "https://matrix.example.org",
-    "example.org",                // the homeserver's server name
+    "example.org",                // the homeserver's server name, see below
 ))?;
 
 let found = directory.search_for_asker(&session, asker_did, "ada", 10).await?;
 ```
+
+**`server_name` is the homeserver's own name**, the part after the colon in its
+users' MXIDs (Synapse's `server_name`), not the host the client API is served
+from when the two differ (`matrix.example.org` behind a delegation of
+`example.org`). The split between a local person, whose proof is checked, and a
+person of another server, whose claim is only shown, rests on it, and a wrong
+name would turn every local person into a foreign one: their valid proof ignored
+and their unsigned `did` member shown as a claim. So the client checks it. The
+asker of `search_for_asker`, and the owner of the token of `search_as_user`
+(`GET /_matrix/client/v3/account/whoami`, asked once, with the first search),
+are the homeserver's own people; one who is not on `server_name` is the
+non-retryable `DirectoryError::ServerNameMismatch` and nothing else is asked or
+read. (An asker who does not exist has no MXID to check and gets the empty
+result.) A mismatch is never kept: every search says it again until the
+configuration is corrected.
 
 **Hold one `DirectoryClient` and one `ServiceSession`.** The caches live in the
 client, and the single-flight token renewal lives in the session. The client is
@@ -272,7 +287,9 @@ so a consumer that matched that text keeps working until it matches the type.)
 1. `GET {issuer}/resolve?did=<asker>` maps the asker to an MXID
    ([identity-model.md](identity-model.md#looking-up-an-identity-get-resolve)). An
    account that does not exist, or a DID no sign-in could accept (a 400), gets the
-   **empty result**, the same as no match, and the module is not called.
+   **empty result**, the same as no match, and the module is not called. An asker
+   who is not on the configured `server_name` is `ServerNameMismatch`, and the
+   module is not called either.
 2. `POST {homeserver}/_synapse/client/io.inblock/directory/v1/search` with the
    service token and `{"asker": "@…", "term": "…", "limit": n}`. The module
    searches as the asker through Synapse's own `search_users`, so the visibility
@@ -298,11 +315,16 @@ header or Synapse's `retry_after_ms` when it gave one (at most one hour).
 token and `{"search_term", "limit"}`, then, for each hit,
 `GET {homeserver}/_matrix/client/v3/profile/{mxid}/io.inblock.did` with **no
 credential** (the route is public by default; a token would tell every
-homeserver polled who is asking), at most eight at a time, local and remote
-together, then the proof check for the local ones. A local profile that cannot
-be read fails the search; a remote one only costs that person their claim
-([below](#people-of-other-homeservers)). The user's token is never renewed
-here: a 401 is `Unauthorized` and the caller, who owns the session, renews it.
+homeserver polled who is asking), at most eight at a time. The local profiles
+are read first, and one that cannot be read ends the search before any foreign
+server is asked; then the profiles of the people of other servers
+([below](#people-of-other-homeservers)); then the proof check for the local
+ones. A local profile that cannot be read fails the search; a remote one only
+costs that person their claim. The first search of a client also asks
+`GET /account/whoami` with the token, once, to check `server_name` (see
+[Setting up a service](#setting-up-a-service)). The user's token is never
+renewed here: a 401 is `Unauthorized` and the caller, who owns the session,
+renews it.
 
 ## People of other homeservers
 
@@ -330,19 +352,41 @@ what the field *claims*.
   a signed `sub` gets, because a claim is text a stranger chose, shown to a
   person and pasted into a grant.
 - **Bounded, and never failing the search.** Each remote read is held to
-  `Tuning::remote_profile_timeout` (3 s) and all of them together, the wait for a
-  place included, to `Tuning::remote_profiles_timeout` (6 s). A slow or dead
-  foreign server leaves that one person `not_yet_published`; the rest of the
-  answer is unaffected and arrives in time. Remote reads share the eight places
-  of the local reads.
+  `Tuning::remote_profile_timeout` (3 s) and all of them together to
+  `Tuning::remote_profiles_timeout` (6 s), counted from the first remote read of
+  the search and the wait for a place included. A read ends by the earlier of its
+  own bound and that total, and what it found, a miss included, is kept. A slow
+  or dead foreign server leaves that one person `not_yet_published`. The local
+  people of the same answer are read before any foreign server is asked, so a
+  slow one never delays their check, and the foreign reads have eight places of
+  their own: at most sixteen slow servers can be waited out in one search (two
+  waves of 3 s in the 6 s). A row behind them is not asked in that search and is
+  `not_yet_published` in it; the next search asks it, since every server that was
+  waited out is remembered for a minute. **Budget for it:** the remote reads add
+  up to the total (6 s) to a search's critical path, so a host with a deadline of
+  its own for a search sets it above that, or lowers
+  `Tuning::remote_profiles_timeout` (it is raised to `remote_profile_timeout`
+  when lower, and every duration of a `Tuning` is held to a year).
+- **One read per person at a time.** Searches that want the same person at the
+  same moment, on either transport, share one read and its outcome (a claim or a
+  miss), and a person who appears twice in an answer is read once. A search that
+  is dropped while it reads ends that read without an outcome, and one of the
+  searches that waited reads instead. A read that ends never replaces an entry
+  stored after it began, so a slow failure cannot put a miss over a fresher
+  claim.
+- **Show the claim as it is, never percent-decoded.** `%XX` escapes are legal DID
+  syntax, and `did:web:example.com%3A8443` is not the identifier
+  `did:web:example.com:8443`. A client displays and compares a claimed DID byte
+  for byte; decoding it for display would show a DID the person never claimed.
 - **Kept briefly, apart from the verified cache.** A claim is kept for
   `Tuning::unconfirmed_ttl` (5 minutes) so that a search as you type does not
   ask a foreign server on every keystroke; "no usable claim" (including a server
-  that was too slow) for `Tuning::remote_miss_ttl` (1 minute), so that a dead
-  server costs one wait, not one per search. A claim can change, so it is never
-  kept as long as a verified DID, and it never enters the verified cache
-  (`CacheStats::verified` does not count it, `CacheStats::remote_claims` does).
-  A read cut off by the total bound keeps nothing.
+  that was too slow, and a read the total ended) for `Tuning::remote_miss_ttl`
+  (1 minute), so that a dead server costs one wait, not one per search. A claim
+  can change, so it is never kept as long as a verified DID, and it never enters
+  the verified cache (`CacheStats::verified` does not count it,
+  `CacheStats::remote_claims` does). A search that is dropped keeps nothing of
+  the read it was running.
 - **Nothing is logged.** Neither the claimed DID nor the search term appears in
   any output of this module.
 
@@ -401,6 +445,8 @@ key set at all (none cached, and the fetch fails) fails, with the retryable
 | asker DID, no such account | 60 seconds, so a new account is found soon | same cache |
 | discovery document and key set | 5 minutes, or sooner on an unknown `kid` (at most one refetch per 30 seconds) | one |
 | a verified `(mxid, proof)` | 10 minutes | 4096 entries |
+| a remote person's claim | 5 minutes (`unconfirmed_ttl`) | 4096 entries, a cache of its own |
+| a remote person with no usable claim, or a read that was too slow | 1 minute (`remote_miss_ttl`) | same cache |
 
 When a cache is full, expired entries go first, then those that would expire
 soonest. A proof that fails is never cached as verified, and an error is never
@@ -408,7 +454,9 @@ cached as anything. The key is the pair (MXID, proof), so a proof copied into
 another profile, or a changed proof for the same MXID, never reuses a verdict.
 
 The defaults are the contract; `Tuning` and `Clock` are open so a test can move
-time by hand. A warm search is one request, the module call.
+time by hand. Every duration of a `Tuning` is held to a year when a client or a
+session is made, so `Duration::MAX` for "never" is a year and not an overflow. A
+warm search is one request, the module call.
 
 ## Revoking a service
 
@@ -447,6 +495,7 @@ never the search term, a token or a response body.
 | `Unavailable` | network, timeout, 5xx, discovery or key set | yes |
 | `UnexpectedStatus { status, errcode }` | a status the client does not act on | no |
 | `Protocol` | an answer that is not the contract: malformed JSON, a row without a user id, a body over the cap | no |
+| `ServerNameMismatch` | the asker, or the owner of the user's token, is not on the configured `server_name` ([above](#setting-up-a-service)) | no |
 
 ## Bounds
 
