@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use siwx_oidc_auth::directory::{
-    register_public_client, DidState, DirectoryEntry, DirectoryError, DirectoryResults,
-    ServiceSession, ServiceSessionConfig, Tuning,
+    register_public_client, DidState, DirectoryClient, DirectoryEntry, DirectoryError,
+    DirectoryResults, ServiceSession, ServiceSessionConfig, Tuning,
 };
 use siwx_oidc_auth::SiwxKey;
 use support::*;
@@ -1357,7 +1357,7 @@ async fn at_most_eight_profiles_are_read_at_a_time() {
 }
 
 #[tokio::test]
-async fn a_remote_user_is_not_asked_for_and_a_failing_profile_fails_the_search() {
+async fn a_failing_local_profile_fails_the_search_and_a_failing_remote_one_does_not() {
     let w = World::new().await;
     let (a, remote) = (mxid("alice"), "@carol:other.example".to_string());
     w.hs.directory_rows(vec![json!({"user_id": remote}), json!({"user_id": a})]);
@@ -1366,15 +1366,21 @@ async fn a_remote_user_is_not_asked_for_and_a_failing_profile_fails_the_search()
     assert_eq!(states(&got), vec![json!({"state": "not_yet_published"}); 2]);
     assert_eq!(
         w.hs.profile_reads(),
-        1,
-        "the remote user's profile was not read"
+        2,
+        "the remote user's profile is read too, to look for a claim"
     );
 
-    // A profile that cannot be read is an unknown state, not a verdict about the person.
+    // A local profile that cannot be read is an unknown state, not a verdict about the person.
     w.hs.profile_status(&a, 500);
     let err = w.directory().search_as_user("t", "a", 5).await.unwrap_err();
     assert!(matches!(err, DirectoryError::Unavailable(_)), "{err:?}");
     assert!(err.is_retryable());
+
+    // A remote one that cannot be read is only that person's missing claim.
+    w.hs.profile(&a, Some(json!({"did": did_of("Alice")})));
+    w.hs.profile_status(&remote, 500);
+    let got = w.directory().search_as_user("t", "a", 5).await.unwrap();
+    assert_eq!(states(&got), vec![json!({"state": "not_yet_published"}); 2]);
 }
 
 #[tokio::test]
@@ -2253,7 +2259,8 @@ async fn the_server_name_is_compared_the_way_synapse_does_exactly() {
         "another spelling of the server name is another server"
     );
 
-    // On the user transport its profile is not even read.
+    // On the user transport its profile is read as any other server's is, for a
+    // claim; its valid proof is not looked at, so it is not verified either.
     w.hs.directory_rows(vec![
         json!({"user_id": other_case}),
         json!({"user_id": mxid("bob")}),
@@ -2264,7 +2271,7 @@ async fn the_server_name_is_compared_the_way_synapse_does_exactly() {
     );
     let got = dir.search_as_user("t", "a", 5).await.unwrap();
     assert_eq!(got.results[0].did, DidState::NotYetPublished);
-    assert_eq!(w.hs.profile_reads(), 1);
+    assert_eq!(w.hs.profile_reads(), 2);
 }
 
 #[tokio::test]
@@ -2730,4 +2737,1321 @@ async fn invalidate_access_token_discards_only_the_token_it_names() {
     session.invalidate_access_token("access-1").await;
     assert_eq!(session.access_token().await.unwrap(), "access-2");
     assert_eq!(w.issuer.sign_ins(), 2, "no renewal for a stale report");
+}
+
+// ---------------------------------------------------------------------------
+// People of other homeservers: an unconfirmed claim, never a verified DID
+// ---------------------------------------------------------------------------
+
+const OTHER: &str = "other.example";
+
+fn remote(name: &str) -> String {
+    format!("@{name}:{OTHER}")
+}
+
+fn unconfirmed(did: &str) -> Value {
+    json!({"state": "unconfirmed", "value": did})
+}
+
+fn not_yet() -> Value {
+    json!({"state": "not_yet_published"})
+}
+
+/// The same people on both transports: as module rows (with the module's own
+/// `did_field` where given) and as standard user-directory rows.
+fn people(w: &World, people: &[(String, Option<Value>)]) {
+    w.hs.module_hits(
+        people
+            .iter()
+            .map(|(m, f)| hit(m, Some("P"), f.clone()))
+            .collect(),
+    );
+    w.hs.directory_rows(
+        people
+            .iter()
+            .map(|(m, _)| json!({"user_id": m, "display_name": "P"}))
+            .collect(),
+    );
+}
+
+/// How many profiles of other servers' people the homeserver has been asked for.
+fn remote_profile_reads(w: &World) -> usize {
+    w.hs.mock
+        .requests()
+        .iter()
+        .filter(|r| {
+            r.path.starts_with("/_matrix/client/v3/profile/")
+                && r.path.contains(&format!(":{OTHER}/"))
+        })
+        .count()
+}
+
+/// Both transports for the same people. The claims the first one read are
+/// kept, so the clock is moved past every lifetime before the second one asks,
+/// and the second must have read the remote profiles itself: an answer from the
+/// first one's cache would say nothing about the second transport.
+async fn ask_both(w: &World, dir: &DirectoryClient) -> [DirectoryResults; 2] {
+    let before = remote_profile_reads(w);
+    let first = dir
+        .search_for_asker(&w.session(), ASKER_DID, "p", 20)
+        .await
+        .unwrap();
+    let by_first = remote_profile_reads(w) - before;
+    w.clock.advance(11 * MIN);
+    let second = dir
+        .search_as_user("user-token-fixture", "p", 20)
+        .await
+        .unwrap();
+    assert_eq!(
+        remote_profile_reads(w) - before - by_first,
+        by_first,
+        "the second transport reads the remote profiles itself, not from the cache of the first"
+    );
+    [first, second]
+}
+
+#[tokio::test]
+async fn a_remote_user_with_a_claimed_did_is_unconfirmed_on_both_transports() {
+    let w = World::new().await;
+    let (carol, local) = (remote("carol"), mxid("alice"));
+    // The module's own `did_field` of a remote row, with a proof that would
+    // verify if the row were local, is not where the claim comes from.
+    let module_field = w.issuer.field(&did_of("FromTheModule"), &carol);
+    people(
+        &w,
+        &[
+            (carol.clone(), Some(module_field)),
+            (
+                local.clone(),
+                Some(w.issuer.field(&did_of("Alice"), &local)),
+            ),
+        ],
+    );
+    w.hs.profile(&carol, Some(json!({"did": "did:pkh:eip155:1:0xAbC123"})));
+    w.hs.profile(&local, Some(w.issuer.field(&did_of("Alice"), &local)));
+
+    let dir = w.directory();
+    for got in ask_both(&w, &dir).await {
+        assert_eq!(
+            serde_json::to_value(&got).unwrap(),
+            json!({"results": [
+                {"mxid": carol, "alias": "P",
+                 "did": {"state": "unconfirmed", "value": "did:pkh:eip155:1:0xAbC123"}},
+                {"mxid": local, "alias": "P", "did": verified(&did_of("Alice"))},
+            ], "limited": false}),
+            "the exact wire form"
+        );
+        let carol_did = &got.results[0].did;
+        assert_eq!(
+            carol_did.unconfirmed_did(),
+            Some("did:pkh:eip155:1:0xAbC123")
+        );
+        assert_eq!(
+            carol_did.verified_did(),
+            None,
+            "an unconfirmed DID is never a verified one"
+        );
+        assert_eq!(got.results[1].did.unconfirmed_did(), None);
+    }
+
+    // The read goes through our homeserver, for that person's field, with no credential.
+    let reads: Vec<_> =
+        w.hs.mock
+            .requests()
+            .into_iter()
+            .filter(|r| r.path.starts_with("/_matrix/client/v3/profile/"))
+            .collect();
+    assert!(reads
+        .iter()
+        .any(|r| r.path == format!("/_matrix/client/v3/profile/{carol}/io.inblock.did")));
+    assert!(reads
+        .iter()
+        .all(|r| !r.headers.contains_key("authorization")));
+}
+
+#[tokio::test]
+async fn a_remote_proof_does_not_make_a_claim_verified() {
+    let w = World::new().await;
+    let carol = remote("carol");
+    // A proof of OUR issuer that names this very MXID: the strongest thing a
+    // foreign user could carry. A foreign server's user is still not ours to vouch for.
+    let field = w.issuer.field(&did_of("Carol"), &carol);
+    people(&w, &[(carol.clone(), None)]);
+    w.hs.profile(&carol, Some(field));
+    let dir = w.directory();
+    for got in ask_both(&w, &dir).await {
+        assert_eq!(states(&got), vec![unconfirmed(&did_of("Carol"))]);
+    }
+    assert_eq!(dir.cache_stats().verified, 0);
+    assert_eq!(
+        w.issuer.mock.count("GET", "/jwk"),
+        0,
+        "no key set was fetched to look at a remote row"
+    );
+}
+
+#[tokio::test]
+async fn a_remote_user_without_a_usable_claim_is_not_yet_published() {
+    let w = World::new().await;
+    let long = format!("did:key:{}", "z".repeat(3000));
+    let cases: Vec<(&str, Resp)> = vec![
+        (
+            "no_field",
+            Resp::json(404, json!({"errcode": "M_NOT_FOUND"})),
+        ),
+        ("null", Resp::json(200, json!({"io.inblock.did": null}))),
+        (
+            "no_did_member",
+            Resp::json(200, json!({"io.inblock.did": {"proof": "a.b.c"}})),
+        ),
+        (
+            "bare_string",
+            Resp::json(200, json!({"io.inblock.did": "did:key:zLegacy"})),
+        ),
+        (
+            "number",
+            Resp::json(200, json!({"io.inblock.did": {"did": 42}})),
+        ),
+        (
+            "not_a_did",
+            Resp::json(200, json!({"io.inblock.did": {"did": "hello there"}})),
+        ),
+        (
+            "empty",
+            Resp::json(200, json!({"io.inblock.did": {"did": ""}})),
+        ),
+        (
+            "scheme_only",
+            Resp::json(200, json!({"io.inblock.did": {"did": "did:"}})),
+        ),
+        (
+            "no_method_id",
+            Resp::json(200, json!({"io.inblock.did": {"did": "did:key"}})),
+        ),
+        (
+            "empty_id",
+            Resp::json(200, json!({"io.inblock.did": {"did": "did:key:"}})),
+        ),
+        (
+            "upper_method",
+            Resp::json(200, json!({"io.inblock.did": {"did": "did:KEY:zAbc"}})),
+        ),
+        (
+            "space",
+            Resp::json(200, json!({"io.inblock.did": {"did": "did:key:z Abc"}})),
+        ),
+        (
+            "newline",
+            Resp::json(200, json!({"io.inblock.did": {"did": "did:key:zAbc\nx"}})),
+        ),
+        (
+            "markup",
+            Resp::json(200, json!({"io.inblock.did": {"did": "did:key:<b>"}})),
+        ),
+        (
+            "non_ascii",
+            Resp::json(200, json!({"io.inblock.did": {"did": "did:key:zÄbc"}})),
+        ),
+        (
+            "too_long",
+            Resp::json(200, json!({"io.inblock.did": {"did": long}})),
+        ),
+        ("not_json", Resp::text(200, "<html>proxy error</html>")),
+        (
+            "server_error",
+            Resp::json(500, json!({"errcode": "M_UNKNOWN"})),
+        ),
+        (
+            "federation_failed",
+            Resp::json(
+                502,
+                json!({"errcode": "M_UNKNOWN", "error": "Failed to fetch profile"}),
+            ),
+        ),
+        (
+            "rate_limited",
+            Resp::json(
+                429,
+                json!({"errcode": "M_LIMIT_EXCEEDED", "retry_after_ms": 100}),
+            ),
+        ),
+        (
+            "unauthorized",
+            Resp::json(401, json!({"errcode": "M_MISSING_TOKEN"})),
+        ),
+    ];
+    w.hs.profile(&remote("fine"), Some(json!({"did": "did:key:zFine"})));
+    for (name, resp) in &cases {
+        w.hs.profile_answer(&remote(name), resp.clone());
+    }
+    // A search returns at most 20 rows (`LIMIT_MAX`): the honest person and up to
+    // 19 of the cases at a time, so that no case is cut off unseen. Each group has
+    // a client of its own, so that nothing a group read is served to the next.
+    let mut checked = 0;
+    for chunk in cases.chunks(19) {
+        let dir = w.directory();
+        let mut every = vec![(remote("fine"), None)];
+        every.extend(chunk.iter().map(|(name, _)| (remote(name), None)));
+        assert!(every.len() <= 20);
+        people(&w, &every);
+        for got in ask_both(&w, &dir).await {
+            assert_eq!(got.results.len(), every.len(), "no row was cut off");
+            assert!(!got.limited);
+            let s = states(&got);
+            assert_eq!(
+                s[0],
+                unconfirmed("did:key:zFine"),
+                "the search is not spoiled by the others"
+            );
+            for (i, state) in s.iter().enumerate().skip(1) {
+                assert_eq!(*state, not_yet(), "case {}", every[i].0);
+            }
+        }
+        checked += chunk.len();
+    }
+    assert_eq!(checked, cases.len(), "every case was searched");
+}
+
+#[tokio::test]
+async fn a_local_row_is_judged_as_before_and_the_remote_rows_around_it_change_nothing() {
+    let w = World::new().await;
+    let (good, bad, none) = (mxid("alice"), mxid("bob"), mxid("carol"));
+    let r = remote("dave");
+    let forged = json!({"did": did_of("Bob"), "proof": "x.y.z"});
+    people(
+        &w,
+        &[
+            (r.clone(), None),
+            (good.clone(), Some(w.issuer.field(&did_of("Alice"), &good))),
+            (bad.clone(), Some(forged.clone())),
+            (none.clone(), None),
+        ],
+    );
+    w.hs.profile(&r, Some(json!({"did": did_of("Dave")})));
+    w.hs.profile(&good, Some(w.issuer.field(&did_of("Alice"), &good)));
+    w.hs.profile(&bad, Some(forged));
+    let dir = w.directory();
+    for got in ask_both(&w, &dir).await {
+        assert_eq!(
+            states(&got),
+            vec![
+                unconfirmed(&did_of("Dave")),
+                verified(&did_of("Alice")),
+                json!({"state": "invalid"}),
+                not_yet(),
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unconfirmed_claim_never_enters_the_verified_cache() {
+    let w = World::new().await;
+    let r = remote("carol");
+    people(&w, &[(r.clone(), None)]);
+    w.hs.profile(&r, Some(json!({"did": did_of("Carol")})));
+    let dir = w.directory();
+    let got = dir
+        .search_for_asker(&w.session(), ASKER_DID, "p", 5)
+        .await
+        .unwrap();
+    assert_eq!(states(&got), vec![unconfirmed(&did_of("Carol"))]);
+    let stats = dir.cache_stats();
+    assert_eq!(stats.verified, 0, "nothing unconfirmed is a verified entry");
+    assert!(!stats.keys_cached, "and no proof was checked for it");
+    assert_eq!(stats.remote_claims, 1, "it is kept, in a cache of its own");
+}
+
+#[tokio::test]
+async fn a_claim_is_kept_briefly_and_a_change_is_seen_after_that() {
+    let w = World::new().await;
+    let r = remote("carol");
+    people(&w, &[(r.clone(), None)]);
+    w.hs.profile(&r, Some(json!({"did": "did:key:zFirst"})));
+    let dir = w.directory();
+    let ask = || async {
+        states(
+            &dir.search_for_asker(&w.session(), ASKER_DID, "p", 5)
+                .await
+                .unwrap(),
+        )
+    };
+
+    assert_eq!(ask().await, vec![unconfirmed("did:key:zFirst")]);
+    assert_eq!(w.hs.profile_reads(), 1);
+
+    // The person changes the claim. Within five minutes the first one stands, unread again.
+    w.hs.profile(&r, Some(json!({"did": "did:key:zSecond"})));
+    w.clock.advance(5 * MIN - Duration::from_secs(1));
+    assert_eq!(ask().await, vec![unconfirmed("did:key:zFirst")]);
+    assert_eq!(w.hs.profile_reads(), 1, "kept, not read again");
+
+    // After that the new claim is seen.
+    w.clock.advance(Duration::from_secs(2));
+    assert_eq!(ask().await, vec![unconfirmed("did:key:zSecond")]);
+    assert_eq!(w.hs.profile_reads(), 2);
+
+    // And a claim that is taken away is gone after the same time.
+    w.hs.profile(&r, None);
+    w.clock.advance(5 * MIN + Duration::from_secs(1));
+    assert_eq!(ask().await, vec![not_yet()]);
+}
+
+#[tokio::test]
+async fn no_usable_claim_is_kept_for_a_shorter_time_so_a_new_claim_is_found_soon() {
+    let w = World::new().await;
+    let r = remote("carol");
+    people(&w, &[(r.clone(), None)]);
+    let dir = w.directory();
+    let ask = || async {
+        states(
+            &dir.search_for_asker(&w.session(), ASKER_DID, "p", 5)
+                .await
+                .unwrap(),
+        )
+    };
+
+    assert_eq!(ask().await, vec![not_yet()]);
+    w.hs.profile(&r, Some(json!({"did": "did:key:zLate"})));
+    w.clock.advance(Duration::from_secs(59));
+    assert_eq!(ask().await, vec![not_yet()]);
+    assert_eq!(w.hs.profile_reads(), 1);
+    w.clock.advance(Duration::from_secs(2));
+    assert_eq!(ask().await, vec![unconfirmed("did:key:zLate")]);
+    assert_eq!(w.hs.profile_reads(), 2);
+}
+
+#[tokio::test]
+async fn a_slow_foreign_server_costs_its_bound_and_never_fails_or_stalls_the_search() {
+    let w = World::new().await;
+    let (slow, quick, local) = (remote("slow"), remote("quick"), mxid("alice"));
+    people(
+        &w,
+        &[
+            (slow.clone(), None),
+            (quick.clone(), None),
+            (
+                local.clone(),
+                Some(w.issuer.field(&did_of("Alice"), &local)),
+            ),
+        ],
+    );
+    w.hs.profile(&quick, Some(json!({"did": "did:key:zQuick"})));
+    w.hs.profile(&local, Some(w.issuer.field(&did_of("Alice"), &local)));
+    // It does answer, with a claim, but long after the bound.
+    w.hs.profile_answer(
+        &slow,
+        Resp::json(200, json!({"io.inblock.did": {"did": "did:key:zSlow"}}))
+            .delayed(Duration::from_secs(4)),
+    );
+    let tuning = Tuning {
+        remote_profile_timeout: Duration::from_millis(300),
+        remote_profiles_timeout: Duration::from_millis(900),
+        ..Tuning::default()
+    };
+    let dir = w.directory_with(tuning);
+    for transport in 0..2 {
+        let started = std::time::Instant::now();
+        let got = if transport == 0 {
+            dir.search_for_asker(&w.session(), ASKER_DID, "p", 5).await
+        } else {
+            dir.search_as_user("user-token-fixture", "p", 5).await
+        }
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(1800),
+            "the search answered in {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            states(&got),
+            vec![
+                not_yet(),
+                unconfirmed("did:key:zQuick"),
+                verified(&did_of("Alice"))
+            ]
+        );
+        // Forget the claims so the second transport reads again.
+        w.clock.advance(6 * MIN);
+    }
+}
+
+#[tokio::test]
+async fn many_slow_foreign_servers_cannot_stretch_a_search_past_the_remote_total() {
+    let w = World::new().await;
+    let names: Vec<String> = (0..20).map(|i| format!("slow{i}")).collect();
+    people(
+        &w,
+        &names.iter().map(|n| (remote(n), None)).collect::<Vec<_>>(),
+    );
+    for n in &names {
+        w.hs.profile_answer(
+            &remote(n),
+            Resp::json(200, json!({"io.inblock.did": {"did": "did:key:zSlow"}}))
+                .delayed(Duration::from_secs(5)),
+        );
+    }
+    // Eight at a time, 20 reads of 500 ms each are three waves, 1.5 s; the total cuts them at 0.8 s.
+    let tuning = Tuning {
+        remote_profile_timeout: Duration::from_millis(500),
+        remote_profiles_timeout: Duration::from_millis(800),
+        ..Tuning::default()
+    };
+    let dir = w.directory_with(tuning);
+    let started = std::time::Instant::now();
+    let got = dir
+        .search_for_asker(&w.session(), ASKER_DID, "slow", 20)
+        .await
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(1200),
+        "20 reads of 5 s, in {:?}",
+        started.elapsed()
+    );
+    assert_eq!(states(&got), vec![not_yet(); 20]);
+}
+
+#[tokio::test]
+async fn a_dead_foreign_server_costs_one_wait_and_not_one_per_search() {
+    let w = World::new().await;
+    let r = remote("carol");
+    people(&w, &[(r.clone(), None)]);
+    w.hs.profile_answer(
+        &r,
+        Resp::json(502, json!({"errcode": "M_UNKNOWN"})).delayed(Duration::from_secs(4)),
+    );
+    let tuning = Tuning {
+        remote_profile_timeout: Duration::from_millis(300),
+        ..Tuning::default()
+    };
+    let dir = w.directory_with(tuning);
+    let t = std::time::Instant::now();
+    let first = dir
+        .search_for_asker(&w.session(), ASKER_DID, "p", 5)
+        .await
+        .unwrap();
+    assert_eq!(states(&first), vec![not_yet()]);
+    assert!(
+        t.elapsed() >= Duration::from_millis(250),
+        "it did wait for the bound"
+    );
+
+    let t = std::time::Instant::now();
+    let again = dir
+        .search_for_asker(&w.session(), ASKER_DID, "p", 5)
+        .await
+        .unwrap();
+    assert_eq!(states(&again), vec![not_yet()]);
+    assert!(
+        t.elapsed() < Duration::from_millis(250),
+        "the second search did not wait"
+    );
+    assert_eq!(w.hs.profile_reads(), 1);
+}
+
+/// The wait for a place is held to the total, but tokio polls the inner future
+/// first, so a place freed at the deadline is still taken. A read that begins
+/// there is cancelled on its first poll, and what it "learned" (nothing) must
+/// not be kept as a one-minute miss for a server that was never asked.
+#[tokio::test]
+async fn a_place_taken_at_the_remote_deadline_is_never_kept_as_a_miss() {
+    let w = World::new().await;
+    let names: Vec<String> = (0..24).map(|i| format!("dead{i}")).collect();
+    people(
+        &w,
+        &names.iter().map(|n| (remote(n), None)).collect::<Vec<_>>(),
+    );
+    for n in &names {
+        w.hs.profile_answer(
+            &remote(n),
+            Resp::json(200, json!({"io.inblock.did": {"did": "did:key:zDead"}}))
+                .delayed(Duration::from_secs(5)),
+        );
+    }
+    // The total is one read's bound: the places free exactly when it ends.
+    let tuning = Tuning {
+        remote_profile_timeout: Duration::from_millis(300),
+        remote_profiles_timeout: Duration::from_millis(300),
+        ..Tuning::default()
+    };
+    let dir = w.directory_with(tuning);
+    let session = w.session();
+    let mut asked_before = 0;
+    for search in 1..=3 {
+        let got = dir
+            .search_for_asker(&session, ASKER_DID, "dead", 20)
+            .await
+            .unwrap();
+        assert_eq!(states(&got), vec![not_yet(); 20]);
+        let asked = w.hs.profile_reads();
+        assert_eq!(
+            dir.cache_stats().remote_claims,
+            asked,
+            "search {search}: a miss is kept for a server that was asked, and only for those"
+        );
+        assert!(
+            asked > asked_before,
+            "search {search}: the people not asked before are asked now ({asked})"
+        );
+        asked_before = asked;
+    }
+}
+
+#[tokio::test]
+async fn local_and_remote_profile_reads_are_never_more_than_eight_at_once() {
+    let w = World::new().await;
+    let locals: Vec<String> = (0..10).map(|i| mxid(&format!("l{i}"))).collect();
+    let remotes: Vec<String> = (0..10).map(|i| remote(&format!("r{i}"))).collect();
+    let all: Vec<(String, Option<Value>)> = locals
+        .iter()
+        .chain(&remotes)
+        .map(|m| (m.clone(), None))
+        .collect();
+    people(&w, &all);
+    for m in &locals {
+        w.hs.profile(m, Some(w.issuer.field(&did_of("x"), m)));
+    }
+    for m in &remotes {
+        w.hs.profile(m, Some(json!({"did": "did:key:zRemote"})));
+    }
+    w.hs.profile_delay(Duration::from_millis(120));
+    let got = w
+        .directory()
+        .search_as_user("user-token-fixture", "p", 20)
+        .await
+        .unwrap();
+    assert_eq!(got.results.len(), 20);
+    assert_eq!(
+        got.results
+            .iter()
+            .filter(|e| e.did.verified_did().is_some())
+            .count(),
+        10
+    );
+    assert_eq!(
+        got.results
+            .iter()
+            .filter(|e| e.did.unconfirmed_did().is_some())
+            .count(),
+        10
+    );
+    assert_eq!(w.hs.profile_reads(), 20);
+    assert_eq!(
+        w.hs.mock.max_in_flight(),
+        8,
+        "concurrent, and never more than eight"
+    );
+}
+
+#[tokio::test]
+async fn the_remote_claims_cache_is_bounded() {
+    let w = World::new().await;
+    let tuning = Tuning {
+        max_cache_entries: 3,
+        ..Tuning::default()
+    };
+    let dir = w.directory_with(tuning);
+    let names: Vec<String> = (0..6).map(|i| format!("r{i}")).collect();
+    people(
+        &w,
+        &names.iter().map(|n| (remote(n), None)).collect::<Vec<_>>(),
+    );
+    for n in &names {
+        w.hs.profile(&remote(n), Some(json!({"did": "did:key:zRemote"})));
+    }
+    dir.search_for_asker(&w.session(), ASKER_DID, "r", 20)
+        .await
+        .unwrap();
+    assert_eq!(dir.cache_stats().remote_claims, 3);
+}
+
+// ---------------------------------------------------------------------------
+// A server_name that is not the homeserver's fails closed
+// ---------------------------------------------------------------------------
+
+/// The deployment's users are `@x:example.org`; the client is told the name of
+/// the delegated host instead, as an operator can by mistake.
+const WRONG_NAME: &str = "matrix.example.org";
+
+fn misconfigured(w: &World) -> DirectoryClient {
+    let mut config = w.config();
+    config.server_name = WRONG_NAME.to_string();
+    DirectoryClient::new(config).unwrap()
+}
+
+/// With the wrong name every local person would look like a person of another
+/// server: not checked against their proof, their unsigned `did` member shown as
+/// a claim. That must be an error, never an answer.
+fn local_people_with_a_valid_proof(w: &World) {
+    let alice = mxid("alice");
+    w.hs.module_hits(vec![published(w, "alice")]);
+    w.hs.directory_rows(vec![json!({"user_id": alice, "display_name": "alice"})]);
+    w.hs.profile(&alice, Some(w.issuer.field(&did_of("alice"), &alice)));
+}
+
+fn is_name_mismatch(e: &DirectoryError) -> bool {
+    matches!(e, DirectoryError::ServerNameMismatch)
+}
+
+#[tokio::test]
+async fn a_wrong_server_name_fails_the_module_search_closed() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    let dir = misconfigured(&w);
+    let err = dir
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .expect_err("an answer under the wrong name would show local people as unconfirmed");
+    assert!(is_name_mismatch(&err), "{err}");
+    assert!(
+        !err.is_retryable(),
+        "the operator fixes it, a retry does not"
+    );
+    let text = err.to_string();
+    assert!(
+        !text.contains("asker-fixture")
+            && !text.contains(SERVER_NAME)
+            && !text.contains(WRONG_NAME),
+        "the message names neither a person nor a server: {text}"
+    );
+    assert_eq!(w.hs.module_calls(), 0, "the module is not asked");
+    assert_eq!(w.hs.profile_reads(), 0, "no profile is read");
+    // And it is not remembered as fine: the next search fails the same way.
+    assert!(is_name_mismatch(
+        &dir.search_for_asker(&w.session(), ASKER_DID, "a", 5)
+            .await
+            .unwrap_err()
+    ));
+}
+
+#[tokio::test]
+async fn a_wrong_server_name_fails_the_user_search_closed() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    let dir = misconfigured(&w);
+    let err = dir
+        .search_as_user("user-token-fixture", "a", 5)
+        .await
+        .expect_err("an answer under the wrong name would show local people as unconfirmed");
+    assert!(is_name_mismatch(&err), "{err}");
+    assert!(!err.is_retryable());
+    let text = err.to_string();
+    assert!(
+        !text.contains("whoami-fixture")
+            && !text.contains(SERVER_NAME)
+            && !text.contains(WRONG_NAME),
+        "the message names neither a person nor a server: {text}"
+    );
+    assert_eq!(w.hs.user_directory_calls(), 0, "the directory is not asked");
+    assert_eq!(w.hs.profile_reads(), 0, "no profile is read");
+    assert!(is_name_mismatch(
+        &dir.search_as_user("user-token-fixture", "a", 5)
+            .await
+            .unwrap_err()
+    ));
+    assert_eq!(
+        w.hs.whoami_calls(),
+        2,
+        "a mismatch is asked again, never kept"
+    );
+}
+
+#[tokio::test]
+async fn the_homeservers_name_is_asked_once_and_not_again_after_it_matched() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    let dir = w.directory();
+    for _ in 0..3 {
+        let got = dir
+            .search_as_user("user-token-fixture", "a", 5)
+            .await
+            .unwrap();
+        assert_eq!(states(&got), vec![verified(&did_of("alice"))]);
+    }
+    assert_eq!(w.hs.whoami_calls(), 1);
+    let whoami =
+        w.hs.mock
+            .requests()
+            .into_iter()
+            .find(|r| r.path == WHOAMI_PATH);
+    assert_eq!(
+        whoami.unwrap().bearer().as_deref(),
+        Some("user-token-fixture"),
+        "it is the user's own token that asks"
+    );
+}
+
+/// A module answer confirms nothing, not even for an asker on the right name:
+/// the real module answers an asker it does not know with a normal 200, so an
+/// answer cannot tell "my own person" from "a string that matched". Only
+/// `whoami` confirms, and it is asked once, by the first user search.
+#[tokio::test]
+async fn a_module_answer_never_confirms_the_name_so_the_user_transport_asks_whoami() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    let dir = w.directory();
+    dir.search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .unwrap();
+    assert_eq!(w.hs.whoami_calls(), 0, "the module transport never asks");
+    for _ in 0..2 {
+        dir.search_as_user("user-token-fixture", "a", 5)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        w.hs.whoami_calls(),
+        1,
+        "the first user search asks whoami, once; the module answer left nothing confirmed"
+    );
+}
+
+/// The issuer builds the asker's MXID from its own config, so an asker that
+/// matches a wrong `server_name` says nothing about the homeserver: when the
+/// issuer and the client carry the same wrong name, the string matches. Only the
+/// homeserver may confirm the name, and only `whoami` does: a module call that
+/// fails leaves the name unconfirmed, and the user search on the same client
+/// asks whoami and fails closed.
+#[tokio::test]
+async fn an_asker_string_on_a_wrong_name_never_confirms_it_for_the_user_transport() {
+    for status in [403, 429, 502] {
+        let w = World::new().await;
+        local_people_with_a_valid_proof(&w);
+        // The issuer is misconfigured the same way as the client.
+        w.issuer.with(|s| {
+            s.resolve.insert(
+                ASKER_DID.to_string(),
+                format!("@asker-fixture:{WRONG_NAME}"),
+            );
+        });
+        // The homeserver does not answer for an asker that is not its own.
+        w.hs.on_module(move |_, _| Resp::json(status, json!({"errcode": "M_FORBIDDEN"})));
+        let dir = misconfigured(&w);
+        assert!(
+            dir.search_for_asker(&w.session(), ASKER_DID, "a", 5)
+                .await
+                .is_err(),
+            "the module refused ({status})"
+        );
+        assert_eq!(w.hs.module_calls(), 1, "the asker matched the wrong name");
+
+        let err = dir
+            .search_as_user("user-token-fixture", "a", 5)
+            .await
+            .expect_err("local people would be shown as unconfirmed under the wrong name");
+        assert!(is_name_mismatch(&err), "{status}: {err}");
+        assert_eq!(w.hs.whoami_calls(), 1, "{status}: the homeserver was asked");
+        assert_eq!(w.hs.user_directory_calls(), 0, "the directory is not asked");
+        assert_eq!(w.hs.profile_reads(), 0, "no profile is read");
+        // And it stays unconfirmed: the next user search asks again.
+        assert!(is_name_mismatch(
+            &dir.search_as_user("user-token-fixture", "a", 5)
+                .await
+                .unwrap_err()
+        ));
+        assert_eq!(w.hs.whoami_calls(), 2);
+    }
+}
+
+/// The real module (`inblock_directory`, `module.py`) answers an asker that is
+/// not on its homeserver, or not known to it, with a normal
+/// `200 {"results": [], "limited": false}`. With the issuer and the client
+/// sharing one wrong (delegated) name, that is the answer the wrong-name asker
+/// gets, and it must not confirm the name: the following user search still asks
+/// `whoami`, fails closed, and shows no local person as an unconfirmed remote.
+#[tokio::test]
+async fn an_empty_200_from_the_module_for_a_wrong_name_asker_never_confirms_it() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    w.issuer.with(|s| {
+        s.resolve.insert(
+            ASKER_DID.to_string(),
+            format!("@asker-fixture:{WRONG_NAME}"),
+        );
+    });
+    // Not its own person: the module answers as it does for any asker it
+    // does not know, a plain success with nothing in it.
+    w.hs.on_module(|_, _| Resp::json(200, json!({"results": [], "limited": false})));
+    let dir = misconfigured(&w);
+    let got = dir
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .expect("the module answered");
+    assert!(states(&got).is_empty(), "the empty answer is passed on");
+    assert_eq!(w.hs.module_calls(), 1);
+    assert_eq!(w.hs.whoami_calls(), 0);
+
+    let err = dir
+        .search_as_user("user-token-fixture", "a", 5)
+        .await
+        .expect_err("local people would come back as unconfirmed remote people");
+    assert!(is_name_mismatch(&err), "{err}");
+    assert_eq!(w.hs.whoami_calls(), 1, "the homeserver was asked");
+    assert_eq!(w.hs.user_directory_calls(), 0, "the directory is not asked");
+    assert_eq!(w.hs.profile_reads(), 0, "no profile is read");
+    // Nothing was kept: the next user search asks again and says the same.
+    assert!(is_name_mismatch(
+        &dir.search_as_user("user-token-fixture", "a", 5)
+            .await
+            .unwrap_err()
+    ));
+    assert_eq!(w.hs.whoami_calls(), 2);
+}
+
+#[tokio::test]
+async fn a_whoami_that_fails_is_the_searchs_error_and_is_not_kept() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    let dir = w.directory();
+
+    w.hs.on_whoami(|_, _| Resp::json(401, json!({"errcode": "M_UNKNOWN_TOKEN"})));
+    assert!(matches!(
+        dir.search_as_user("stale", "a", 5).await.unwrap_err(),
+        DirectoryError::Unauthorized
+    ));
+    w.hs.on_whoami(|_, _| Resp::json(502, json!({"errcode": "M_UNKNOWN"})));
+    let err = dir.search_as_user("t", "a", 5).await.unwrap_err();
+    assert!(matches!(err, DirectoryError::Unavailable(_)) && err.is_retryable());
+    w.hs.on_whoami(|_, _| Resp::json(200, json!({"device_id": "D"})));
+    assert!(matches!(
+        dir.search_as_user("t", "a", 5).await.unwrap_err(),
+        DirectoryError::Protocol(_)
+    ));
+    assert_eq!(w.hs.user_directory_calls(), 0);
+
+    // None of it was kept as a verdict: the next honest answer works.
+    w.hs.on_whoami(|_, _| Resp::json(200, json!({"user_id": mxid("someone")})));
+    let got = dir.search_as_user("t", "a", 5).await.unwrap();
+    assert_eq!(states(&got), vec![verified(&did_of("alice"))]);
+}
+
+// ---------------------------------------------------------------------------
+// Tuning that would overflow a clock is held to a bound
+// ---------------------------------------------------------------------------
+
+/// One person of each kind, so that a search runs every cache and every bound:
+/// the asker is resolved, a local person is verified, a foreign one is read.
+fn one_of_each(w: &World) {
+    let (local, foreign) = (mxid("alice"), remote("carol"));
+    people(
+        w,
+        &[
+            (foreign.clone(), None),
+            (
+                local.clone(),
+                Some(w.issuer.field(&did_of("alice"), &local)),
+            ),
+        ],
+    );
+    w.hs.profile(&foreign, Some(json!({"did": "did:key:zCarol"})));
+    w.hs.profile(&local, Some(w.issuer.field(&did_of("alice"), &local)));
+}
+
+type Field = (&'static str, fn(&mut Tuning));
+
+/// Every duration of the tuning, once set to what "never" would be to a host.
+const DURATIONS: [Field; 14] = [
+    ("request_timeout", |t| t.request_timeout = Duration::MAX),
+    ("sign_in_timeout", |t| t.sign_in_timeout = Duration::MAX),
+    ("flow_request_timeout", |t| {
+        t.flow_request_timeout = Duration::MAX
+    }),
+    ("token_refresh_margin", |t| {
+        t.token_refresh_margin = Duration::MAX
+    }),
+    ("resolve_hit_ttl", |t| t.resolve_hit_ttl = Duration::MAX),
+    ("resolve_miss_ttl", |t| t.resolve_miss_ttl = Duration::MAX),
+    ("failed_sign_in_cooldown", |t| {
+        t.failed_sign_in_cooldown = Duration::MAX
+    }),
+    ("keys_ttl", |t| t.keys_ttl = Duration::MAX),
+    ("keys_refetch_interval", |t| {
+        t.keys_refetch_interval = Duration::MAX
+    }),
+    ("verified_ttl", |t| t.verified_ttl = Duration::MAX),
+    ("remote_profile_timeout", |t| {
+        t.remote_profile_timeout = Duration::MAX
+    }),
+    ("remote_profiles_timeout", |t| {
+        t.remote_profiles_timeout = Duration::MAX
+    }),
+    ("unconfirmed_ttl", |t| t.unconfirmed_ttl = Duration::MAX),
+    ("remote_miss_ttl", |t| t.remote_miss_ttl = Duration::MAX),
+];
+
+#[tokio::test]
+async fn no_duration_of_the_tuning_can_make_a_search_panic() {
+    for (name, set) in DURATIONS {
+        let w = World::new().await;
+        one_of_each(&w);
+        let mut tuning = Tuning::default();
+        set(&mut tuning);
+        let dir = w.directory_with(tuning.clone());
+        // The service signs in with the same tuning.
+        let session = w.session_with(tuning);
+        let expected = vec![unconfirmed("did:key:zCarol"), verified(&did_of("alice"))];
+        let got = dir
+            .search_for_asker(&session, ASKER_DID, "p", 20)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(states(&got), expected, "{name}: module transport");
+        let got = dir
+            .search_as_user("user-token-fixture", "p", 20)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(states(&got), expected, "{name}: user transport");
+    }
+}
+
+#[tokio::test]
+async fn a_lifetime_taken_as_never_is_kept_for_a_bounded_time_and_is_a_real_cache() {
+    let w = World::new().await;
+    one_of_each(&w);
+    let forever = Tuning {
+        resolve_hit_ttl: Duration::MAX,
+        keys_ttl: Duration::MAX,
+        verified_ttl: Duration::MAX,
+        unconfirmed_ttl: Duration::MAX,
+        remote_miss_ttl: Duration::MAX,
+        ..Tuning::default()
+    };
+    let dir = w.directory_with(forever);
+    for _ in 0..2 {
+        let got = dir
+            .search_for_asker(&w.session(), ASKER_DID, "p", 20)
+            .await
+            .unwrap();
+        assert_eq!(got.results.len(), 2);
+    }
+    assert_eq!(
+        w.hs.profile_reads(),
+        1,
+        "the claim was kept, not read again"
+    );
+    assert_eq!(w.issuer.mock.count("GET", "/resolve"), 1);
+    // A day on, it is all still there; a hundred years on it is not.
+    w.clock.advance(24 * 60 * MIN);
+    dir.search_for_asker(&w.session(), ASKER_DID, "p", 20)
+        .await
+        .unwrap();
+    assert_eq!(w.hs.profile_reads(), 1);
+    w.clock.advance(Duration::from_secs(2 * 365 * 24 * 3600));
+    dir.search_for_asker(&w.session(), ASKER_DID, "p", 20)
+        .await
+        .unwrap();
+    assert_eq!(w.hs.profile_reads(), 2, "no lifetime is longer than a year");
+}
+
+#[tokio::test]
+async fn the_remote_total_is_never_shorter_than_one_read() {
+    let w = World::new().await;
+    let r = remote("carol");
+    people(&w, &[(r.clone(), None)]);
+    // It answers after 300 ms. The per-read bound allows that; the total, set
+    // lower by mistake, would cut every read before it could.
+    w.hs.profile_answer(
+        &r,
+        Resp::json(200, json!({"io.inblock.did": {"did": "did:key:zCarol"}}))
+            .delayed(Duration::from_millis(300)),
+    );
+    let tuning = Tuning {
+        remote_profile_timeout: Duration::from_millis(800),
+        remote_profiles_timeout: Duration::from_millis(100),
+        ..Tuning::default()
+    };
+    let got = w
+        .directory_with(tuning)
+        .search_for_asker(&w.session(), ASKER_DID, "p", 5)
+        .await
+        .unwrap();
+    assert_eq!(states(&got), vec![unconfirmed("did:key:zCarol")]);
+}
+
+// ---------------------------------------------------------------------------
+// Slow foreign servers: every read that was waited for is remembered
+// ---------------------------------------------------------------------------
+
+/// `n` people on `n` foreign servers that never answer in time (the real
+/// answers come after 5 s, far past every bound the tests set).
+fn dead_remotes(w: &World, prefix: &str, n: usize) -> Vec<String> {
+    let names: Vec<String> = (0..n).map(|i| remote(&format!("{prefix}{i}"))).collect();
+    for m in &names {
+        w.hs.profile_answer(
+            m,
+            Resp::json(502, json!({"errcode": "M_UNKNOWN"})).delayed(Duration::from_secs(5)),
+        );
+    }
+    names
+}
+
+#[tokio::test]
+async fn the_second_wave_of_slow_reads_is_remembered_like_the_first() {
+    let w = World::new().await;
+    let dead = dead_remotes(&w, "dead", 16);
+    people(
+        &w,
+        &dead.iter().map(|m| (m.clone(), None)).collect::<Vec<_>>(),
+    );
+    // Eight places: the first eight reads end at 500 ms by their own bound, the
+    // next eight begin then and meet the 1 s total before theirs.
+    let tuning = Tuning {
+        remote_profile_timeout: Duration::from_millis(500),
+        remote_profiles_timeout: Duration::from_millis(1000),
+        ..Tuning::default()
+    };
+    let dir = w.directory_with(tuning);
+    let first = dir
+        .search_for_asker(&w.session(), ASKER_DID, "dead", 20)
+        .await
+        .unwrap();
+    assert_eq!(states(&first), vec![not_yet(); 16]);
+    assert_eq!(w.hs.profile_reads(), 16, "every one was asked");
+    assert_eq!(
+        dir.cache_stats().remote_claims,
+        16,
+        "and every one is remembered"
+    );
+
+    let started = std::time::Instant::now();
+    let second = dir
+        .search_for_asker(&w.session(), ASKER_DID, "dead", 20)
+        .await
+        .unwrap();
+    assert_eq!(states(&second), vec![not_yet(); 16]);
+    assert_eq!(w.hs.profile_reads(), 16, "none of them is asked again");
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "and the second search does not wait: {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn local_people_are_read_before_any_foreign_server_is_asked() {
+    let w = World::new().await;
+    // The homeserver's order puts twelve dead servers first, then an honest one,
+    // then three local people with a valid proof.
+    let dead = dead_remotes(&w, "dead", 12);
+    let honest = remote("honest");
+    let locals: Vec<String> = ["ann", "bob", "cy"].iter().map(|n| mxid(n)).collect();
+    let mut rows: Vec<(String, Option<Value>)> = dead.iter().map(|m| (m.clone(), None)).collect();
+    rows.push((honest.clone(), None));
+    rows.extend(locals.iter().map(|m| (m.clone(), None)));
+    people(&w, &rows);
+    w.hs.profile(&honest, Some(json!({"did": "did:key:zHonest"})));
+    for m in &locals {
+        w.hs.profile(
+            m,
+            Some(w.issuer.field(&did_of(&m[1..m.find(':').unwrap()]), m)),
+        );
+    }
+    let tuning = Tuning {
+        remote_profile_timeout: Duration::from_millis(400),
+        remote_profiles_timeout: Duration::from_millis(800),
+        ..Tuning::default()
+    };
+    let got = w
+        .directory_with(tuning)
+        .search_as_user("user-token-fixture", "p", 20)
+        .await
+        .unwrap();
+
+    let mut expected = vec![not_yet(); 12];
+    expected.push(unconfirmed("did:key:zHonest"));
+    expected.extend(["ann", "bob", "cy"].iter().map(|n| verified(&did_of(n))));
+    assert_eq!(
+        states(&got),
+        expected,
+        "the locals verified, the honest one heard"
+    );
+
+    // The order the homeserver was asked in: every local profile before the first foreign one.
+    let order: Vec<bool> =
+        w.hs.mock
+            .requests()
+            .iter()
+            .filter(|r| r.path.starts_with("/_matrix/client/v3/profile/"))
+            .map(|r| r.path.contains(&format!(":{OTHER}/")))
+            .collect();
+    assert_eq!(order.len(), 3 + 13, "every profile was read");
+    let first_foreign = order.iter().position(|&foreign| foreign).unwrap();
+    assert_eq!(
+        first_foreign, 3,
+        "no foreign server was asked before the three local profiles were read: {order:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_local_read_ends_the_search_before_any_foreign_server_is_asked() {
+    let w = World::new().await;
+    let (broken, foreign) = (mxid("broken"), remote("carol"));
+    people(&w, &[(foreign.clone(), None), (broken.clone(), None)]);
+    w.hs.profile(&foreign, Some(json!({"did": "did:key:zCarol"})));
+    w.hs.profile_status(&broken, 500);
+    let err = w
+        .directory()
+        .search_as_user("user-token-fixture", "p", 20)
+        .await
+        .unwrap_err();
+    assert!(err.is_retryable(), "{err}");
+    assert_eq!(
+        remote_profile_reads(&w),
+        0,
+        "the state of a local person is unknown, and no foreign server was bothered for the answer"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// One read per person at a time, whoever asks
+// ---------------------------------------------------------------------------
+
+/// `n` searches of the same people at once, over both transports alternately.
+async fn concurrently(
+    w: &World,
+    dir: &DirectoryClient,
+    n: usize,
+    transport: usize,
+) -> Vec<DirectoryResults> {
+    let session = Arc::new(w.session());
+    let mut tasks = Vec::new();
+    for i in 0..n {
+        let (dir, session) = (dir.clone(), session.clone());
+        tasks.push(tokio::spawn(async move {
+            if i % 2 == transport % 2 {
+                dir.search_for_asker(&session, ASKER_DID, "p", 20).await
+            } else {
+                dir.search_as_user("user-token-fixture", "p", 20).await
+            }
+        }));
+    }
+    let mut out = Vec::new();
+    for t in tasks {
+        out.push(t.await.unwrap().unwrap());
+    }
+    out
+}
+
+#[tokio::test]
+async fn searches_at_the_same_time_make_one_read_of_the_same_person() {
+    for answer in [
+        Resp::json(200, json!({"io.inblock.did": {"did": "did:key:zCarol"}})),
+        Resp::json(502, json!({"errcode": "M_UNKNOWN"})),
+    ] {
+        let found = answer.status == 200;
+        let w = World::new().await;
+        let carol = remote("carol");
+        people(&w, &[(carol.clone(), None)]);
+        w.hs.profile_answer(&carol, answer.delayed(Duration::from_millis(300)));
+        let dir = w.directory();
+        let got = concurrently(&w, &dir, 5, 0).await;
+        assert_eq!(
+            w.hs.profile_reads(),
+            1,
+            "five searches wait for one read ({})",
+            if found { "a claim" } else { "a failure" }
+        );
+        let expected = if found {
+            unconfirmed("did:key:zCarol")
+        } else {
+            not_yet()
+        };
+        for g in got {
+            assert_eq!(states(&g), vec![expected.clone()]);
+        }
+        assert_eq!(dir.cache_stats().remote_claims, 1);
+    }
+}
+
+#[tokio::test]
+async fn one_person_twice_in_an_answer_is_read_once() {
+    let w = World::new().await;
+    let carol = remote("carol");
+    people(&w, &[(carol.clone(), None), (carol.clone(), None)]);
+    w.hs.profile_answer(
+        &carol,
+        Resp::json(200, json!({"io.inblock.did": {"did": "did:key:zCarol"}}))
+            .delayed(Duration::from_millis(100)),
+    );
+    let got = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "p", 20)
+        .await
+        .unwrap();
+    assert_eq!(
+        states(&got),
+        vec![unconfirmed("did:key:zCarol"); 2],
+        "both rows have the claim"
+    );
+    assert_eq!(w.hs.profile_reads(), 1);
+}
+
+#[tokio::test]
+async fn a_search_that_is_dropped_leaves_the_others_their_answer() {
+    let w = World::new().await;
+    let carol = remote("carol");
+    people(&w, &[(carol.clone(), None)]);
+    w.hs.profile_answer(
+        &carol,
+        Resp::json(200, json!({"io.inblock.did": {"did": "did:key:zCarol"}}))
+            .delayed(Duration::from_millis(400)),
+    );
+    let dir = w.directory();
+    let session = Arc::new(w.session());
+    let (first, second) = (
+        {
+            let (dir, session) = (dir.clone(), session.clone());
+            tokio::spawn(async move { dir.search_for_asker(&session, ASKER_DID, "p", 5).await })
+        },
+        {
+            let (dir, session) = (dir.clone(), session.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                dir.search_for_asker(&session, ASKER_DID, "p", 5).await
+            })
+        },
+    );
+    // The first search is the one reading when its caller gives up.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    first.abort();
+    let got = second.await.unwrap().unwrap();
+    assert_eq!(
+        states(&got),
+        vec![unconfirmed("did:key:zCarol")],
+        "the second search was not left waiting for a read nobody runs"
+    );
+}
+
+#[tokio::test]
+async fn searches_waiting_for_a_slow_server_share_its_one_bound_and_its_one_miss() {
+    let w = World::new().await;
+    let carol = remote("carol");
+    people(&w, &[(carol.clone(), None)]);
+    w.hs.profile_answer(
+        &carol,
+        Resp::json(200, json!({"io.inblock.did": {"did": "did:key:zLate"}}))
+            .delayed(Duration::from_secs(3)),
+    );
+    let tuning = Tuning {
+        remote_profile_timeout: Duration::from_millis(300),
+        remote_profiles_timeout: Duration::from_millis(600),
+        ..Tuning::default()
+    };
+    let dir = w.directory_with(tuning);
+    let started = std::time::Instant::now();
+    for g in concurrently(&w, &dir, 5, 1).await {
+        assert_eq!(states(&g), vec![not_yet()]);
+    }
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "five searches did not wait one after another: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(w.hs.profile_reads(), 1);
+    // The miss is kept for the next search, which does not wait at all.
+    let again = std::time::Instant::now();
+    dir.search_as_user("user-token-fixture", "p", 20)
+        .await
+        .unwrap();
+    assert!(again.elapsed() < Duration::from_millis(250));
+    assert_eq!(w.hs.profile_reads(), 1);
 }

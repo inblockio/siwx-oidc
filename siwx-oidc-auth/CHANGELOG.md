@@ -113,6 +113,37 @@ matches error text should match the types named here instead.
 
 ### Added
 
+- **`DidState::Unconfirmed(ClaimedDid)`**, wire form
+  `{"state":"unconfirmed","value":"did:..."}`, for a person on ANOTHER homeserver
+  whose `io.inblock.did` profile field, read through our homeserver (Synapse asks
+  theirs over federation), holds a well-formed DID. It is what they claim and
+  nobody has checked: such a person is never `Verified`, proof or no proof. No
+  field, a bare string, a value that is not a DID, an unreadable profile or a
+  slow server leaves `NotYetPublished`, as before. A client may offer an
+  `unconfirmed` person behind a strong warning; one that does not know the state
+  must treat it as not selectable. `DidState::unconfirmed_did()`, `ClaimedDid`,
+  `CacheStats::remote_claims`, and the `Tuning` fields `remote_profile_timeout`
+  (3 s per read), `remote_profiles_timeout` (6 s for all of them of one search),
+  `unconfirmed_ttl` (5 min) and `remote_miss_ttl` (1 min). Both transports read
+  remote profiles, at most eight at a time (after the local reads, see "Changed
+  (remote reads)"); a remote read never fails a search. Claims are kept apart from the verified cache. See "People of
+  other homeservers" in `docs/directory.md`.
+- **`DirectoryError::ServerNameMismatch`** (not retryable): the asker of a module
+  search, or the owner of the token of a user search, is not on
+  `DirectoryConfig::server_name`. The name must be the homeserver's own (the part
+  after the colon of its users' MXIDs), not a delegated host; with a wrong one
+  every local person would look like a person of another server, their valid
+  proof ignored and their unsigned `did` shown as a claim. The search is now this
+  error and nothing else is asked, and a mismatch is never kept. `search_as_user`
+  learns the name from `GET /account/whoami` with the user's token, once per
+  client. Only `whoami` confirms the name: a module answer or an asker that
+  matched the name does not, since the module answers an asker it does not know
+  with a normal empty `200`.
+- **`DirectoryClient` and `ServiceSession` hold a `Tuning` to bounds when made**:
+  every duration is taken at most a year (`Duration::MAX` for "never" is a year,
+  not an overflow and a panic at `remote_profiles_timeout` or inside a spawned
+  read), and `remote_profiles_timeout` is raised to at least
+  `remote_profile_timeout`.
 - **`DirectoryConfig::sign_in_again_on_401`** (default `true`) and
   `DirectoryConfig::with_sign_in_again_on_401(bool)`: a host that owns the sign-in
   retries sets it to `false`, and `DirectoryClient::search_for_asker` then returns
@@ -156,8 +187,42 @@ matches error text should match the types named here instead.
 - **`Tuning::flow_request_timeout`** (default `FLOW_REQUEST_TIMEOUT`, 10 s): the
   per-request timeout of the directory session's sign-in and refresh.
 
+### Changed (remote reads)
+
+- **A remote read ends by the earlier of its own bound and the search's total,
+  and keeps its miss.** The total used to cut a read that waited for a place from
+  outside, so nothing was kept and a dead server in the second wave of reads
+  cost every search the same wait. Up to 16 slow servers (8 places, two bounds)
+  are now waited out and remembered in one search.
+- **The local profiles of a `search_as_user` are read before any foreign server is
+  asked**, and a local read that fails ends the search before one is. The two no
+  longer queue for the same eight places (the remote reads have eight of their
+  own, counted from the first remote read): a slow foreign server cannot delay
+  a local person's check. Remote reads add up to `remote_profiles_timeout` (6 s) to a search's critical
+  path; a host with a deadline of its own budgets for it.
+- **Reads of one remote person are single-flight.** Searches that want the same
+  person at once share one read and its outcome, a person twice in an answer is
+  read once, and a read never replaces an entry stored after it began (a slow
+  failure no longer puts a 60 s miss over a fresher claim). A search that is
+  dropped while it reads ends the read with no outcome and a waiting search reads
+  instead.
+- A claimed DID may carry `%XX` escapes (legal DID syntax): a client shows it raw,
+  never percent-decoded.
+
 ### Breaking
 
+- `search_as_user` makes one more request, `GET /account/whoami` with the user's
+  token, in the first search of a client (none after the name matched). A homeserver
+  that refuses `whoami` for the token fails the search the way it would have failed
+  the directory call (401 `Unauthorized`, 5xx `Unavailable`).
+- `DidState` has a new variant, `Unconfirmed`: a `match` on it that has no
+  wildcard arm must handle it. A caller that offers recipients should keep
+  offering `Verified` ones only unless it warns for `Unconfirmed`.
+  `CacheStats` has a new public field (`remote_claims`), and `Tuning` four
+  (above): code that builds `Tuning` with a struct literal and no
+  `..Tuning::default()` must name them.
+- `search_as_user` and `search_for_asker` now make one profile read per person of
+  another homeserver (they made none), through our homeserver, with no credential.
 - `AuthError` variants no longer carry the server's `error_description`:
   `DeviceRefused`, `AccessDenied` and `TemporarilyUnavailable` are unit variants,
   `SignInRefused` has only `error`, and `AuthError::description()` is removed.

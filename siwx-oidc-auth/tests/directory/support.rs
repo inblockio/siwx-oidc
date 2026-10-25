@@ -73,6 +73,7 @@ impl Req {
     }
 }
 
+#[derive(Clone)]
 pub struct Resp {
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -716,9 +717,15 @@ pub struct HsState {
     module_calls: usize,
     user_directory: Handler,
     user_directory_calls: usize,
+    whoami_calls: usize,
     /// mxid to the profile answer; an mxid that is absent answers 404.
     profiles: HashMap<String, Resp>,
     profile_delay: Duration,
+    /// mxid to answers given in turn, one per read; the last repeats. Wins over `profiles`.
+    profile_scripts: HashMap<String, (usize, Vec<Resp>)>,
+    /// `GET /account/whoami`, which the user transport asks once to learn the
+    /// homeserver's own name.
+    whoami: Handler,
 }
 
 pub struct Homeserver {
@@ -728,6 +735,7 @@ pub struct Homeserver {
 
 pub const MODULE_PATH: &str = "/_synapse/client/io.inblock/directory/v1/search";
 pub const USER_DIRECTORY_PATH: &str = "/_matrix/client/v3/user_directory/search";
+pub const WHOAMI_PATH: &str = "/_matrix/client/v3/account/whoami";
 
 pub fn hit(user_id: &str, display_name: Option<&str>, did_field: Option<Value>) -> Value {
     let mut v = json!({ "user_id": user_id });
@@ -749,8 +757,16 @@ impl Homeserver {
             module_calls: 0,
             user_directory: empty,
             user_directory_calls: 0,
+            whoami_calls: 0,
             profiles: HashMap::new(),
             profile_delay: Duration::ZERO,
+            profile_scripts: HashMap::new(),
+            whoami: Arc::new(|_, _| {
+                Resp::json(
+                    200,
+                    json!({"user_id": mxid("whoami-fixture"), "device_id": "D"}),
+                )
+            }),
         }));
         let shared = st.clone();
         let mock = Mock::start(move |r| hs_route(&shared, r)).await;
@@ -767,6 +783,19 @@ impl Homeserver {
     /// `f(request, zero-based call number)`.
     pub fn on_module(&self, f: impl Fn(&Req, usize) -> Resp + Send + Sync + 'static) {
         self.st.lock().unwrap().module = Arc::new(f);
+    }
+
+    /// `f(request, zero-based call number)`.
+    pub fn on_whoami(&self, f: impl Fn(&Req, usize) -> Resp + Send + Sync + 'static) {
+        self.st.lock().unwrap().whoami = Arc::new(f);
+    }
+
+    pub fn whoami_calls(&self) -> usize {
+        self.mock.count("GET", WHOAMI_PATH)
+    }
+
+    pub fn user_directory_calls(&self) -> usize {
+        self.mock.count("POST", USER_DIRECTORY_PATH)
     }
 
     pub fn on_user_directory(&self, f: impl Fn(&Req, usize) -> Resp + Send + Sync + 'static) {
@@ -808,6 +837,15 @@ impl Homeserver {
             .insert(mxid.to_string(), resp);
     }
 
+    /// The answers to the reads of one profile, in the order the reads arrive.
+    pub fn profile_script(&self, mxid: &str, answers: Vec<Resp>) {
+        self.st
+            .lock()
+            .unwrap()
+            .profile_scripts
+            .insert(mxid.to_string(), (0, answers));
+    }
+
     pub fn profile_delay(&self, d: Duration) {
         self.st.lock().unwrap().profile_delay = d;
     }
@@ -828,7 +866,11 @@ impl Homeserver {
 fn hs_route(st: &Arc<Mutex<HsState>>, r: &Req) -> Resp {
     let (handler, n) = {
         let mut s = st.lock().unwrap();
-        if r.method == "POST" && r.path == MODULE_PATH {
+        if r.method == "GET" && r.path == WHOAMI_PATH {
+            let n = s.whoami_calls;
+            s.whoami_calls += 1;
+            (Some(s.whoami.clone()), n)
+        } else if r.method == "POST" && r.path == MODULE_PATH {
             let n = s.module_calls;
             s.module_calls += 1;
             (Some(s.module.clone()), n)
@@ -846,15 +888,23 @@ fn hs_route(st: &Arc<Mutex<HsState>>, r: &Req) -> Resp {
     const PREFIX: &str = "/_matrix/client/v3/profile/";
     if r.method == "GET" {
         if let Some(rest) = r.path.strip_prefix(PREFIX) {
-            let s = st.lock().unwrap();
+            let mut s = st.lock().unwrap();
             let delay = s.profile_delay;
             let mxid = rest.strip_suffix("/io.inblock.did").unwrap_or(rest);
-            return match s.profiles.get(mxid) {
+            let scripted = s.profile_scripts.get_mut(mxid).map(|(next, answers)| {
+                let answer = answers[(*next).min(answers.len() - 1)].clone();
+                *next += 1;
+                answer
+            });
+            let found = scripted.as_ref().or_else(|| s.profiles.get(mxid));
+            return match found {
                 Some(p) => Resp {
                     status: p.status,
                     headers: p.headers.clone(),
                     body: p.body.clone(),
-                    delay,
+                    // The answer's own delay (one slow server), or the
+                    // homeserver-wide one, whichever is longer.
+                    delay: p.delay.max(delay),
                     chunked: p.chunked,
                     short_by: p.short_by,
                     stall_body: p.stall_body,

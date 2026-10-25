@@ -1,0 +1,123 @@
+{
+  "description": "People of another homeserver are never verified. Their io.inblock.did profile field, read through the homeserver, gives an unconfirmed DID when its did member is a well-formed DID (a proof beside it is not looked at, and the module's own did_field for the row is not the source); no field, a bare string, a value that is not a DID, or a member that is not a string leaves not_yet_published. A local user is judged as before.",
+  "expected": {
+    "limited": false,
+    "results": [
+      {
+        "alias": "Remote",
+        "did": {
+          "state": "unconfirmed",
+          "value": "did:key:zVectorFixtureRemote0000000000000000000000"
+        },
+        "mxid": "@remote:other.example"
+      },
+      {
+        "alias": "Claimed",
+        "did": {
+          "state": "unconfirmed",
+          "value": "did:pkh:eip155:1:0x4B23da593596D94035c57Adf6C2454216449B1B2"
+        },
+        "mxid": "@claimed:other.example"
+      },
+      {
+        "alias": "Garbage",
+        "did": {
+          "state": "not_yet_published"
+        },
+        "mxid": "@garbage:other.example"
+      },
+      {
+        "alias": "Bare",
+        "did": {
+          "state": "not_yet_published"
+        },
+        "mxid": "@bare:other.example"
+      },
+      {
+        "alias": "Nofield",
+        "did": {
+          "state": "not_yet_published"
+        },
+        "mxid": "@nofield:other.example"
+      },
+      {
+        "alias": "Alice Example",
+        "did": {
+          "state": "verified",
+          "value": "did:key:zVectorFixtureAlice0000000000000000000000"
+        },
+        "mxid": "@alice:example.org"
+      }
+    ]
+  },
+  "format": "siwx-oidc-auth.directory-vector/1",
+  "issuer": "https://siwx.example.org",
+  "jwks": {
+    "keys": [
+      {
+        "alg": "ES256",
+        "crv": "P-256",
+        "kid": "vector-kid-1",
+        "kty": "EC",
+        "use": "sig",
+        "x": "tPu3jwpS2v6n-Jz8agbU69uYdv_3mB4_uaTeuYa10po",
+        "y": "1fJclFD081W4TLi6Sn-J94lhdm8V58IgqxBI4pNpgL4"
+      }
+    ]
+  },
+  "limit": 10,
+  "module_response": {
+    "limited": false,
+    "results": [
+      {
+        "did_field": {
+          "did": "did:key:zVectorFixtureRemote0000000000000000000000",
+          "proof": "eyJhbGciOiJFUzI1NiIsImtpZCI6InZlY3Rvci1raWQtMSIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3NTcwMDAwMDAsImlzcyI6Imh0dHBzOi8vc2l3eC5leGFtcGxlLm9yZyIsIm14aWQiOiJAcmVtb3RlOm90aGVyLmV4YW1wbGUiLCJzdWIiOiJkaWQ6a2V5OnpWZWN0b3JGaXh0dXJlUmVtb3RlMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCJ9.AS7Jg6SvpP8vmK1OGCejG2kxPduSOMIEXl2_7vQ5jhemK_PibeIK4H36ZlUZ-LeZjGfwTRpogpvve68IEEiArg"
+        },
+        "display_name": "Remote",
+        "user_id": "@remote:other.example"
+      },
+      {
+        "display_name": "Claimed",
+        "user_id": "@claimed:other.example"
+      },
+      {
+        "display_name": "Garbage",
+        "user_id": "@garbage:other.example"
+      },
+      {
+        "display_name": "Bare",
+        "user_id": "@bare:other.example"
+      },
+      {
+        "display_name": "Nofield",
+        "user_id": "@nofield:other.example"
+      },
+      {
+        "did_field": {
+          "did": "did:key:zVectorFixtureAlice0000000000000000000000",
+          "proof": "eyJhbGciOiJFUzI1NiIsImtpZCI6InZlY3Rvci1raWQtMSIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3NTcwMDAwMDAsImlzcyI6Imh0dHBzOi8vc2l3eC5leGFtcGxlLm9yZyIsIm14aWQiOiJAYWxpY2U6ZXhhbXBsZS5vcmciLCJzdWIiOiJkaWQ6a2V5OnpWZWN0b3JGaXh0dXJlQWxpY2UwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIn0.2IOXgYfB8UlTdeUEc37hktdrVZSL-i2cAPuBwJS-Ss3XB5WoNwqqKHIPrl529z-fQ0asB2I4_iEn2fFQP7A8Tg"
+        },
+        "display_name": "Alice Example",
+        "user_id": "@alice:example.org"
+      }
+    ]
+  },
+  "name": "unconfirmed-remote-user",
+  "profiles": {
+    "@bare:other.example": "did:key:zVectorFixtureBare0000000000000000000000",
+    "@claimed:other.example": {
+      "did": "did:pkh:eip155:1:0x4B23da593596D94035c57Adf6C2454216449B1B2"
+    },
+    "@garbage:other.example": {
+      "did": "not a did"
+    },
+    "@nofield:other.example": null,
+    "@remote:other.example": {
+      "did": "did:key:zVectorFixtureRemote0000000000000000000000",
+      "proof": "eyJhbGciOiJFUzI1NiIsImtpZCI6InZlY3Rvci1raWQtMSIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3NTcwMDAwMDAsImlzcyI6Imh0dHBzOi8vc2l3eC5leGFtcGxlLm9yZyIsIm14aWQiOiJAcmVtb3RlOm90aGVyLmV4YW1wbGUiLCJzdWIiOiJkaWQ6a2V5OnpWZWN0b3JGaXh0dXJlUmVtb3RlMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCJ9.AS7Jg6SvpP8vmK1OGCejG2kxPduSOMIEXl2_7vQ5jhemK_PibeIK4H36ZlUZ-LeZjGfwTRpogpvve68IEEiArg"
+    }
+  },
+  "server_name": "example.org",
+  "transport": "module"
+}

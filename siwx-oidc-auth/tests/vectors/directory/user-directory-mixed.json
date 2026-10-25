@@ -1,5 +1,5 @@
 {
-  "description": "Rows of the standard user directory plus the profile field of each local user; a remote user's profile is not read.",
+  "description": "Rows of the standard user directory plus the profile field of each local user; a remote user's profile is read for a claim, and this one has none.",
   "expected": {
     "limited": false,
     "results": [
