@@ -270,6 +270,28 @@ matches error text should match the types named here instead.
   `Whoami(Unauthorized)` and a later one, once the name is confirmed, the plain
   `Unauthorized` of the directory call. (The enum is `#[non_exhaustive]`, so a
   `match` with a wildcard arm still compiles.)
+- **A failed lookup of the asker is `DirectoryError::Resolve(Box<DirectoryError>)`,
+  not the plain error of its status.** `search_for_asker` asks the issuer's
+  `GET /resolve` first, and its failure came back as the same error as the
+  homeserver's or the directory module's own answer, so a host could not tell a
+  proxy that answers 401 in front of the issuer from the service token being
+  refused (and renewed it for nothing, or kept a token-refusal backoff it should
+  have cleared), nor the issuer's 429 from the module's, nor an issuer without
+  `/resolve` from a module that is not registered. Every failure of that request
+  (a 401, a 404, a 429, a 5xx, a timeout, a body that is not the contract) is now
+  `Resolve` with the failure inside; neither `whoami` nor the module is asked, the
+  service does not sign in, and nothing is kept. An asker that does not exist, or a
+  DID no sign-in could accept, is still the empty result, and an asker of another
+  server is still `ServerNameMismatch`. New `DirectoryError::is_resolve()` and
+  `resolve_cause()`; `is_retryable()`, `is_rate_limited()`, `retry_after()` and
+  `is_unknown_client()` answer for the cause, and `std::error::Error::source()`
+  returns it. A host that matched `Unauthorized`, `RateLimited`, `Unavailable`,
+  `UnexpectedStatus` or `Protocol` from `search_for_asker` must also look inside
+  `Resolve`; a host that renews the service token on `Unauthorized` should keep
+  matching the module's and `whoami`'s refusal only
+  (`e.whoami_cause().unwrap_or(&e)`), which a `Resolve(Unauthorized)` is not.
+  (The enum is `#[non_exhaustive]`, so a `match` with a wildcard arm still
+  compiles.)
 - `DidState` has a new variant, `Unconfirmed`: a `match` on it that has no
   wildcard arm must handle it. A caller that offers recipients should keep
   offering `Verified` ones only unless it warns for `Unconfirmed`.

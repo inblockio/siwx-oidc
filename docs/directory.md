@@ -243,7 +243,10 @@ match directory.search_for_asker(&session, asker, term, 10).await {
 
 With `sign_in_again_on_401` off (default `true`, the behaviour above), a 401 from
 the directory module is `DirectoryError::Unauthorized` at once, and one from
-`whoami` is `Whoami(Unauthorized)`: no sign-in, no retry. `ServiceSession::invalidate_access_token(rejected)` discards the session's
+`whoami` is `Whoami(Unauthorized)`: no sign-in, no retry. (A 401 from the issuer's
+`/resolve` is `Resolve(Unauthorized)`: the service token was not involved, so the
+`match` above does not take it for a refused token, and renewing cannot help.)
+`ServiceSession::invalidate_access_token(rejected)` discards the session's
 access token and its refresh token when the access token is `rejected`, so the
 next `access_token()` signs in with the key (a refused access token says nothing
 good of its refresh token, and this is what the client's own retry does). It
@@ -306,7 +309,10 @@ so a consumer that matched that text keeps working until it matches the type.)
    account that does not exist, or a DID no sign-in could accept (a 400), gets the
    **empty result**, the same as no match, and the module is not called; that
    result says so with `DirectoryResults::homeserver_answered() == false`, where a
-   module's own empty answer is `true`. An asker
+   module's own empty answer is `true`. A lookup that fails (a 401, a 404, a 429,
+   a 5xx, a timeout, a body that is not the contract) is
+   `DirectoryError::Resolve`, with the failure inside; `whoami` and the module are
+   not asked, the service does not sign in, and nothing is kept. An asker
    who is not on the configured `server_name` is `ServerNameMismatch`, and the
    module is not called either.
    Then, once per client, `GET {homeserver}/_matrix/client/v3/account/whoami`
@@ -525,6 +531,7 @@ never the search term, a token or a response body.
 | `Protocol` | an answer that is not the contract: malformed JSON, a row without a user id, a body over the cap | no |
 | `ServerNameMismatch` | the asker, the owner of the user's token, or (by `whoami`) the service account itself is not on the configured `server_name` ([above](#setting-up-a-service)) | no |
 | `Whoami(cause)` | `GET /account/whoami`, the check of `server_name` before a client's first search on either transport, failed, and `cause` is how: a status (`UnexpectedStatus`, `Unauthorized`, `RateLimited`), a network failure (`Unavailable`) or a body without a user (`Protocol`). Told apart because the same status means something else from the directory: a 404 here is a homeserver URL (or a proxy) that does not answer `/_matrix/client/v3/account/whoami`, a 404 from the module is a module that is not registered. `is_whoami()` and `whoami_cause()` read it; `is_retryable()`, `is_rate_limited()` and `retry_after()` answer for the cause. A person of another server is `ServerNameMismatch`, not this | by the cause |
+| `Resolve(cause)` | `GET {issuer}/resolve`, the lookup of the asker that comes first in `search_for_asker`, failed, and `cause` is how: a status (`UnexpectedStatus`, `Unauthorized`, `RateLimited`), a network failure or a 5xx (`Unavailable`) or a body that is not the contract (`Protocol`). Told apart because the same status means something else from the homeserver: `/resolve` is public and takes no token, so its 401 is a proxy or a wall in front of the issuer and never a refused service token (renewing the token cannot help, and a host must not count it as one), its 429 is the issuer's rate limit, not the module's, and its 404 is an issuer without `/resolve` or a wrong `issuer_url`, not a module that is not registered. `is_resolve()` and `resolve_cause()` read it; `is_retryable()`, `is_rate_limited()` and `retry_after()` answer for the cause. An asker who does not exist is the empty result, and one of another server is `ServerNameMismatch`, not this | by the cause |
 
 ## Bounds
 

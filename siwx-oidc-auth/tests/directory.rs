@@ -547,7 +547,10 @@ async fn an_issuer_that_cannot_answer_resolve_fails_the_search_retryably() {
         .search_for_asker(&w.session(), ASKER_DID, "ada", 5)
         .await
         .unwrap_err();
-    assert!(matches!(err, DirectoryError::Unavailable(_)), "{err:?}");
+    assert!(
+        matches!(resolve_cause(&err), DirectoryError::Unavailable(_)),
+        "{err:?}"
+    );
     assert!(err.is_retryable());
     assert_eq!(w.hs.module_calls(), 0);
 }
@@ -3935,6 +3938,10 @@ async fn when_the_host_owns_re_sign_in_a_whoami_401_is_unauthorized_and_nothing_
 /// of that stage.
 fn whoami_cause(e: &DirectoryError) -> &DirectoryError {
     assert!(e.is_whoami(), "not reported as a whoami failure: {e:?}");
+    assert!(
+        !e.is_resolve() && e.resolve_cause().is_none(),
+        "a whoami failure is not a resolve failure: {e:?}"
+    );
     e.whoami_cause()
         .unwrap_or_else(|| panic!("is_whoami without a cause: {e:?}"))
 }
@@ -4074,6 +4081,8 @@ async fn a_module_failure_is_still_a_module_failure() {
             .unwrap_err();
         assert!(!err.is_whoami(), "{status}: {err:?}");
         assert!(err.whoami_cause().is_none(), "{status}: {err:?}");
+        assert!(!err.is_resolve(), "{status}: {err:?}");
+        assert!(err.resolve_cause().is_none(), "{status}: {err:?}");
         match status {
             404 => assert!(
                 matches!(err, DirectoryError::UnexpectedStatus { status: 404, .. }),
@@ -4142,6 +4151,231 @@ fn the_whoami_error_answers_the_helpers_for_its_cause() {
     );
     assert!(!DirectoryError::Unauthorized.is_whoami());
     assert!(DirectoryError::Unauthorized.whoami_cause().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// A resolve failure is told apart from the homeserver's and the module's answer
+// ---------------------------------------------------------------------------
+
+/// How `GET /resolve` failed; fails the test when `e` is not a failure of that
+/// stage.
+fn resolve_cause(e: &DirectoryError) -> &DirectoryError {
+    assert!(e.is_resolve(), "not reported as a resolve failure: {e:?}");
+    assert!(
+        !e.is_whoami() && e.whoami_cause().is_none(),
+        "a resolve failure is not a whoami failure: {e:?}"
+    );
+    e.resolve_cause()
+        .unwrap_or_else(|| panic!("is_resolve without a cause: {e:?}"))
+}
+
+/// The lookup of the asker is the issuer's, and every way it fails is told as
+/// that: a 401 is not the module refusing the service token, a 429 not the
+/// module's rate limit, a 404 not a module that is not registered. Nothing else
+/// is asked (not `whoami`, not the module) and the service does not sign in.
+#[tokio::test]
+async fn a_resolve_failure_is_a_resolve_stage_failure() {
+    for status in [401u16, 404, 429, 500, 502, 503] {
+        let w = World::new().await;
+        w.issuer.with(|s| s.resolve_status = status);
+        let err = w
+            .directory()
+            .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+            .await
+            .unwrap_err();
+        let cause = resolve_cause(&err);
+        match status {
+            401 => assert!(matches!(cause, DirectoryError::Unauthorized), "{err:?}"),
+            404 => assert!(
+                matches!(cause, DirectoryError::UnexpectedStatus { status: 404, .. }),
+                "{err:?}"
+            ),
+            429 => assert!(
+                matches!(cause, DirectoryError::RateLimited { .. }),
+                "{err:?}"
+            ),
+            _ => assert!(matches!(cause, DirectoryError::Unavailable(_)), "{err:?}"),
+        }
+        assert_eq!(
+            err.is_retryable(),
+            status == 429 || status >= 500,
+            "{status}"
+        );
+        assert_eq!(err.is_rate_limited(), status == 429, "{status}");
+        assert_eq!(w.hs.whoami_calls(), 0, "{status}");
+        assert_eq!(w.hs.module_calls(), 0, "{status}");
+        assert_eq!(
+            w.issuer.mock.count("POST", "/token"),
+            0,
+            "{status}: a resolve failure signs the service in for nothing"
+        );
+    }
+}
+
+/// An answer of `/resolve` that is not the contract is a resolve failure too:
+/// not JSON, JSON of another shape, an account without an MXID.
+#[tokio::test]
+async fn a_resolve_body_that_is_garbage_is_a_resolve_stage_failure() {
+    for body in [
+        "this is not json",
+        "",
+        r#"{"unexpected": true}"#,
+        r#"{"exists": true}"#,
+        r#"{"exists": true, "mxid": "not an mxid"}"#,
+    ] {
+        let w = World::new().await;
+        w.issuer.with(|s| s.resolve_body = Some(body.to_string()));
+        let err = w
+            .directory()
+            .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(resolve_cause(&err), DirectoryError::Protocol(_)),
+            "{body:?}: {err:?}"
+        );
+        assert!(!err.is_retryable(), "{body:?}");
+        assert_eq!(w.hs.whoami_calls(), 0, "{body:?}");
+        assert_eq!(w.hs.module_calls(), 0, "{body:?}");
+    }
+}
+
+/// The rate limit of `/resolve` keeps its hint inside the wrapper.
+#[tokio::test]
+async fn a_resolve_rate_limit_keeps_its_hint() {
+    let w = World::new().await;
+    w.issuer.with(|s| {
+        s.resolve_status = 429;
+        s.resolve_retry_after = Some("7".into());
+    });
+    let err = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(resolve_cause(&err), DirectoryError::RateLimited { .. }),
+        "{err:?}"
+    );
+    assert!(err.is_rate_limited() && err.is_retryable());
+    assert_eq!(err.retry_after(), Some(Duration::from_secs(7)));
+}
+
+/// A resolve failure is the error of that search and is kept nowhere: the next
+/// search asks again, and an honest answer works.
+#[tokio::test]
+async fn a_resolve_failure_is_not_kept() {
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    let dir = w.directory();
+    let session = w.session();
+    w.issuer.with(|s| s.resolve_status = 429);
+    for _ in 0..2 {
+        let err = dir
+            .search_for_asker(&session, ASKER_DID, "a", 5)
+            .await
+            .unwrap_err();
+        assert!(resolve_cause(&err).is_rate_limited());
+    }
+    assert_eq!(w.issuer.mock.count("GET", "/resolve"), 2, "asked again");
+    w.issuer.with(|s| s.resolve_status = 200);
+    dir.search_for_asker(&session, ASKER_DID, "a", 5)
+        .await
+        .unwrap();
+    assert_eq!(w.issuer.mock.count("GET", "/resolve"), 3);
+}
+
+/// What `/resolve` answers without failing stays what it was: a DID no sign-in
+/// could accept (400) and an unknown asker are the empty result, and an asker of
+/// another server is the name mismatch, not a resolve failure.
+#[tokio::test]
+async fn an_answer_of_resolve_is_not_a_resolve_failure() {
+    let w = World::new().await;
+    w.issuer.with(|s| s.resolve_status = 400);
+    let got = w
+        .directory()
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .unwrap();
+    assert!(got.results.is_empty());
+
+    let w = World::new().await;
+    let got = w
+        .directory()
+        .search_for_asker(&w.session(), "did:key:zNoSuchAccountFixture", "a", 5)
+        .await
+        .unwrap();
+    assert!(got.results.is_empty());
+    assert!(!got.homeserver_answered());
+
+    // An invalid input is checked before any request and is neither stage.
+    let err = w
+        .directory()
+        .search_for_asker(&w.session(), "", "a", 5)
+        .await
+        .unwrap_err();
+    assert!(!err.is_resolve() && !err.is_whoami(), "{err:?}");
+
+    let w = World::new().await;
+    local_people_with_a_valid_proof(&w);
+    let err = misconfigured(&w)
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .unwrap_err();
+    assert!(is_name_mismatch(&err), "{err:?}");
+    assert!(!err.is_resolve(), "{err:?}");
+}
+
+/// A `whoami` failure stays `Whoami` after a `/resolve` that answered.
+#[tokio::test]
+async fn a_whoami_failure_after_a_good_resolve_stays_a_whoami_failure() {
+    let w = World::new().await;
+    w.hs.on_whoami(|_, _| Resp::json(401, json!({"errcode": "M_UNKNOWN_TOKEN"})));
+    let err = directory_that_leaves_sign_in_to_the_host(&w)
+        .search_for_asker(&w.session(), ASKER_DID, "a", 5)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(whoami_cause(&err), DirectoryError::Unauthorized),
+        "{err:?}"
+    );
+    assert_eq!(w.issuer.mock.count("GET", "/resolve"), 1);
+}
+
+/// The helpers answer for the inner error, and the error carries its cause.
+#[test]
+fn the_resolve_error_answers_the_helpers_for_its_cause() {
+    use std::error::Error;
+    let wrap = |cause| DirectoryError::Resolve(Box::new(cause));
+
+    let down = wrap(DirectoryError::Unavailable(
+        "the server answered 502".into(),
+    ));
+    assert!(down.is_retryable() && down.is_resolve() && !down.is_rate_limited());
+    for fatal in [
+        DirectoryError::Unauthorized,
+        DirectoryError::Protocol("/resolve answered something else".into()),
+        DirectoryError::UnexpectedStatus {
+            status: 404,
+            errcode: None,
+        },
+    ] {
+        assert!(!wrap(fatal).is_retryable());
+    }
+    let limited = wrap(DirectoryError::RateLimited {
+        retry_after: Some(Duration::from_secs(3)),
+    });
+    assert!(limited.is_retryable() && limited.is_rate_limited());
+    assert_eq!(limited.retry_after(), Some(Duration::from_secs(3)));
+    assert!(!limited.is_unknown_client());
+
+    assert!(down.source().is_some(), "the cause is the source");
+    let text = down.to_string();
+    assert!(text.contains("resolve") && text.contains("502"), "{text}");
+    assert!(!down.is_whoami() && down.whoami_cause().is_none());
+    assert!(!DirectoryError::Unauthorized.is_resolve());
+    assert!(DirectoryError::Unauthorized.resolve_cause().is_none());
+    assert!(!DirectoryError::Whoami(Box::new(DirectoryError::Unauthorized)).is_resolve());
 }
 
 // ---------------------------------------------------------------------------

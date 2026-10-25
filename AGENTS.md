@@ -118,7 +118,7 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   helpers and the 169 unit and hermetic tests of the rotation canary
   (`siwx-oidc-auth/tests/rotation_canary_unit.rs`, which compiles the modules of
   `examples/rotation_canary.rs`; the hermetic ones talk to a fake server inside the test process),
-  and the directory client's suites: `siwx-oidc-auth/tests/directory.rs` (114 tests through the
+  and the directory client's suites: `siwx-oidc-auth/tests/directory.rs` (143 tests through the
   public API against a fake siwx-oidc and a fake homeserver on local sockets, `tests/directory/support.rs`,
   with a clock the tests move by hand) and the shared vectors in `siwx-oidc-auth/tests/vectors/directory/`
   (`every_vector_gives_its_expected_result`; the `#[ignore]`d `regenerate_directory_vectors` makes them
@@ -342,7 +342,7 @@ doc; read it before changing the code the rule covers.
   searches that want one person share one read; a read never replaces an entry stored after it began), and
   never failing a search; a `server_name` that is not the homeserver's is `DirectoryError::ServerNameMismatch`
   (the asker, or the `whoami` of the user's token, must be on it), never an answer in which local people
-  look foreign; a `whoami` that fails is `DirectoryError::Whoami(cause)` (a 404 there is the homeserver URL, not a missing module); the claimed value and the search term are never logged. Tokens stay in memory: no file API and no output macro in the module
+  look foreign; a `whoami` that fails is `DirectoryError::Whoami(cause)` (a 404 there is the homeserver URL, not a missing module) and a failed `GET /resolve` of the asker is `DirectoryError::Resolve(cause)` (a 401 there is never a refused service token); the claimed value and the search term are never logged. Tokens stay in memory: no file API and no output macro in the module
   outside its tests. The key set is fetched by one request pair at a time and a waiter shares the
   fetch's outcome; a proof with a `kid` the cached set lacks refetches it, at most once per 30 s; a
   failed renewal of the service session is shared by its waiters and answered for 5 s; an error

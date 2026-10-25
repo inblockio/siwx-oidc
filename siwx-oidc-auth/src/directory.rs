@@ -333,6 +333,32 @@ pub enum DirectoryError {
     /// with [`whoami_cause`](Self::whoami_cause). Nothing of the directory was
     /// asked, and nothing of the failure is kept: the next search asks again.
     Whoami(Box<DirectoryError>),
+    /// The lookup of the asker at siwx-oidc (`GET /resolve` on the issuer) failed,
+    /// and the inner error is how. It is the first request of
+    /// [`DirectoryClient::search_for_asker`], and it is told apart because the
+    /// same inner error means something else when the homeserver or its
+    /// directory module answers it: a 401 here is the issuer's (`/resolve` is
+    /// public, so a 401 is a proxy or a wall in front of it), never the service
+    /// token refused, and renewing the token cannot help; a 429 is the issuer's
+    /// rate limit, not the module's; a 404 is an issuer that has no `/resolve`
+    /// (an old build, a wrong `issuer_url`), where a 404 from the directory
+    /// module says the module is not registered.
+    ///
+    /// The inner error is one of [`Unauthorized`](DirectoryError::Unauthorized),
+    /// [`RateLimited`](DirectoryError::RateLimited),
+    /// [`Unavailable`](DirectoryError::Unavailable),
+    /// [`UnexpectedStatus`](DirectoryError::UnexpectedStatus) or
+    /// [`Protocol`](DirectoryError::Protocol) (an answer that is not the
+    /// contract); it is never another `Resolve` or a [`Whoami`](DirectoryError::Whoami).
+    /// An asker who does not exist, or whose DID no sign-in could accept, is not
+    /// this: `/resolve` answered, and the result is the empty one. A person of
+    /// another server is [`DirectoryError::ServerNameMismatch`].
+    /// [`is_retryable`](Self::is_retryable), [`is_rate_limited`](Self::is_rate_limited)
+    /// and [`retry_after`](Self::retry_after) answer for the inner error; read it
+    /// with [`resolve_cause`](Self::resolve_cause). Neither `whoami` nor the
+    /// module was asked, and nothing of the failure is kept: the next search asks
+    /// again.
+    Resolve(Box<DirectoryError>),
 }
 
 impl DirectoryError {
@@ -354,6 +380,27 @@ impl DirectoryError {
         }
     }
 
+    /// Whether the failure is the issuer's `GET /resolve` (the lookup of the
+    /// asker), not the homeserver's or its module's answer:
+    /// [`DirectoryError::Resolve`]. Match this (or
+    /// [`resolve_cause`](Self::resolve_cause)) before reading the status of an
+    /// [`Unauthorized`](DirectoryError::Unauthorized), a
+    /// [`RateLimited`](DirectoryError::RateLimited) or an
+    /// [`UnexpectedStatus`](DirectoryError::UnexpectedStatus), which mean
+    /// something else at `/resolve`: the service token was not involved.
+    pub fn is_resolve(&self) -> bool {
+        matches!(self, DirectoryError::Resolve(_))
+    }
+
+    /// How `GET /resolve` failed, when it is what failed
+    /// ([`DirectoryError::Resolve`]); `None` for every other error.
+    pub fn resolve_cause(&self) -> Option<&DirectoryError> {
+        match self {
+            DirectoryError::Resolve(cause) => Some(cause),
+            _ => None,
+        }
+    }
+
     /// Whether the service could not sign in because the server does not know its
     /// client id: a dynamic client lapses after 30 days without a use (see
     /// [`register_public_client`]). The remedy is to register again and keep the
@@ -362,7 +409,9 @@ impl DirectoryError {
     pub fn is_unknown_client(&self) -> bool {
         match self {
             DirectoryError::SignIn { source } => crate::is_unknown_client(source),
-            DirectoryError::Whoami(cause) => cause.is_unknown_client(),
+            DirectoryError::Whoami(cause) | DirectoryError::Resolve(cause) => {
+                cause.is_unknown_client()
+            }
             _ => false,
         }
     }
@@ -377,7 +426,9 @@ impl DirectoryError {
         match self {
             DirectoryError::RateLimited { .. } => true,
             DirectoryError::SignIn { source } => crate::is_rate_limited(source),
-            DirectoryError::Whoami(cause) => cause.is_rate_limited(),
+            DirectoryError::Whoami(cause) | DirectoryError::Resolve(cause) => {
+                cause.is_rate_limited()
+            }
             _ => false,
         }
     }
@@ -392,7 +443,7 @@ impl DirectoryError {
             DirectoryError::SignIn { source } => source
                 .downcast_ref::<AuthError>()
                 .and_then(AuthError::retry_after),
-            DirectoryError::Whoami(cause) => cause.retry_after(),
+            DirectoryError::Whoami(cause) | DirectoryError::Resolve(cause) => cause.retry_after(),
             _ => None,
         }
     }
@@ -409,7 +460,7 @@ impl DirectoryError {
                 Some(typed) => typed.is_transient(),
                 None => true,
             },
-            DirectoryError::Whoami(cause) => cause.is_retryable(),
+            DirectoryError::Whoami(cause) | DirectoryError::Resolve(cause) => cause.is_retryable(),
             DirectoryError::InvalidInput(_)
             | DirectoryError::NotAdmitted
             | DirectoryError::Unauthorized
@@ -451,6 +502,7 @@ impl fmt::Display for DirectoryError {
                 "the homeserver's users are not on the configured server_name"
             ),
             DirectoryError::Whoami(cause) => write!(f, "whoami failed: {cause}"),
+            DirectoryError::Resolve(cause) => write!(f, "resolve failed: {cause}"),
         }
     }
 }
@@ -459,7 +511,7 @@ impl std::error::Error for DirectoryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             DirectoryError::SignIn { source } => Some(source.as_ref()),
-            DirectoryError::Whoami(cause) => Some(&**cause),
+            DirectoryError::Whoami(cause) | DirectoryError::Resolve(cause) => Some(&**cause),
             _ => None,
         }
     }
@@ -1579,7 +1631,12 @@ impl DirectoryClient {
     ///
     /// Resolves the asker at siwx-oidc (an unknown asker, or a DID no sign-in
     /// could accept, gets the same empty result as no match, and the module is
-    /// not called), then asks the directory module with the service's token. A
+    /// not called). A lookup that fails is the error of that search, as
+    /// [`DirectoryError::Resolve`] with the failure inside (a 401, a 404, a 429, a
+    /// 5xx, a timeout or a body that is not the contract), is not kept, and
+    /// neither `whoami` nor the module is asked; it is never the plain error of
+    /// the same status, which is the module's own. Then the directory module is
+    /// asked with the service's token. A
     /// 401 signs the service in again once and retries once (unless the client
     /// was made with [`DirectoryConfig::sign_in_again_on_401`] off: then a 401 is
     /// the typed [`DirectoryError::Unauthorized`] at once, and the host renews
@@ -1626,7 +1683,13 @@ impl DirectoryClient {
             return Err(invalid("the service session belongs to another deployment"));
         }
 
-        let Some(asker) = inner.resolve_asker(asker_did).await? else {
+        // A failure of this request is the issuer's, and is told as that: the
+        // same status from `whoami` or the module means something else.
+        let Some(asker) = inner
+            .resolve_asker(asker_did)
+            .await
+            .map_err(|cause| DirectoryError::Resolve(Box::new(cause)))?
+        else {
             return Ok(DirectoryResults::unasked());
         };
         // The asker comes from our own issuer, so it is a person of the
@@ -2006,7 +2069,9 @@ impl Inner {
     }
 
     /// The MXID of the asker, or `None` when there is no such account. Found
-    /// mappings and misses are cached, for different times.
+    /// mappings and misses are cached, for different times. Its errors are the
+    /// plain ones of the request; `search_for_asker` marks them as the `resolve`
+    /// stage's ([`DirectoryError::Resolve`]).
     async fn resolve_asker(&self, did: &str) -> Result<Option<String>, DirectoryError> {
         let now = self.now();
         if let Some(known) = self

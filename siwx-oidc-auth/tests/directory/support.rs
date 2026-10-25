@@ -424,6 +424,12 @@ pub struct IssuerState {
     /// DID to the MXID `/resolve` finds; a DID that is absent does not exist.
     pub resolve: HashMap<String, String>,
     pub resolve_status: u16,
+    /// A `Retry-After` header to put on a refused `/resolve`, as a rate
+    /// limiter's 429 would have it.
+    pub resolve_retry_after: Option<String>,
+    /// A body, spelled any way (not JSON, JSON of the wrong shape), to answer a
+    /// `200` `/resolve` with instead of the lookup.
+    pub resolve_body: Option<String>,
     pub seq: u32,
     pub current_refresh: Option<String>,
     pub expires_in: Option<u64>,
@@ -471,6 +477,8 @@ impl Issuer {
             discovery_issuer: None,
             resolve,
             resolve_status: 200,
+            resolve_retry_after: None,
+            resolve_body: None,
             seq: 0,
             current_refresh: None,
             expires_in: Some(300),
@@ -556,7 +564,14 @@ fn issuer_route(st: &Arc<Mutex<IssuerState>>, r: &Req) -> Resp {
         }
         ("GET", "/resolve") => {
             if s.resolve_status != 200 {
-                return Resp::json(s.resolve_status, json!({"error": "fixture"}));
+                let mut resp = Resp::json(s.resolve_status, json!({"error": "fixture"}));
+                if let Some(wait) = &s.resolve_retry_after {
+                    resp = resp.header("Retry-After", wait);
+                }
+                return resp;
+            }
+            if let Some(body) = &s.resolve_body {
+                return Resp::bytes(200, body.clone().into_bytes());
             }
             let did = r.query_pairs().get("did").cloned().unwrap_or_default();
             match s.resolve.get(&did) {
