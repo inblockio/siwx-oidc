@@ -199,6 +199,10 @@ impl DidState {
 /// The DID another server's user claims. It passed [`is_did`] and nothing else:
 /// no proof of ours stands behind it. Like [`VerifiedSubject`] it has a private
 /// field, so a value of this type comes from a profile read in this module.
+///
+/// `%XX` escapes are legal DID syntax and change the identifier
+/// (`did:web:example.com%3A8443` is not `did:web:example.com:8443`): show and
+/// compare a claim as it is, byte for byte, never percent-decoded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct ClaimedDid(String);
