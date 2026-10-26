@@ -311,7 +311,7 @@ See [Matrix accounts for AI agents](#matrix-accounts-for-ai-agents) above and
 
 | Crate | Contents |
 |---|---|
-| `siwx-oidc` (root) | The server (`siwx-oidc` binary, Axum + Redis) and `migrate-credentials`, a one-shot operator tool for the passkey credential store |
+| `siwx-oidc` (root) | The server (`siwx-oidc` binary, Axum + Redis) and `migrate-credentials`, a one-shot operator tool for the passkey credential store, and `remint-did-assertions` (the server binary under a second name), which signs DID bindings again after a signing-key rotation |
 | `siwx-oidc-auth` | Headless client: Rust library and CLI (sign-in, refresh, device flow, DID verification) |
 
 The browser sign-in page is a Svelte app in `js/ui/`, built into `static/`. CAIP-122 verification

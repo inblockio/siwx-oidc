@@ -23,14 +23,14 @@ notice. There are no tagged releases yet; `main` is what runs.
 ## Code map
 
 Workspace: the root package `siwx-oidc` (library crate `siwx_oidc` in `src/lib.rs`, binaries
-`siwx-oidc`, `migrate-credentials` and `siwx-signer`) plus `siwx-oidc-auth/`. Crypto comes from the external
+`siwx-oidc`, `migrate-credentials` and `siwx-signer`; `remint-did-assertions` is `siwx-oidc` under a second name) plus `siwx-oidc-auth/`. Crypto comes from the external
 crate [aqua-auth](https://github.com/inblockio/aqua-auth), pinned by tag in both manifests.
 Modules marked **lib** are compiled into the library crate, so `tests/*.rs` can link them;
 everything else exists only in the binary crate.
 
 | `src/` | Role |
 |---|---|
-| `main.rs` | Binary entry point. Declares the binary-only modules and calls `axum_lib::main`. |
+| `main.rs` | Binary entry point. Declares the binary-only modules and calls `axum_lib::main`, unless the process is called `remint-did-assertions` (or has it as first argument), which runs `remint::cli_main`. |
 | `lib.rs` | Library crate root. `synapse_client` is deliberately not re-exported (see Invariants). |
 | `axum_lib.rs` | Startup: loads config through `config::figment()`, validates it (DID methods and pkh namespaces against the aqua-auth registries, signing key, retired keys, WebAuthn), `store_default_clients` (digested, no expiry, prunes the clients the map no longer names), `AppState`, the router, handler glue, the `siwx_user` / `acct_session` cookies, the CORS layer. |
 | `config.rs` | `Config`, its defaults, and `figment()`: the one place config names and precedence are defined. `Config::read_secret_files` reads `mas_shared_secret_file` and `redis_password_file` once at start. `Config` is deliberately not `Debug` (it holds secrets). Reference: [docs/configuration.md](docs/configuration.md). |
@@ -62,6 +62,7 @@ everything else exists only in the binary crate.
 | `db/tokens.rs` (lib) | Token formats (`mat_`, `msa_`, `mcr_{handle}_{secret}`), `parse_refresh_token` (never panics), `digest` (the SHA-256 every credential a client holds is stored as). |
 | `db/seal.rs` (lib) | The sealed successor pair: AES-256-GCM under a key HKDF-derived from the previous refresh token, so only its presenter can open it. |
 | `bin/migrate-credentials.rs` | Operator tool for the credential backfill. Dry run unless `--apply`. |
+| `remint.rs` | Operator tool `remint-did-assertions`: signs again, under the current key, the `io.inblock.did` bindings a key rotation left unverifiable. Dry run unless `--apply`, idempotent, counts-only output, `--limit` and `--delay-ms`. Lives in the binary crate because it needs `config`, `synapse_client` and `did_assertion`; the image links `siwx-oidc` under its name. The DID comes from `DidAuthority`, whose production form (`DerivationAuthority`) confirms a claim found in the profile only if siwx-oidc's own derivation binds it to exactly that account. |
 | `bin/siwx-signer.rs` | The signer process for `signing_backend = socket`: `serve`, `self-test`, `keygen`, `kid`. Non-dumpable, prints no key bytes. |
 
 | `siwx-oidc-auth/src/` | Role |
@@ -398,6 +399,20 @@ doc; read it before changing the code the rule covers.
 - **Row-absence is decided by `errcode`** (`M_UNKNOWN` = absent), not by a 404 alone. Pin:
   `profile_404_m_unknown_no_row_found_is_absent`,
   `profile_404_m_not_found_profile_was_not_found_is_present`.
+- **`remint-did-assertions` signs a DID only when siwx-oidc's own rules bind it to that exact
+  account, and never trusts the profile.** The `did` member and the `sub` of an old proof are
+  claims; `DerivationAuthority` returns one only if it derives to the account's localpart and
+  `resolve_identity` picks that localpart for it (a legacy account stays on its legacy
+  localpart, a second account for the same DID gets nothing). Two different claims that both
+  pass are left alone. A binding is current only when the profile's `did`, the proof's `sub`,
+  `mxid` and `iss`, and its `kid` and signature under the CURRENT key all match. It refuses an
+  ephemeral key before reading anything, never scans Redis, and prints counts only (no account,
+  DID, token or proof, and no per-account error text: the text of an HTTP error names the
+  account). Pin: `a_tampered_profile_cannot_make_the_tool_sign_a_did_the_account_is_not_derived_from`,
+  `only_the_canonical_account_of_a_did_is_signed`, `a_proof_with_the_wrong_mxid_is_reminted`,
+  `the_second_apply_writes_nothing`, `an_ephemeral_key_is_refused_before_anything_is_read_or_written`,
+  `the_report_names_no_account_did_proof_or_token`, and in `tests/remint_did_assertions_cli.rs`
+  `the_tool_remints_stale_bindings_once_and_prints_counts_only`.
 - **`synapse_client` stays out of `lib.rs`.** It depends on binary-only modules, and compiling it
   into both crates produced two types with one name.
 

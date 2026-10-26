@@ -11,7 +11,7 @@ wiring (Synapse, tokens, devices, account management) is in
 
 | Crate | Where | What |
 |---|---|---|
-| `siwx-oidc` | `src/` | The Axum server (binary `siwx-oidc`), the operator tool `migrate-credentials`, and a small library crate `siwx_oidc` (Redis layer, pure MXID and alias derivation, credential store) that integration tests link against. |
+| `siwx-oidc` | `src/` | The Axum server (binary `siwx-oidc`), the operator tools `migrate-credentials` and `remint-did-assertions` (the server binary under a second name), and a small library crate `siwx_oidc` (Redis layer, pure MXID and alias derivation, credential store) that integration tests link against. |
 | `siwx-oidc-auth` | `siwx-oidc-auth/` | Headless client, library and CLI: key-based sign-in, refresh, device flow, DID verification. See [agents.md](agents.md). |
 | `aqua-auth` | external, [inblockio/aqua-auth](https://github.com/inblockio/aqua-auth) | DID parsing and CAIP-122 signature verification, WebAuthn assertion verification, the optional credential store. Pinned by git tag (`v0.7.0` at the time of writing) in both `Cargo.toml` files. |
 

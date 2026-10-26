@@ -24,6 +24,8 @@ mod guest;
 mod introspect;
 mod localpart;
 mod oidc;
+// The operator tool `remint-did-assertions`: this binary under a second name.
+mod remint;
 // GET /resolve: the public DID <-> MXID directory lookup. Read-only, and a
 // discovery hint only — see the module doc's "never an authorization source".
 mod resolve;
@@ -32,6 +34,12 @@ mod teardown;
 mod webauthn;
 
 #[tokio::main]
-async fn main() {
-    axum_lib::main().await
+async fn main() -> std::process::ExitCode {
+    // `remint-did-assertions` is this binary under a second name (the image links it), or its
+    // first argument: it needs the server's own modules, which exist only in this crate.
+    if let Some(args) = remint::invoked_as_tool(std::env::args()) {
+        return remint::cli_main(args).await;
+    }
+    axum_lib::main().await;
+    std::process::ExitCode::SUCCESS
 }
