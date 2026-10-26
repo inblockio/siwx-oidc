@@ -2193,7 +2193,7 @@ mod tests {
     async fn an_all_upper_case_address_is_not_signed() {
         let fx = fixture!();
         let (old, current) = (key(), key());
-        let shouted = pkh(&format!("0x{}", &CHECKSUMMED_ADDRESS[2..].to_uppercase()));
+        let shouted = pkh(&format!("0x{}", CHECKSUMMED_ADDRESS[2..].to_uppercase()));
         assert_ne!(shouted, pkh(CHECKSUMMED_ADDRESS));
         let lp = modern(&shouted);
         fx.add_user(&lp);
