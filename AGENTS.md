@@ -103,15 +103,16 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 
 - **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
   mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
-  `cargo test --workspace` runs the unit tests of both crates plus 66 tests in fifteen files:
+  `cargo test --workspace` runs the unit tests of both crates plus 73 tests in sixteen files:
   `openapi_covers_every_route` (2), `localpart_vectors` (1), `graceful_shutdown` (7),
   `static_client_startup` (10), `secret_files_startup` (12, one of which serves requests from
   database 3 of the test Redis), `audit_pr82_findings` (4, the pins of the audit of the
   secret-file change; one of them takes database 1 of the test Redis),
   `log_hygiene_credential_store` (1),
   `log_capture_callsite_interest` (1), `siwx_signer_cli` (10) and `signing_backend_startup` (4),
-  which need nothing; `account_linking_dual_write` (6), which needs the test Redis, and `log_hygiene`
-  (4, one of them needs it);
+  which need nothing; `account_linking_dual_write` (6), which needs the test Redis, `log_hygiene`
+  (4, one of them needs it) and `remint_did_assertions_cli` (7, three of them need it; the real
+  binary against a fake homeserver and key set);
   `credential_migration_live` (2), which needs its own disposable, empty Redis named by
   `MIGRATION_TEST_REDIS_URL`; and the pure check `an_absent_strict_skips_variable_means_strict`
   in `e2e_account_lifecycle_live` and in `e2e_did_field_live` (1 each). In the headless
