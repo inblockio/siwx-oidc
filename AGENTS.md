@@ -406,11 +406,17 @@ doc; read it before changing the code the rule covers.
   `resolve_identity` picks that localpart for it (a legacy account stays on its legacy
   localpart, a second account for the same DID gets nothing). `legacy_localpart` folds case and
   turns `:` into `-`, so the claim must also be DID text a sign-in writes: it parses through
-  `resolve::check_did` (the sign-in's parsers) and equals `mxid::canonicalize` of itself byte
-  for byte, else it is `skipped_non_canonical` and nothing is written (never a second parser or
-  a second canonical form). A mixed-case `did:pkh` (EIP-55) is therefore left to the next
-  sign-in; a `did:key` whose case was changed and still reads as a key cannot be told from the
-  original without the retired public keys. Two different claims that both pass are left alone.
+  `resolve::check_did` (the sign-in's parsers) and is (a) equal to `mxid::canonicalize` of itself
+  byte for byte, or (b) a `did:pkh:eip155` that equals its canonical form everywhere except the
+  address, which is exactly `aqua_auth::eip55_checksum` of the lower-case address (what a wallet
+  sign-in writes: the login page builds the DID from the checksummed address the wallet returns);
+  else it is `skipped_non_canonical` and nothing is written (never a second parser, a second
+  canonical form or a hand-rolled checksum). The text signed is the claim as stored, so a
+  checksummed DID stays checksummed. An upper-case `0X` or `EIP155`, a colon turned into a dash,
+  an all-upper-case address that is not its own checksum and a mixed-case address with a wrong
+  checksum are all refused. A `did:key` whose case was changed and still reads as a key cannot be
+  told from the original without the retired public keys. Two different claims that both pass
+  are left alone.
   A binding is current only when the profile's `did`, the proof's `sub`, `mxid` and `iss`, and
   its `kid` and signature under the CURRENT key all match. **The tool's key must be the one the
   server publishes:** before any homeserver read it fetches `base_url` + `/jwk` (the URL the
@@ -427,7 +433,9 @@ doc; read it before changing the code the rule covers.
   `a_tampered_profile_cannot_make_the_tool_sign_a_did_the_account_is_not_derived_from`,
   `only_the_canonical_account_of_a_did_is_signed`, `a_proof_with_the_wrong_mxid_is_reminted`,
   `a_did_with_a_colon_turned_into_a_dash_is_not_signed`, `an_upper_case_did_pkh_is_not_signed`,
-  `a_mixed_case_did_pkh_is_not_canonical_and_waits_for_the_next_sign_in`,
+  `a_checksummed_did_pkh_is_signed`, `a_checksummed_binding_that_verifies_is_skipped_as_current`,
+  `a_mixed_case_did_pkh_with_a_wrong_checksum_is_not_signed`, `an_all_upper_case_address_is_not_signed`,
+  `only_a_did_in_a_sign_in_form_is_signable`,
   `a_modern_canonical_did_pkh_is_still_signed`,
   `a_key_set_without_the_signers_kid_is_refused`,
   `a_key_set_with_the_signers_kid_but_another_public_key_is_refused`,

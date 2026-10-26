@@ -235,18 +235,23 @@ processed like any other and only counted), and, for each, reads the profile fie
 this account: the DID the profile (or the old proof) names must derive to the account's
 localpart under the rule a sign-in uses (a legacy `did-pkh-…` account stays on its legacy
 localpart). The profile is a claim, never the authority, so a tampered profile or a forged old
-proof cannot make it sign a DID the account is not derived from. It signs only DID text in the
-exact form a sign-in writes: a claim must parse the way a sign-in parses it and equal its own
-canonical form (`mxid::canonicalize`) byte for byte. A legacy localpart folds case and turns `:`
-into `-`, so a claim such as `did:pkh:eip155:1-0x…` or `did:pkh:EIP155:1:0X…` would derive to a
-legacy account without being text any sign-in wrote; it is counted under `skipped_non_canonical`
-and nothing is written. That includes a `did:pkh` whose address is in mixed case (the EIP-55
-spelling): it is the same account, but not the canonical text, and renews at the holder's next
-sign-in. What it cannot rule out: a `did:key` or `did:peer` whose case was changed and that
-still reads as a valid key, because case is key material there and only the retired public keys
-could tell it from the original. It then writes the value the way a sign-in does. A binding that already verifies under the current key, for that DID, that
-account and this issuer, is left alone, so a rerun after `--apply` writes nothing. It refuses
-to run with an ephemeral signing key, before it reads or writes anything.
+proof cannot make it sign a DID the account is not derived from. It signs only DID text in a
+form a sign-in writes: a claim must parse the way a sign-in parses it and be either (a) its own
+canonical form (`mxid::canonicalize`) byte for byte, or (b) a `did:pkh` in the `eip155`
+namespace whose text equals its canonical form everywhere except the address, and whose address
+is exactly the EIP-55 checksum encoding of that (lower-case) address. Rule (b) is the text a
+wallet sign-in writes: the login page builds the DID from the address the wallet returns, and a
+wallet returns the checksummed spelling. The text signed is the claim as stored, so a
+checksummed DID stays checksummed. A legacy localpart folds case and turns `:` into `-`, so a
+claim such as `did:pkh:eip155:1-0x…`, `did:pkh:EIP155:1:0x…` or `did:pkh:eip155:1:0X…` would
+derive to a legacy account without being text any sign-in wrote; it is counted under
+`skipped_non_canonical` and nothing is written. So is an all-upper-case address that is not its
+own checksum, and a mixed-case address whose checksum is wrong. What the rule cannot rule out: a
+`did:key` or `did:peer` whose case was changed and that still reads as a valid key, because case
+is key material there and only the retired public keys could tell it from the original. It then
+writes the value the way a sign-in does. A binding that already verifies under the current key,
+for that DID, that account and this issuer, is left alone, so a rerun after `--apply` writes
+nothing. It refuses to run with an ephemeral signing key, before it reads or writes anything.
 
 The output is counts only (`total`, `skipped_current`, `skipped_no_mapping`,
 `skipped_not_canonical`, `skipped_ambiguous`, `skipped_deactivated`, `skipped_no_profile_row`,
@@ -254,7 +259,7 @@ The output is counts only (`total`, `skipped_current`, `skipped_no_mapping`,
 proof. `skipped_no_mapping` includes service accounts and accounts with no published DID, which
 renew at their next sign-in. `skipped_not_canonical` counts an account that is not the one
 siwx-oidc keeps for its DID (a legacy account exists for it) and an account whose only claim
-is not DID text in the exact form above. `locked_seen` is informational: the locked accounts
+is not DID text in one of the forms above. `locked_seen` is informational: the locked accounts
 among those processed, which the tool asks Synapse to list (`locked=true`) because its user
 list otherwise leaves them out; they are signed like any other and also counted under the
 outcome they came to. `--limit N` stops after N writes, for a staged first run;

@@ -37,7 +37,9 @@
 //! sign-in uses, which keeps a legacy account on its legacy localpart) picks this localpart for
 //! it. A claim that does not derive to the account is dropped, so a tampered profile or a
 //! forged proof cannot make the tool sign a DID the account is not derived from. Two different
-//! claims that both pass are ambiguous and are left alone.
+//! claims that both pass are ambiguous and are left alone. A claim must also be DID text a
+//! sign-in writes ([`in_sign_in_form`]): its canonical form, or a `did:pkh:eip155` whose address
+//! is the EIP-55 checksum encoding of the canonical one. The text signed is the claim as stored.
 //!
 //! There is no stored mapping from a Matrix account to its DID in siwx-oidc (the Redis keyspace
 //! keys DIDs, never accounts), so the profile is the only place the exact-case DID text
@@ -200,7 +202,7 @@ pub(crate) trait DidAuthority: Send + Sync {
     async fn confirm(&self, localpart: &str, claims: &[String]) -> Result<Confirmation>;
 }
 
-/// Whether `claim` is a DID in the exact form a sign-in writes.
+/// Whether `claim` is a DID in a form a sign-in writes.
 ///
 /// `binds_to_localpart` is lenient on purpose (it must find the account whatever the spelling):
 /// [`legacy_localpart`](siwx_oidc::mxid::legacy_localpart) folds case and turns `:` into `-`, so
@@ -208,16 +210,50 @@ pub(crate) trait DidAuthority: Send + Sync {
 /// account although no sign-in can have written it, and signing it would put a binding for a
 /// DID nobody holds under the provider's key. So a claim must also be a DID a sign-in accepts
 /// ([`crate::resolve::check_did`]: the sign-in's own parsers, run on the canonical form) and
-/// must BE its canonical form ([`siwx_oidc::mxid::canonicalize`]), byte for byte. No second
-/// parser, no second canonicalisation: both are the sign-in's.
+/// be one of the two texts a sign-in writes:
 ///
-/// The consequence for `did:pkh`: the canonical form is lower case, so an address in mixed case
-/// (the EIP-55 spelling a wallet may present) is the same account but not this text, and is
-/// left to the holder's next sign-in. For `did:key` and `did:peer` case is key material and is
-/// never folded, so a case change that still reads as a valid key passes here; only the
-/// retired public keys could tell it from the original (see the module doc).
+/// 1. its canonical form ([`siwx_oidc::mxid::canonicalize`]), byte for byte: a `did:key`,
+///    a `did:peer`, a lower-case `did:pkh`; or
+/// 2. a `did:pkh:eip155` that is its canonical form everywhere except the address, which is
+///    exactly the EIP-55 checksum encoding of the canonical (lower-case) address
+///    ([`is_eip55_did_pkh`]). The login page builds the DID from the address the wallet returns,
+///    and a wallet returns the checksummed spelling, so this is what most wallet sign-ins write.
+///
+/// Nothing else: not an upper-case `0X` or `EIP155`, not a changed prefix, not a colon turned
+/// into a dash, not an all-upper-case address, not a mixed-case address whose checksum is
+/// wrong. No second parser, no second canonicalisation: the parsers and `canonicalize` are the
+/// sign-in's, and the checksum is aqua-auth's, the one that builds the wallet DIDs.
+///
+/// The text that is signed is the claim as stored, so a checksummed DID stays checksummed.
+/// For `did:key` and `did:peer` case is key material and is never folded, so a case change that
+/// still reads as a valid key passes here; only the retired public keys could tell it from the
+/// original (see the module doc).
 fn in_sign_in_form(claim: &str) -> bool {
-    crate::resolve::check_did(claim).is_ok() && siwx_oidc::mxid::canonicalize(claim) == claim
+    crate::resolve::check_did(claim).is_ok()
+        && (siwx_oidc::mxid::canonicalize(claim) == claim || is_eip55_did_pkh(claim))
+}
+
+/// Rule 2 of [`in_sign_in_form`]: `did:pkh:eip155:<reference>:0x<address>` whose text equals
+/// `canonicalize(claim)` everywhere except the address digits, and whose address digits are
+/// exactly [`aqua_auth::eip55_checksum`] of the address they spell. A lower-case address is
+/// rule 1's, and is also accepted here when it has no letter (its checksum is itself).
+fn is_eip55_did_pkh(claim: &str) -> bool {
+    let Some((head, address)) = claim.rsplit_once(':') else {
+        return false;
+    };
+    let canonical = siwx_oidc::mxid::canonicalize(claim);
+    // The prefix (`did:pkh:eip155:<reference>`) is its own canonical text, and the separator
+    // and `0x` are exactly as `canonicalize` leaves them.
+    if !head.starts_with("did:pkh:eip155:") || canonical.get(..head.len()) != Some(head) {
+        return false;
+    }
+    let Some(digits) = address.strip_prefix("0x") else {
+        return false;
+    };
+    let mut bytes = [0u8; 20];
+    digits.len() == 40
+        && hex::decode_to_slice(digits, &mut bytes).is_ok()
+        && aqua_auth::eip55_checksum(&bytes) == digits
 }
 
 /// The production authority: siwx-oidc's own derivation, see the module doc.
@@ -2047,20 +2083,99 @@ mod tests {
         assert!(fx.puts().is_empty(), "nothing is written");
     }
 
-    /// The rule the sign-in's own `canonicalize` sets: a `did:pkh` is signed only in its
-    /// canonical (lower-case) form. A mixed-case address, the EIP-55 spelling of a wallet, is
-    /// the same account but not the canonical text, so it is left for the holder's next
-    /// sign-in, which writes it again. Pinned here so the consequence is a decision and not
-    /// an accident.
+    /// The EIP-55 checksummed spelling, from the EIP-55 specification's own test vectors.
+    const CHECKSUMMED_ADDRESS: &str = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
+
+    /// `did:pkh:eip155:1:` plus `address`, the way the login page forms it from the address the
+    /// wallet returns.
+    fn pkh(address: &str) -> String {
+        format!("did:pkh:eip155:1:{address}")
+    }
+
+    /// A wallet sign-in writes the DID with the address the wallet returned, and a wallet
+    /// returns the EIP-55 checksummed spelling. That is the text the profile holds, and the
+    /// text that is signed again: stored, not folded to lower case. A rerun then writes nothing.
     #[tokio::test]
-    async fn a_mixed_case_did_pkh_is_not_canonical_and_waits_for_the_next_sign_in() {
+    async fn a_checksummed_did_pkh_is_signed() {
         let fx = fixture!();
         let (old, current) = (key(), key());
-        let checksummed = "did:pkh:eip155:1:0x7a76A0f2B0d4C3e1A5b9c8D7e6f50413229A8b7c";
-        assert_eq!(mxid::canonicalize(checksummed), DID_C, "the same account");
-        let lp = modern(checksummed);
+        let checksummed = pkh(CHECKSUMMED_ADDRESS);
+        assert_ne!(mxid::canonicalize(&checksummed), checksummed, "mixed case");
+        let lp = modern(&checksummed);
+        assert_eq!(lp, modern(&mxid::canonicalize(&checksummed)), "one account");
         fx.add_user(&lp);
-        fx.set_profile(&lp, mint_value(&old, checksummed, &mxid_of(&lp)).await);
+        fx.set_profile(&lp, mint_value(&old, &checksummed, &mxid_of(&lp)).await);
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        let report = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(report.written, 1, "{report:?}");
+        assert_eq!(report.skipped_not_canonical, 0);
+        let stored = fx.profile(&lp).expect("the field was written");
+        assert_eq!(
+            stored["did"], checksummed,
+            "the claim as stored, not folded"
+        );
+        assert!(
+            binding_is_current(
+                &stored,
+                &current,
+                "https://auth.example.org/",
+                &checksummed,
+                &mxid_of(&lp)
+            ),
+            "the new proof is for the checksummed text"
+        );
+        let writes = fx.puts().len();
+
+        let again = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(again.written, 0, "{again:?}");
+        assert_eq!(again.skipped_current, 1);
+        assert_eq!(fx.puts().len(), writes, "the rerun wrote nothing");
+    }
+
+    /// A checksummed binding that already verifies under the current key is current: it is
+    /// skipped and nothing is written, through the production authority.
+    #[tokio::test]
+    async fn a_checksummed_binding_that_verifies_is_skipped_as_current() {
+        let fx = fixture!();
+        let current = key();
+        let checksummed = pkh(CHECKSUMMED_ADDRESS);
+        let lp = modern(&checksummed);
+        fx.add_user(&lp);
+        fx.set_profile(&lp, mint_value(&current, &checksummed, &mxid_of(&lp)).await);
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        let report = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(report.skipped_current, 1, "{report:?}");
+        assert_eq!(report.written, 0);
+        assert_eq!(report.skipped_not_canonical, 0);
+        assert!(fx.puts().is_empty(), "a current binding is not rewritten");
+    }
+
+    /// Mixed case is not a spelling, it is a checksum: an address whose case does not encode
+    /// its own EIP-55 checksum is no text a wallet returns. (One letter of the specification's
+    /// vector changed in case.) Same account, so it waits for the holder's next sign-in.
+    #[tokio::test]
+    async fn a_mixed_case_did_pkh_with_a_wrong_checksum_is_not_signed() {
+        let fx = fixture!();
+        let (old, current) = (key(), key());
+        let wrong = pkh("0x5AAeb6053F3E94C9b9A09f33669435E7Ef1BeAed");
+        assert_ne!(wrong, pkh(CHECKSUMMED_ADDRESS));
+        assert_eq!(
+            mxid::canonicalize(&wrong),
+            mxid::canonicalize(&pkh(CHECKSUMMED_ADDRESS)),
+            "the same account"
+        );
+        let lp = modern(&wrong);
+        fx.add_user(&lp);
+        fx.set_profile(&lp, mint_value(&old, &wrong, &mxid_of(&lp)).await);
         let authority = DerivationAuthority {
             synapse: &fx.synapse,
         };
@@ -2069,6 +2184,29 @@ mod tests {
 
         assert_eq!(report.skipped_not_canonical, 1, "{report:?}");
         assert_eq!(report.written, 0);
+        assert!(fx.puts().is_empty(), "nothing is written");
+    }
+
+    /// An all-upper-case address is not the checksum encoding of an address whose checksum has
+    /// lower-case letters in it, and is not what a wallet returns.
+    #[tokio::test]
+    async fn an_all_upper_case_address_is_not_signed() {
+        let fx = fixture!();
+        let (old, current) = (key(), key());
+        let shouted = pkh(&format!("0x{}", &CHECKSUMMED_ADDRESS[2..].to_uppercase()));
+        assert_ne!(shouted, pkh(CHECKSUMMED_ADDRESS));
+        let lp = modern(&shouted);
+        fx.add_user(&lp);
+        fx.set_profile(&lp, mint_value(&old, &shouted, &mxid_of(&lp)).await);
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        let report = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(report.skipped_not_canonical, 1, "{report:?}");
+        assert_eq!(report.written, 0);
+        assert!(fx.puts().is_empty(), "nothing is written");
     }
 
     /// The regression guard: a modern account whose DID is in canonical form is still signed.
@@ -2090,11 +2228,25 @@ mod tests {
         assert_eq!(fx.profile(&lp).unwrap()["did"], DID_C);
     }
 
-    /// The text rule on its own: a DID that parses the way a sign-in parses it and whose
-    /// canonical form is the text itself.
+    /// The text rule on its own: a DID that parses the way a sign-in parses it and is either
+    /// its own canonical form or a `did:pkh:eip155` whose address is the EIP-55 checksum
+    /// encoding of the canonical (lower-case) one.
     #[test]
-    fn only_a_did_in_the_exact_sign_in_form_is_signable() {
-        for ok in [DID_A, DID_B, DID_C, DID_D] {
+    fn only_a_did_in_a_sign_in_form_is_signable() {
+        for ok in [
+            DID_A,
+            DID_B,
+            DID_C,
+            DID_D,
+            // the EIP-55 specification's vectors, on chain 1 and on another chain
+            "did:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
+            "did:pkh:eip155:1:0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359",
+            "did:pkh:eip155:1:0xdbF03B407c01E7cD3CBea99509d93f8DDDC8C6FB",
+            "did:pkh:eip155:1:0xD1220A0cf47c7B9Be7A2E6BA89F429762e7b9aDb",
+            "did:pkh:eip155:137:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
+            // an address whose own checksum happens to be all upper case is that checksum
+            "did:pkh:eip155:1:0x52908400098527886E0F7030069857D2E4169EE7",
+        ] {
             assert!(in_sign_in_form(ok), "{ok}");
         }
         for not_ok in [
@@ -2102,8 +2254,17 @@ mod tests {
             "did:pkh:eip155:1-0x7a76a0f2b0d4c3e1a5b9c8d7e6f50413229a8b7c",
             // upper-case method data
             "did:pkh:EIP155:1:0X7a76a0f2b0d4c3e1a5b9c8d7e6f50413229a8b7c",
-            // EIP-55 mixed-case address: same account, not the canonical text
+            // ... also with a checksummed address: only the address may be mixed case
+            "did:pkh:EIP155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
+            "did:pkh:eip155:1:0X5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
+            "DID:pkh:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
+            "did:PKH:eip155:1:0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
+            // a mixed-case address whose checksum is wrong
             "did:pkh:eip155:1:0x7a76A0f2B0d4C3e1A5b9c8D7e6f50413229A8b7c",
+            "did:pkh:eip155:1:0x5AAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
+            "did:pkh:eip155:1:0xFb6916095ca1df60bB79Ce92cE3Ea74c37c5d359",
+            // an all-upper-case address that is not its own checksum
+            "did:pkh:eip155:1:0x5AAEB6053F3E94C9B9A09F33669435E7EF1BEAED",
             // a key whose case change broke its multicodec prefix
             "did:key:z6MKmWziJJ2k3ckqVqnmMGVKefMhDSe4ZxrfvqksxDMGBa4v",
             // not a method this provider signs in, and not a DID at all
