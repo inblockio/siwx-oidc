@@ -65,7 +65,7 @@ nondeterministic, so every admin request introspects.
   POST   /_synapse/mas/reactivate_user            synapse_client::reactivate_user
 
   -- admin surface (minted admin token) --------------------------------------
-  GET    /_synapse/admin/v2/users                 synapse_client::admin_users_page (device reaper, orphan scan), admin_all_users_page (remint-did-assertions: `deactivated=true`)
+  GET    /_synapse/admin/v2/users                 synapse_client::admin_users_page (device reaper, orphan scan), admin_all_users_page (remint-did-assertions: `deactivated=true&locked=true`)
   GET    /_synapse/admin/v2/users/{mxid}/devices  synapse_client::list_devices (and get_device)
   POST   /_matrix/client/v3/keys/query            synapse_client::has_cross_signing_keys
   PUT    /_matrix/client/v3/profile/{mxid}/{field} synapse_client::publish_did_field
@@ -215,6 +215,11 @@ CALL_LOG = []  # list of "METHOD path"
 ADMIN_PUTS = []
 # user_id -> user_type set by the admin PUT.
 USER_TYPES = {}
+# Locked accounts (Synapse `users.locked`, set by `PUT /_synapse/admin/v2/users/{id}` with
+# `locked`; modelled here by `POST /__lock`). Like Synapse's `UsersRestServletV2.on_GET`
+# (`locked = parse_boolean(request, "locked", default=False)`), the user list leaves them out
+# unless the request says `locked=true`.
+LOCKED = set()
 # Mutable expected secret (so a test can flip it to force 401s) and the
 # admin-surface kill switch (see __reject_admin_token).
 STATE = {"secret": SECRET, "reject_admin": False}
@@ -611,6 +616,7 @@ class Handler(BaseHTTPRequestHandler):
                     "profile_fields": PROFILE_FIELDS,
                     "admin_puts": list(ADMIN_PUTS),
                     "user_types": dict(USER_TYPES),
+                    "locked": sorted(LOCKED),
                     "reject_admin": STATE["reject_admin"],
                 })
         if path == "/health":
@@ -694,7 +700,8 @@ class Handler(BaseHTTPRequestHandler):
         # (`deactivated=false`), `not_user_type=` (empty) leaves out untyped accounts
         # as Synapse does; `from` is an offset, `next_token` absent on the last page.
         # `deactivated=true` (admin_all_users_page) lists the deactivated accounts too,
-        # each row carrying `deactivated` as 0 or 1 as Synapse writes it.
+        # each row carrying `deactivated` as 0 or 1 as Synapse writes it. Locked accounts
+        # are left out unless `locked=true`, each row carrying `locked` as 0 or 1.
         if path == "/_synapse/admin/v2/users":
             denied = self._admin_auth()
             if denied:
@@ -706,11 +713,14 @@ class Handler(BaseHTTPRequestHandler):
                 names = sorted({_mxid(lp) for lp in EXISTING_USERS} | set(DEVICES))
                 if (q.get("deactivated") or [""])[0] != "true":
                     names = [n for n in names if not LIFECYCLE.get(n, {}).get("deactivated")]
+                if (q.get("locked") or [""])[0] != "true":
+                    names = [n for n in names if n not in LOCKED]
                 rows = [
                     {
                         "name": n,
                         "user_type": USER_TYPES.get(n),
                         "deactivated": 1 if LIFECYCLE.get(n, {}).get("deactivated") else 0,
+                        "locked": 1 if n in LOCKED else 0,
                     }
                     for n in names
                 ]
@@ -924,6 +934,16 @@ class Handler(BaseHTTPRequestHandler):
         # distinguish a returning account from a brand-new identity.
         # With `did`, the account also publishes it as `io.inblock.did` (the
         # `{"did": ...}` shape `read_did_field` reads), as a sign-in would.
+        # Lock or unlock an account: `{"localpart": ..., "locked": true}`. A locked account
+        # is left out of the admin user list unless the request says `locked=true`.
+        if path == "/__lock":
+            lp = body.get("localpart") or _localpart_of(body.get("user_id", ""))
+            with LOCK:
+                if body.get("locked", True):
+                    LOCKED.add(_mxid(lp))
+                else:
+                    LOCKED.discard(_mxid(lp))
+            return self._send(200, {"ok": True, "localpart": lp})
         if path == "/__seed_user":
             lp = body.get("localpart") or _localpart_of(body.get("user_id", ""))
             with LOCK:
@@ -962,7 +982,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True, "user_id": uid, "state": state})
         if path == "/__reset":
             with LOCK:
-                DEVICES.clear(); LIFECYCLE.clear(); CALL_LOG.clear(); ADMIN_PUTS.clear(); USER_TYPES.clear()
+                DEVICES.clear(); LIFECYCLE.clear(); CALL_LOG.clear(); ADMIN_PUTS.clear(); USER_TYPES.clear(); LOCKED.clear()
                 FAIL.clear(); EFFECTIVE_DELETES.clear(); FAIL_DEVICE.clear(); KEYS.clear()
                 EXISTING_USERS.clear(); PROFILES.clear(); PROFILE_FIELDS.clear()
                 RP_RECEIVED.clear(); RP_MODE.clear(); RP_REDIRECTED.clear()

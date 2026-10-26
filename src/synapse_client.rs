@@ -153,6 +153,26 @@ pub struct AdminUserRow {
     /// this is `true` only on a page of [`SynapseClient::admin_all_users_page`].
     #[serde(default, deserialize_with = "flag_from_bool_or_int")]
     pub deactivated: bool,
+    /// Whether the account is locked (Synapse 1.91 and later). The `v2/users` list leaves a
+    /// locked account out unless the request says `locked=true`, which only
+    /// [`SynapseClient::admin_all_users_page`] does. A row without the flag, or with one that
+    /// is neither a bool nor a number, reads as unlocked: unlike `deactivated` it only feeds
+    /// an informational count, so an odd value must never fail the page for the callers that
+    /// share this row (the orphan scan, the device reaper).
+    #[serde(default, deserialize_with = "informational_flag")]
+    pub locked: bool,
+}
+
+/// A bool or a `0`/`1` flag that never fails the row: anything else is `false`.
+fn informational_flag<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Bool(b) => b,
+        serde_json::Value::Number(n) => n.as_i64().is_some_and(|n| n != 0),
+        _ => false,
+    })
 }
 
 fn flag_from_bool_or_int<'de, D>(deserializer: D) -> Result<bool, D::Error>
@@ -240,11 +260,16 @@ fn admin_users_url(endpoint: &str, from: Option<&str>, typed_only: bool) -> Stri
     url
 }
 
-/// The URL of one page of the user list that INCLUDES deactivated accounts (guests stay
-/// out). The DID re-mint tool counts the deactivated accounts it skips, so it must see them.
+/// The URL of one page of the user list that INCLUDES deactivated and locked accounts (guests
+/// stay out). The DID re-mint tool counts the deactivated accounts it skips, so it must see
+/// them, and it signs locked accounts like any other. Synapse's `UsersRestServletV2.on_GET`
+/// reads `locked` with default false, so without `locked=true` a locked account is never
+/// listed and its binding would stay stale for good. `guests=true` stays out: with MAS
+/// delegation Synapse rejects it.
 fn admin_all_users_url(endpoint: &str, from: Option<&str>) -> String {
-    let mut url =
-        format!("{endpoint}/_synapse/admin/v2/users?limit=100&guests=false&deactivated=true");
+    let mut url = format!(
+        "{endpoint}/_synapse/admin/v2/users?limit=100&guests=false&deactivated=true&locked=true"
+    );
     if let Some(from) = from {
         url.push_str("&from=");
         url.push_str(&urlencoding::encode(from));
@@ -2506,16 +2531,19 @@ mod tests {
     }
 
     /// The DID re-mint tool counts the deactivated accounts it skips, so its list includes
-    /// them; guests stay out, and the token is encoded.
+    /// them, and it signs locked accounts like any other, so the list asks for those too
+    /// (Synapse's `UsersRestServletV2.on_GET` reads `locked` with default false, which leaves
+    /// them out). Guests stay out (`guests=true` is rejected with MAS delegation), and the
+    /// token is encoded.
     #[test]
-    fn the_all_users_list_includes_deactivated_accounts_and_no_guests() {
+    fn the_all_users_list_includes_deactivated_and_locked_accounts_and_no_guests() {
         assert_eq!(
             admin_all_users_url("https://hs.example.org", None),
-            "https://hs.example.org/_synapse/admin/v2/users?limit=100&guests=false&deactivated=true"
+            "https://hs.example.org/_synapse/admin/v2/users?limit=100&guests=false&deactivated=true&locked=true"
         );
         assert_eq!(
             admin_all_users_url("https://hs.example.org", Some("a b")),
-            "https://hs.example.org/_synapse/admin/v2/users?limit=100&guests=false&deactivated=true&from=a%20b"
+            "https://hs.example.org/_synapse/admin/v2/users?limit=100&guests=false&deactivated=true&locked=true&from=a%20b"
         );
     }
 
@@ -2543,6 +2571,23 @@ mod tests {
         );
         assert_eq!(flag(json!({"name": "@a:hs"})), Some(false));
         assert_eq!(flag(json!({"name": "@a:hs", "deactivated": "yes"})), None);
+    }
+
+    /// The `locked` flag feeds a count only: `0`/`1` and a bool are read, and a missing,
+    /// null or odd value is unlocked and never fails the row.
+    #[test]
+    fn a_user_row_reads_the_locked_flag_and_never_fails_on_it() {
+        let flag = |row: serde_json::Value| {
+            serde_json::from_value::<AdminUserRow>(row)
+                .map(|r| r.locked)
+                .ok()
+        };
+        assert_eq!(flag(json!({"name": "@a:hs", "locked": 1})), Some(true));
+        assert_eq!(flag(json!({"name": "@a:hs", "locked": 0})), Some(false));
+        assert_eq!(flag(json!({"name": "@a:hs", "locked": true})), Some(true));
+        assert_eq!(flag(json!({"name": "@a:hs", "locked": null})), Some(false));
+        assert_eq!(flag(json!({"name": "@a:hs"})), Some(false));
+        assert_eq!(flag(json!({"name": "@a:hs", "locked": "yes"})), Some(false));
     }
 
     /// The orphan scan asks only for typed accounts (`not_user_type=`); the plain list keeps

@@ -354,6 +354,8 @@ pub(crate) struct Report {
     /// The account has no profile row (element-hq/synapse#19702): its field cannot be read
     /// and a write is refused. Left for the next sign-in, as a sign-in leaves it.
     pub skipped_no_profile_row: u64,
+    /// Locked accounts among those processed. Informational: they are signed like any other.
+    pub locked_seen: u64,
     pub would_write: u64,
     pub written: u64,
     pub errors: BTreeMap<ErrorClass, u64>,
@@ -405,6 +407,7 @@ impl Report {
             "  skipped_no_profile_row: {}\n",
             self.skipped_no_profile_row
         ));
+        out.push_str(&format!("  locked_seen: {}\n", self.locked_seen));
         if apply {
             out.push_str(&format!("  written: {}\n", self.written));
         } else {
@@ -550,6 +553,11 @@ async fn process(
     if row.deactivated {
         report.skipped_deactivated += 1;
         return Outcome::Counted;
+    }
+    // A locked account is processed like an active one (signing it again changes nothing it
+    // can do); it is only counted, so the operator can see the list did include them.
+    if row.locked {
+        report.locked_seen += 1;
     }
 
     // A local account is `@localpart:<our server name>`. Anything else is not ours to sign.
@@ -858,6 +866,7 @@ mod tests {
     #[derive(Default)]
     struct UserRec {
         deactivated: bool,
+        locked: bool,
         user_type: Option<String>,
     }
 
@@ -870,6 +879,8 @@ mod tests {
         puts: Vec<(String, Value)>,
         /// `deactivated=` the list request carried, per request
         list_flags: Vec<String>,
+        /// `locked=` the list request carried, per request
+        locked_flags: Vec<String>,
         list_requests: usize,
         profile_gets: usize,
         page_size: usize,
@@ -901,11 +912,17 @@ mod tests {
         hs.list_requests += 1;
         let deactivated = q.get("deactivated").cloned().unwrap_or_default();
         hs.list_flags.push(deactivated.clone());
+        let locked = q.get("locked").cloned().unwrap_or_default();
+        hs.locked_flags.push(locked.clone());
         let include_deactivated = deactivated == "true";
+        // As Synapse's `UsersRestServletV2.on_GET` (`locked = parse_boolean(request, "locked",
+        // default=False)`): a locked account is not listed unless the request says so.
+        let include_locked = locked == "true";
         let rows: Vec<(&String, &UserRec)> = hs
             .users
             .iter()
             .filter(|(_, u)| include_deactivated || !u.deactivated)
+            .filter(|(_, u)| include_locked || !u.locked)
             .collect();
         let from: usize = q.get("from").and_then(|f| f.parse().ok()).unwrap_or(0);
         let size = if hs.page_size == 0 { 100 } else { hs.page_size };
@@ -920,6 +937,7 @@ mod tests {
                     "admin": 0,
                     "user_type": u.user_type,
                     "deactivated": if u.deactivated { 1 } else { 0 },
+                    "locked": if u.locked { 1 } else { 0 },
                 })
             })
             .collect();
@@ -1020,6 +1038,7 @@ mod tests {
                 ADMIN_LOCALPART.to_string(),
                 UserRec {
                     deactivated: false,
+                    locked: false,
                     user_type: Some("bot".into()),
                 },
             );
@@ -1061,6 +1080,18 @@ mod tests {
                 localpart.to_string(),
                 UserRec {
                     deactivated: true,
+                    locked: false,
+                    user_type: None,
+                },
+            );
+        }
+
+        fn add_locked(&self, localpart: &str) {
+            self.hs.lock().unwrap().users.insert(
+                localpart.to_string(),
+                UserRec {
+                    deactivated: false,
+                    locked: true,
                     user_type: None,
                 },
             );
@@ -1301,6 +1332,59 @@ mod tests {
             vec!["true"],
             "the list is asked to include deactivated accounts, so they can be counted"
         );
+    }
+
+    /// Synapse's user list leaves a locked account out unless asked (`locked=true`), so a tool
+    /// that does not ask never sees it and its binding goes stale for good. A locked account
+    /// is signed like an active one (re-signing it changes nothing it can do), and counted so
+    /// the operator can see how many there were.
+    #[tokio::test]
+    async fn a_locked_account_with_a_stale_binding_is_reminted() {
+        let fx = fixture!();
+        let (old, current) = (key(), key());
+        fx.add_locked("ann");
+        fx.set_profile("ann", mint_value(&old, DID_A, &mxid_of("ann")).await);
+        let store = StoreFake::of(&[("ann", DID_A)]);
+
+        let report = go(&fx, &current, &store, true).await;
+
+        assert_eq!(report.written, 1, "{report:?}");
+        assert_eq!(report.locked_seen, 1, "{report:?}");
+        assert_eq!(
+            report.total, 2,
+            "the locked account and the service account"
+        );
+        let stored = fx.profile("ann").expect("the field was written");
+        assert!(binding_is_current(
+            &stored,
+            &current,
+            "https://auth.example.org/",
+            DID_A,
+            &mxid_of("ann")
+        ));
+        assert_eq!(
+            fx.hs.lock().unwrap().locked_flags,
+            vec!["true"],
+            "the list is asked to include locked accounts"
+        );
+    }
+
+    /// The counter is informational: an unlocked account is not in it, and it is printed.
+    #[tokio::test]
+    async fn the_locked_count_is_reported_and_counts_only_locked_accounts() {
+        let fx = fixture!();
+        let key = key();
+        fx.add_user("ann");
+        fx.add_locked("bob");
+        fx.add_locked("cy");
+        let store = StoreFake::of(&[("ann", DID_A), ("bob", DID_B), ("cy", DID_C)]);
+
+        let report = go(&fx, &key, &store, false).await;
+
+        assert_eq!(report.locked_seen, 2, "{report:?}");
+        assert_eq!(report.would_write, 3, "locked accounts are processed too");
+        assert!(report.render(false).contains("  locked_seen: 2\n"));
+        assert!(report.is_clean(), "a locked account is not a failure");
     }
 
     /// An account with no profile row cannot be read or written (synapse#19702). It is counted
