@@ -701,7 +701,10 @@ class Handler(BaseHTTPRequestHandler):
         # as Synapse does; `from` is an offset, `next_token` absent on the last page.
         # `deactivated=true` (admin_all_users_page) lists the deactivated accounts too,
         # each row carrying `deactivated` as 0 or 1 as Synapse writes it. Locked accounts
-        # are left out unless `locked=true`, each row carrying `locked` as 0 or 1.
+        # are left out unless `locked=true`, each row carrying `locked` as 0 or 1. Each row also
+        # carries `displayname`, as Synapse's list joins it from the `profiles` row: null for an
+        # account with no profile row or no display name (set one with `POST /__profile`, the
+        # admin or profile displayname PUT, or `displayname` on `POST /__seed_user`).
         if path == "/_synapse/admin/v2/users":
             denied = self._admin_auth()
             if denied:
@@ -721,6 +724,7 @@ class Handler(BaseHTTPRequestHandler):
                         "user_type": USER_TYPES.get(n),
                         "deactivated": 1 if LIFECYCLE.get(n, {}).get("deactivated") else 0,
                         "locked": 1 if n in LOCKED else 0,
+                        "displayname": PROFILES.get(n, {}).get("displayname"),
                     }
                     for n in names
                 ]
@@ -933,7 +937,8 @@ class Handler(BaseHTTPRequestHandler):
         # `user_id` mxid or a bare `localpart`. Used to test flows that must
         # distinguish a returning account from a brand-new identity.
         # With `did`, the account also publishes it as `io.inblock.did` (the
-        # `{"did": ...}` shape `read_did_field` reads), as a sign-in would.
+        # `{"did": ...}` shape `read_did_field` reads), as a sign-in would. With `displayname`,
+        # the profile row carries it (and the admin user list shows it); without, it stays null.
         # Lock or unlock an account: `{"localpart": ..., "locked": true}`. A locked account
         # is left out of the admin user list unless the request says `locked=true`.
         if path == "/__lock":
@@ -947,7 +952,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/__seed_user":
             lp = body.get("localpart") or _localpart_of(body.get("user_id", ""))
             with LOCK:
-                _mark_profile(lp)
+                _mark_profile(lp, body.get("displayname"))
                 if body.get("did"):
                     PROFILE_FIELDS.setdefault(_mxid(lp), {})["io.inblock.did"] = {"did": body["did"]}
             return self._send(200, {"ok": True, "localpart": lp})

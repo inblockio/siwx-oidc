@@ -253,11 +253,34 @@ writes the value the way a sign-in does. A binding that already verifies under t
 for that DID, that account and this issuer, is left alone, so a rerun after `--apply` writes
 nothing. It refuses to run with an ephemeral signing key, before it reads or writes anything.
 
+An account with no `io.inblock.did` field at all gets a binding too, when its DID can be
+recovered from the account itself. There is no profile claim to check then, so the claim comes
+from the account: first its name, when the localpart is exactly
+`did-pkh-eip155-<reference>-0x<40 lower-case hex digits>` (a legacy wallet account: the
+localpart is the DID, so the claim is exact, written with the EIP-55 checksum a wallet sign-in
+writes); else its display name, as stored byte for byte, when it starts with `did:` (the alias
+older sign-ins wrote). The claim goes through the same confirmation as a profile claim, and
+there is no other trust path. The display name is never read for an account that has the field,
+and is read for an account without one only when its name made no claim. The display name is
+text the person can edit: for a hash-shaped account the derivation pins the DID exactly, and
+for a legacy `did:key` account it pins it only up to letter case, so the worst case is a binding
+to a case variant of the DID that nobody holds (a share to it opens for nobody, and it never
+reaches another person).
+
+An account counts as having no field only when Synapse says so: a `404` whose JSON body has
+`errcode` `M_NOT_FOUND`. Any other `404` on the field read (a proxy's page with no JSON, an
+`M_UNRECOGNIZED` from a homeserver that does not know the route, another `errcode`) tells the tool
+nothing about the field, so that account is counted as a `read_profile` error and nothing is
+written for it.
+
 The output is counts only (`total`, `skipped_current`, `skipped_no_mapping`,
 `skipped_not_canonical`, `skipped_ambiguous`, `skipped_deactivated`, `skipped_no_profile_row`,
-`locked_seen`, `would_write` or `written`, `rate_limited_waits`, errors by class): it names no
-account, DID, token or proof. `skipped_no_mapping` includes service accounts and accounts with no published DID, which
-renew at their next sign-in. `skipped_not_canonical` counts an account that is not the one
+`locked_seen`, `would_write` or `written`, `created_from_account_name`,
+`created_from_display_name`, `rate_limited_waits`, errors by class): it names no
+account, DID, token or proof. The two `created_from_*` counters are the bindings written (or,
+in a dry run, that would be) for an account that had no field, by where the claim came from;
+they are part of `written` / `would_write`, not in addition to them. `skipped_no_mapping` includes service accounts and accounts with no published DID whose name and
+display name give no DID that derives to them, which renew at their next sign-in. `skipped_not_canonical` counts an account that is not the one
 siwx-oidc keeps for its DID (a legacy account exists for it) and an account whose only claim
 is not DID text in one of the forms above. `locked_seen` is informational: the locked accounts
 among those processed, which the tool asks Synapse to list (`locked=true`) because its user

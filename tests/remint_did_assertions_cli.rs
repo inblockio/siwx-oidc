@@ -20,7 +20,7 @@ use axum::{Json, Router};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde_json::{json, Value};
 
-use siwx_oidc::mxid::localpart_for;
+use siwx_oidc::mxid::{legacy_localpart, localpart_for};
 use siwx_oidc::signing::EcdsaSigningKey;
 use siwx_oidc::test_support::{random_secret, redis, redis_url, temp_dir};
 
@@ -32,6 +32,8 @@ const ADMIN: &str = "siwx-admin";
 const DID_ANN: &str = "did:key:zDnaeUKTWUXc1mxSoRrEfV6wPWmQyHrKuTHLZgAkyUKfSbeMB";
 const DID_BOB: &str = "did:key:z6MkmWziJJ2k3ckqVqnmMGVKefMhDSe4ZxrfvqksxDMGBa4v";
 const DID_CY: &str = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+/// The EIP-55 specification's own test vector: a wallet returns this spelling.
+const WALLET_ADDRESS: &str = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
 
 fn pem() -> String {
     use p256::pkcs8::{EncodePrivateKey, LineEnding};
@@ -102,7 +104,7 @@ async fn list_users(State(hs): State<Shared>) -> impl IntoResponse {
         .users
         .iter()
         .map(|(lp, gone)| {
-            json!({"name": format!("@{lp}:{SERVER}"), "user_type": null, "deactivated": u8::from(*gone)})
+            json!({"name": format!("@{lp}:{SERVER}"), "user_type": null, "deactivated": u8::from(*gone), "displayname": null})
         })
         .collect();
     Json(json!({"users": rows, "total": rows.len()}))
@@ -115,7 +117,7 @@ async fn get_field(State(hs): State<Shared>, Path(user): Path<String>) -> impl I
         Some(value) => (StatusCode::OK, Json(json!({ FIELD: value }))),
         None => (
             StatusCode::NOT_FOUND,
-            Json(json!({"errcode": "M_NOT_FOUND"})),
+            Json(json!({"errcode": "M_NOT_FOUND", "error": "Profile was not found"})),
         ),
     }
 }
@@ -329,6 +331,74 @@ async fn the_tool_remints_stale_bindings_once_and_prints_counts_only() {
         first_text.contains(&format!("signing kid: {}", current.kid())),
         "{first_text}"
     );
+
+    std::fs::remove_dir_all(&setup.dir).ok();
+    server.abort();
+}
+
+/// A legacy wallet account with no field at all: the real binary reads Synapse's own
+/// `404 M_NOT_FOUND`, takes the claim from the account name, and a dry run counts it as a
+/// binding it would create, naming no account and no DID.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_legacy_wallet_account_with_no_field_is_counted_as_created_from_its_name() {
+    if redis().await.is_none() {
+        return;
+    }
+    let (hs, synapse_url, server) = homeserver().await;
+    let issuer = format!("{synapse_url}/");
+    let current_pem = pem();
+    let current = EcdsaSigningKey::from_pem(&current_pem).unwrap();
+    let did = format!("did:pkh:eip155:1:{WALLET_ADDRESS}");
+    let legacy = legacy_localpart(&did);
+    {
+        let mut hs = hs.lock().unwrap();
+        hs.jwks = key_set(&[&current]);
+        // The service account is listed too, as in a real run; the wallet account has no field.
+        hs.users.insert(ADMIN.to_string(), false);
+        hs.users.insert(legacy.clone(), false);
+    }
+    let secret = random_secret(40);
+    let setup = Setup {
+        synapse_url,
+        base_url: issuer,
+        pem: Some(current_pem.clone()),
+        secret: secret.clone(),
+        dir: temp_dir("remint-cli-legacy"),
+    };
+
+    let dry = setup.run(Start::ByName, &["--delay-ms", "0"]);
+    let dry_text = text(&dry);
+
+    assert!(dry.status.success(), "{dry_text}");
+    assert!(dry_text.contains("DRY RUN"), "{dry_text}");
+    assert!(dry_text.contains("would_write: 1"), "{dry_text}");
+    assert!(
+        dry_text.contains("created_from_account_name: 1"),
+        "{dry_text}"
+    );
+    assert!(
+        dry_text.contains("created_from_display_name: 0"),
+        "{dry_text}"
+    );
+    assert_eq!(hs.lock().unwrap().puts, 0, "a dry run writes nothing");
+    // Counts only: not the account, the DID or the address it was derived from.
+    let mut sensitive: Vec<String> = vec![
+        legacy.clone(),
+        did.clone(),
+        WALLET_ADDRESS.to_string(),
+        WALLET_ADDRESS.to_lowercase(),
+        secret,
+        current_pem.lines().nth(1).unwrap_or("pem").to_string(),
+        SERVER.to_string(),
+    ];
+    sensitive.retain(|s| !s.is_empty());
+    for needle in &sensitive {
+        assert!(
+            !dry_text.contains(needle.as_str()),
+            "the output must not carry {}...: {dry_text}",
+            &needle[..needle.len().min(8)]
+        );
+    }
 
     std::fs::remove_dir_all(&setup.dir).ok();
     server.abort();

@@ -161,6 +161,24 @@ pub struct AdminUserRow {
     /// share this row (the orphan scan, the device reaper).
     #[serde(default, deserialize_with = "informational_flag")]
     pub locked: bool,
+    /// The display name, exactly as Synapse's `v2/users` list carries it (the profile's
+    /// `displayname`). User-editable text: read by the DID re-mint tool for an account that has
+    /// no `io.inblock.did` field, and only as a claim it then checks (see `remint.rs`). A row
+    /// without one, with a null, or with a value that is not a string reads as none, and never
+    /// fails the page for the callers that share this row.
+    #[serde(default, deserialize_with = "informational_string")]
+    pub displayname: Option<String>,
+}
+
+/// A string that never fails the row: anything else is `None`.
+fn informational_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(s) => Some(s),
+        _ => None,
+    })
 }
 
 /// A bool or a `0`/`1` flag that never fails the row: anything else is `false`.
@@ -1791,6 +1809,37 @@ impl SynapseClient {
         localpart: &str,
         server_name: &str,
     ) -> Result<Option<serde_json::Value>> {
+        self.fetch_did_value(localpart, server_name, UnsetField::AnyNotFound)
+            .await
+    }
+
+    /// [`read_did_value`](Self::read_did_value) for a caller that WRITES on "unset": a 404 is
+    /// "the field is unset" only when it is Synapse's own, a JSON body whose `errcode` is
+    /// `M_NOT_FOUND`. Any other 404 (a proxy's page with no JSON, `M_UNRECOGNIZED` from a
+    /// homeserver that does not know the route, any other `errcode`) says nothing about the
+    /// field and is an `Err`, like a 500: its state is unknown.
+    ///
+    /// The DID re-mint tool reads through this, because it creates a binding on `Ok(None)`.
+    /// Reading a 404 of a proxy as "unset" would make it rewrite an account that has a field,
+    /// on every run. `GET /resolve` (through `read_did_field`) keeps the lenient read: it only
+    /// reports, and "unattested" is the safe answer to a read that found nothing.
+    pub async fn read_did_value_strict(
+        &self,
+        localpart: &str,
+        server_name: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        self.fetch_did_value(localpart, server_name, UnsetField::SynapseNotFoundOnly)
+            .await
+    }
+
+    /// The one read behind [`read_did_value`](Self::read_did_value) and
+    /// [`read_did_value_strict`](Self::read_did_value_strict); `unset` is the only difference.
+    async fn fetch_did_value(
+        &self,
+        localpart: &str,
+        server_name: &str,
+        unset: UnsetField,
+    ) -> Result<Option<serde_json::Value>> {
         let user_id = matrix_user_id(localpart, server_name);
         // Percent-encoded path segment, for the same reason as the PUT twin:
         // `@` and `:` are sub-delims a bare interpolation would leave raw.
@@ -1873,7 +1922,27 @@ impl SynapseClient {
         };
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
+            match unset {
+                UnsetField::AnyNotFound => return Ok(None),
+                UnsetField::SynapseNotFoundOnly => {
+                    let body = resp.text().await.unwrap_or_default();
+                    if is_synapse_not_found(&body) {
+                        return Ok(None);
+                    }
+                    // The status and the errcode only: the body of a stranger's 404 is not
+                    // ours to log, and no account is named.
+                    let errcode = errcode_of(&body).unwrap_or_default();
+                    warn!(
+                        errcode = errcode.chars().take(64).collect::<String>(),
+                        "read_did_field: a 404 that is not Synapse's M_NOT_FOUND; the field \
+                         state is UNKNOWN, not unset"
+                    );
+                    anyhow::bail!(
+                        "read_did_field: HTTP 404 that is not Synapse's own M_NOT_FOUND, so the \
+                         field state is UNKNOWN, not unset."
+                    );
+                }
+            }
         }
         if !resp.status().is_success() {
             let status = resp.status();
@@ -1952,6 +2021,32 @@ impl SynapseClient {
             serde_json::from_str(&resp.body).context("room_state: invalid JSON")?;
         Ok(Some(body.state))
     }
+}
+
+/// What a 404 on the profile-field read means to the caller (see
+/// [`SynapseClient::read_did_value_strict`]).
+#[derive(Clone, Copy)]
+enum UnsetField {
+    /// Any 404 is "the field is unset": the read `GET /resolve` has always made.
+    AnyNotFound,
+    /// Only Synapse's own `M_NOT_FOUND` is "unset"; any other 404 is an unknown state.
+    SynapseNotFoundOnly,
+}
+
+/// The `errcode` of a JSON error body, when it has one as a string.
+fn errcode_of(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("errcode")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Whether a 404 body is Synapse's own "not found": JSON with `errcode` exactly
+/// `M_NOT_FOUND`. A body that is not JSON, has no string `errcode`, or has another one
+/// (`M_UNRECOGNIZED` for a route the homeserver does not know) is not.
+fn is_synapse_not_found(body: &str) -> bool {
+    errcode_of(body).as_deref() == Some("M_NOT_FOUND")
 }
 
 /// Extract the published DID from the value of the [`DID_PROFILE_FIELD`] member
@@ -2646,6 +2741,31 @@ mod tests {
         assert_eq!(flag(json!({"name": "@a:hs", "locked": "yes"})), Some(false));
     }
 
+    /// The display name feeds one tool as a claim: a string is kept as stored (no trim, no case
+    /// change), and a missing, null or odd value is none and never fails the row.
+    #[test]
+    fn a_user_row_reads_the_display_name_as_stored_and_never_fails_on_it() {
+        let name = |row: serde_json::Value| {
+            serde_json::from_value::<AdminUserRow>(row)
+                .map(|r| r.displayname)
+                .ok()
+        };
+        assert_eq!(
+            name(json!({"name": "@a:hs", "displayname": " Did:Key:zAb "})),
+            Some(Some(" Did:Key:zAb ".to_string()))
+        );
+        assert_eq!(
+            name(json!({"name": "@a:hs", "displayname": ""})),
+            Some(Some(String::new()))
+        );
+        assert_eq!(
+            name(json!({"name": "@a:hs", "displayname": null})),
+            Some(None)
+        );
+        assert_eq!(name(json!({"name": "@a:hs"})), Some(None));
+        assert_eq!(name(json!({"name": "@a:hs", "displayname": 7})), Some(None));
+    }
+
     /// The orphan scan asks only for typed accounts (`not_user_type=`); the plain list keeps
     /// its URL exactly.
     #[test]
@@ -3236,6 +3356,97 @@ mod tests {
             .await
             .expect_err("a 500 is an error");
         assert!(err.downcast_ref::<ProfileRateLimited>().is_none());
+        handle.abort();
+    }
+
+    // -- read_did_value_strict: which 404 is "the field is unset" --------------
+    //
+    // The re-mint tool creates a binding on `Ok(None)`, so for it only Synapse's own
+    // `M_NOT_FOUND` may read as unset. `GET /resolve` (`read_did_field`) only reports and keeps
+    // reading every 404 as unset; the second test pins that it did not move.
+
+    /// Bodies a 404 on the field route can carry, with whether each is Synapse's own
+    /// "field not set".
+    const NOT_FOUND_BODIES: &[(&str, bool)] = &[
+        (
+            r#"{"errcode":"M_NOT_FOUND","error":"Profile was not found"}"#,
+            true,
+        ),
+        ("", false),
+        ("<html><body><h1>404 Not Found</h1></body></html>", false),
+        (
+            r#"{"errcode":"M_UNRECOGNIZED","error":"Unrecognized request"}"#,
+            false,
+        ),
+        (r#"{"errcode":"M_UNKNOWN","error":"x"}"#, false),
+        (r#"{"errcode":"m_not_found"}"#, false),
+        (r#"{"errcode":7}"#, false),
+        ("{}", false),
+        ("[]", false),
+    ];
+
+    async fn client_answering_404(body: &str) -> (SynapseClient, tokio::task::JoinHandle<()>) {
+        let mut replies = MockReplies::new(axum::http::StatusCode::NOT_FOUND);
+        replies.reply_body = body.to_string();
+        let (client, _log, handle) = spawn_mock_synapse(replies).await;
+        (client, handle)
+    }
+
+    #[tokio::test]
+    async fn the_strict_read_takes_only_synapses_own_404_as_an_unset_field() {
+        for (body, is_unset) in NOT_FOUND_BODIES {
+            let (client, handle) = client_answering_404(body).await;
+            let read = client.read_did_value_strict("someone", "matrix.test").await;
+            handle.abort();
+            if *is_unset {
+                assert_eq!(read.unwrap(), None, "{body:?} is Synapse's own 404");
+            } else {
+                let err = read.expect_err(&format!("{body:?} says nothing about the field"));
+                assert!(err.downcast_ref::<ProfileRateLimited>().is_none());
+                assert!(
+                    err.to_string().contains("UNKNOWN, not unset"),
+                    "{body:?}: {err}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_lenient_reads_still_take_every_404_as_an_unset_field() {
+        for (body, _) in NOT_FOUND_BODIES {
+            let (client, handle) = client_answering_404(body).await;
+            let value = client.read_did_value("someone", "matrix.test").await;
+            let did = client.read_did_field("someone", "matrix.test").await;
+            handle.abort();
+            assert_eq!(value.unwrap(), None, "read_did_value, {body:?}");
+            assert_eq!(did.unwrap(), None, "read_did_field, {body:?}");
+        }
+    }
+
+    /// Only a 404 is judged by its body: the other answers are as for the lenient read.
+    #[tokio::test]
+    async fn the_strict_read_answers_a_500_and_a_429_as_the_lenient_read_does() {
+        let (client, _log, handle) = spawn_mock_synapse(MockReplies::new(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ))
+        .await;
+        let err = client
+            .read_did_value_strict("someone", "matrix.test")
+            .await
+            .expect_err("a 500 is an error");
+        assert!(
+            err.to_string().starts_with("read_did_field: HTTP 500"),
+            "{err}"
+        );
+        handle.abort();
+
+        let (client, _log, handle) =
+            spawn_mock_synapse(MockReplies::new(axum::http::StatusCode::TOO_MANY_REQUESTS)).await;
+        let err = client
+            .read_did_value_strict("someone", "matrix.test")
+            .await
+            .expect_err("a 429 is an error");
+        assert!(err.downcast_ref::<ProfileRateLimited>().is_some(), "typed");
         handle.abort();
     }
 

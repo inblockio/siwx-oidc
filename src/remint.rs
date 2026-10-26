@@ -46,6 +46,21 @@
 //! survives; the derivation is what is trusted. [`DidAuthority`] is the seam for a stronger
 //! source, should one exist.
 //!
+//! An account with NO `io.inblock.did` field has no profile claim, and gets one from the
+//! account itself, under the same confirmation and with no other trust path. First the account
+//! name: a legacy wallet account's localpart IS the DID (`did-pkh-eip155-<reference>-0x<hex>`),
+//! so the claim is read off it exactly and written with the EIP-55 checksum a wallet sign-in
+//! writes ([`account_name_claim`]). Else the display name, when it starts with `did:`: older
+//! sign-ins wrote the DID there as an alias ([`display_name_claim`]). The display name is never
+//! read for an account that has the field, and is read only when the account name gave no claim.
+//! Said plainly: the display name is user-editable text. For a hash-shaped account the
+//! derivation pins the DID exactly, so a claim that is not the account's DID is dropped
+//! whatever the name says. For a legacy `did:key` account the derivation pins it only up to
+//! letter case (the localpart folds case), so the worst case is a binding to a case variant of
+//! the DID that nobody holds: a share to it opens for nobody, and it never reaches another
+//! person. The counters `created_from_account_name` and `created_from_display_name` say how
+//! many bindings were created (or would be, in a dry run) from each.
+//!
 //! # Idempotent
 //!
 //! A binding is CURRENT when the profile's `did` equals the confirmed DID byte for byte and its
@@ -348,6 +363,67 @@ pub(crate) fn claims_of(value: &Value) -> Vec<String> {
     claims
 }
 
+/// Where the claim for an account with no published binding came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimSource {
+    /// The localpart of a legacy wallet account spells the DID ([`account_name_claim`]).
+    AccountName,
+    /// The display name an older sign-in wrote ([`display_name_claim`]).
+    DisplayName,
+}
+
+/// The DID a legacy wallet account's localpart spells, in the text a wallet sign-in writes.
+///
+/// A localpart that is exactly `did-pkh-eip155-<reference>-0x<40 lower-case hex digits>`
+/// ([`siwx_oidc::mxid::legacy_localpart`] of a `did:pkh:eip155` DID) is the DID with `:` turned
+/// into `-` and the address folded to lower case, so the DID is recoverable from it: the claim is
+/// `did:pkh:eip155:<reference>:0x<address>` with the address in its EIP-55 checksum encoding
+/// ([`aqua_auth::eip55_checksum`]), the spelling a wallet returns and the login page writes.
+/// `<reference>` is the chain reference, decimal digits.
+///
+/// Exact, or no claim: an upper-case digit, a wrong length, a non-hex digit, no `0x`, an extra
+/// segment, a reference that is not digits, or a hash-shaped localpart ([`siwx_oidc::mxid::localpart_for`]) all give
+/// `None`. The claim is still only a claim: [`DidAuthority::confirm`] decides.
+fn account_name_claim(localpart: &str) -> Option<String> {
+    let (reference, digits) = localpart.strip_prefix("did-pkh-eip155-")?.split_once('-')?;
+    if reference.is_empty() || !reference.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let digits = digits.strip_prefix("0x")?;
+    // Lower case only: `hex` also reads upper case, and an upper-case spelling is not a
+    // localpart this derivation can have produced.
+    if digits.len() != 40
+        || !digits
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    let mut address = [0u8; 20];
+    hex::decode_to_slice(digits, &mut address).ok()?;
+    Some(format!(
+        "did:pkh:eip155:{reference}:0x{}",
+        aqua_auth::eip55_checksum(&address)
+    ))
+}
+
+/// The claim a display name makes: the name as stored, byte for byte (no trim, no case
+/// change), when it starts with `did:`; otherwise none. Older sign-ins wrote the DID as the
+/// display name. It is user-editable text, so it is only ever a claim, see the module doc.
+fn display_name_claim(displayname: Option<&str>) -> Option<String> {
+    displayname
+        .filter(|name| name.starts_with("did:"))
+        .map(str::to_string)
+}
+
+/// The claim for an account whose `io.inblock.did` field is absent: the account name's, or
+/// else the display name's (only when the account name gave none).
+fn absent_field_claim(localpart: &str, displayname: Option<&str>) -> Option<(String, ClaimSource)> {
+    account_name_claim(localpart)
+        .map(|claim| (claim, ClaimSource::AccountName))
+        .or_else(|| display_name_claim(displayname).map(|claim| (claim, ClaimSource::DisplayName)))
+}
+
 fn same_issuer(a: &str, b: &str) -> bool {
     a.trim_end_matches('/') == b.trim_end_matches('/')
 }
@@ -443,6 +519,12 @@ pub(crate) struct Report {
     pub locked_seen: u64,
     pub would_write: u64,
     pub written: u64,
+    /// Bindings created for an account that had no field, written (or, in a dry run, that
+    /// would be) from the account name: a legacy wallet account's localpart spells its DID.
+    pub created_from_account_name: u64,
+    /// The same, from the display name an older sign-in wrote. Counts of `written` /
+    /// `would_write`, not of claims found.
+    pub created_from_display_name: u64,
     /// Waits for a rate-limited profile read (HTTP 429), over all accounts: why a run was
     /// slow. A count only; the wait ended in a success or in a `read_profile` failure.
     pub rate_limited_waits: u64,
@@ -462,6 +544,16 @@ impl Report {
 
     fn error(&mut self, class: ErrorClass) {
         *self.errors.entry(class).or_insert(0) += 1;
+    }
+
+    /// Count a binding that was written (or would be) for an account that had no field, by
+    /// where its claim came from. `None` is a binding that replaced a field that was there.
+    fn count_created(&mut self, source: Option<ClaimSource>) {
+        match source {
+            Some(ClaimSource::AccountName) => self.created_from_account_name += 1,
+            Some(ClaimSource::DisplayName) => self.created_from_display_name += 1,
+            None => {}
+        }
     }
 
     /// True when the run was clean: nothing failed and it ran to the end of the list or to
@@ -501,6 +593,14 @@ impl Report {
         } else {
             out.push_str(&format!("  would_write: {}\n", self.would_write));
         }
+        out.push_str(&format!(
+            "  created_from_account_name: {}\n",
+            self.created_from_account_name
+        ));
+        out.push_str(&format!(
+            "  created_from_display_name: {}\n",
+            self.created_from_display_name
+        ));
         out.push_str(&format!(
             "  rate_limited_waits: {}\n",
             self.rate_limited_waits
@@ -780,7 +880,11 @@ async fn read_published(
 ) -> Result<Option<Value>, ReadFailure> {
     let mut limited_in_a_row: u32 = 0;
     loop {
-        let err = match run.synapse.read_did_value(localpart, run.server_name).await {
+        let err = match run
+            .synapse
+            .read_did_value_strict(localpart, run.server_name)
+            .await
+        {
             Ok(published) => return Ok(published),
             Err(err) => err,
         };
@@ -855,7 +959,16 @@ async fn process(
             return Outcome::Failed;
         }
     };
-    let claims = published.as_ref().map(claims_of).unwrap_or_default();
+    // A field that is there is judged by what it claims. A field that is absent has nothing to
+    // claim, so the account itself is asked: its name, then its display name (module doc). The
+    // display name is never read for an account that has the field.
+    let (claims, created_from) = match &published {
+        Some(value) => (claims_of(value), None),
+        None => match absent_field_claim(localpart, row.displayname.as_deref()) {
+            Some((claim, source)) => (vec![claim], Some(source)),
+            None => (Vec::new(), None),
+        },
+    };
 
     let did = match run.authority.confirm(localpart, &claims).await {
         Ok(Confirmation::Bound(did)) => did,
@@ -892,6 +1005,7 @@ async fn process(
 
     if !run.apply {
         report.would_write += 1;
+        report.count_created(created_from);
         return Outcome::Counted;
     }
 
@@ -919,6 +1033,7 @@ async fn process(
     {
         Ok(PublishOutcome::Written) => {
             report.written += 1;
+            report.count_created(created_from);
             Outcome::Counted
         }
         Ok(PublishOutcome::RowLessAccount) => {
@@ -1159,6 +1274,8 @@ mod tests {
         deactivated: bool,
         locked: bool,
         user_type: Option<String>,
+        /// the display name the admin list carries for the account (`null` when none)
+        displayname: Option<String>,
     }
 
     #[derive(Default)]
@@ -1185,6 +1302,21 @@ mod tests {
         unreadable: std::collections::HashSet<String>,
         /// accounts whose field GET answers 429 (`rc_profile`) a number of times first
         rate_limited: HashMap<String, Limited>,
+        /// accounts whose field GET answers a 404 of this kind, whatever the profile holds
+        field_404: HashMap<String, Field404>,
+    }
+
+    /// The kinds of 404 the field GET can answer. Only [`Field404::NotFound`] is Synapse
+    /// saying "this field is not set"; the others are what a proxy or a homeserver that does
+    /// not know the route answers, for an account that may well have the field.
+    #[derive(Clone, Copy)]
+    enum Field404 {
+        /// Synapse's own answer for an unset field: `404 {"errcode":"M_NOT_FOUND",...}`
+        NotFound,
+        /// A reverse proxy's page: a 404 with no JSON at all
+        NotJson,
+        /// A homeserver that does not know the route: `404 {"errcode":"M_UNRECOGNIZED",...}`
+        Unrecognized,
     }
 
     /// A 429 on the field GET, answered `remaining` more times.
@@ -1240,6 +1372,7 @@ mod tests {
                     "user_type": u.user_type,
                     "deactivated": if u.deactivated { 1 } else { 0 },
                     "locked": if u.locked { 1 } else { 0 },
+                    "displayname": u.displayname,
                 })
             })
             .collect();
@@ -1272,6 +1405,26 @@ mod tests {
                 );
             }
             return reply;
+        }
+        if let Some(kind) = hs.field_404.get(&lp) {
+            return match kind {
+                Field404::NotFound => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"errcode": "M_NOT_FOUND", "error": "Profile was not found"})),
+                )
+                    .into_response(),
+                Field404::NotJson => (
+                    StatusCode::NOT_FOUND,
+                    [(axum::http::header::CONTENT_TYPE, "text/html")],
+                    "<html><body><h1>404 Not Found</h1></body></html>",
+                )
+                    .into_response(),
+                Field404::Unrecognized => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"errcode": "M_UNRECOGNIZED", "error": "Unrecognized request"})),
+                )
+                    .into_response(),
+            };
         }
         if hs.rowless.contains(&lp) || hs.unreadable.contains(&lp) {
             return (
@@ -1364,6 +1517,7 @@ mod tests {
                     deactivated: false,
                     locked: false,
                     user_type: Some("bot".into()),
+                    displayname: None,
                 },
             );
             let app = Router::new()
@@ -1399,6 +1553,17 @@ mod tests {
                 .insert(localpart.to_string(), UserRec::default());
         }
 
+        /// An account whose admin-list row carries this display name.
+        fn add_user_named(&self, localpart: &str, displayname: &str) {
+            self.hs.lock().unwrap().users.insert(
+                localpart.to_string(),
+                UserRec {
+                    displayname: Some(displayname.to_string()),
+                    ..UserRec::default()
+                },
+            );
+        }
+
         fn add_deactivated(&self, localpart: &str) {
             self.hs.lock().unwrap().users.insert(
                 localpart.to_string(),
@@ -1406,6 +1571,7 @@ mod tests {
                     deactivated: true,
                     locked: false,
                     user_type: None,
+                    displayname: None,
                 },
             );
         }
@@ -1417,6 +1583,7 @@ mod tests {
                     deactivated: false,
                     locked: true,
                     user_type: None,
+                    displayname: None,
                 },
             );
         }
@@ -1445,6 +1612,15 @@ mod tests {
                     retry_after_header,
                 },
             );
+        }
+
+        /// Make the field GET of this account answer this kind of 404, whatever it holds.
+        fn answer_field_404(&self, localpart: &str, kind: Field404) {
+            self.hs
+                .lock()
+                .unwrap()
+                .field_404
+                .insert(localpart.to_string(), kind);
         }
 
         fn profile_gets(&self) -> usize {
@@ -2642,6 +2818,628 @@ mod tests {
             "",
         ] {
             assert!(!in_sign_in_form(not_ok), "{not_ok}");
+        }
+    }
+
+    // -- An account with no field: the claim comes from the account itself -------------------
+
+    /// The localpart of the legacy wallet account of [`CHECKSUMMED_ADDRESS`] on chain 1.
+    fn legacy_pkh_localpart() -> String {
+        mxid::legacy_localpart(&pkh(CHECKSUMMED_ADDRESS))
+    }
+
+    /// The account name's claim: the text a wallet sign-in writes, from the localpart alone.
+    #[test]
+    fn the_account_name_of_a_legacy_wallet_account_claims_its_checksummed_did() {
+        let lp = legacy_pkh_localpart();
+        assert_eq!(
+            lp,
+            "did-pkh-eip155-1-0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed"
+        );
+        let claim = account_name_claim(&lp).expect("a legacy wallet localpart claims its DID");
+        assert_eq!(claim, pkh(CHECKSUMMED_ADDRESS), "the EIP-55 spelling");
+        assert!(in_sign_in_form(&claim), "a text a sign-in writes");
+        assert!(crate::resolve::binds_to_localpart(&claim, &lp));
+
+        // The chain reference is kept, whatever it is.
+        let other = format!("did:pkh:eip155:137:{CHECKSUMMED_ADDRESS}");
+        assert_eq!(
+            account_name_claim(&mxid::legacy_localpart(&other)),
+            Some(other)
+        );
+        assert_eq!(
+            account_name_claim(
+                "did-pkh-eip155-11155111-0xfb6916095ca1df60bb79ce92ce3ea74c37c5d359"
+            )
+            .as_deref(),
+            Some("did:pkh:eip155:11155111:0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359")
+        );
+    }
+
+    /// Exact or nothing: every other shape gives no claim.
+    #[test]
+    fn an_account_name_that_is_not_exactly_a_legacy_wallet_localpart_claims_nothing() {
+        let hashed = modern(DID_A);
+        let hashed_pkh = modern(&pkh(CHECKSUMMED_ADDRESS));
+        for not_a_claim in [
+            // an upper-case digit in the address (the localpart is lower case)
+            "did-pkh-eip155-1-0x5Aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
+            "did-pkh-eip155-1-0x5AAEB6053F3E94C9B9A09F33669435E7EF1BEAED",
+            // upper case elsewhere
+            "DID-pkh-eip155-1-0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
+            "did-pkh-EIP155-1-0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
+            "did-pkh-eip155-1-0X5aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
+            // wrong length
+            "did-pkh-eip155-1-0x5aaeb6053f3e94c9b9a09f33669435e7ef1beae",
+            "did-pkh-eip155-1-0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed0",
+            "did-pkh-eip155-1-0x",
+            // not hex
+            "did-pkh-eip155-1-0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaeg",
+            // no 0x
+            "did-pkh-eip155-1-5aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
+            "did-pkh-eip155-1-005aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
+            // extra segments, after, inside and before
+            "did-pkh-eip155-1-0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed-x",
+            "did-pkh-eip155-1-2-0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
+            "x-did-pkh-eip155-1-0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
+            // the reference is missing, empty or not digits
+            "did-pkh-eip155-0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
+            "did-pkh-eip155--0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
+            "did-pkh-eip155-a-0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
+            // another namespace or method
+            "did-pkh-solana-1-0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
+            "did-key-z6mkmwzijj2k3ckqvqnmmgvkefmhdse4zxrfvqksxdmgba4v",
+            // a hash-shaped localpart, a plain name, and nothing at all
+            &hashed,
+            &hashed_pkh,
+            "ann",
+            "",
+        ] {
+            assert_eq!(account_name_claim(not_a_claim), None, "{not_a_claim}");
+        }
+        // the shape those cases are variations of
+        assert!(
+            account_name_claim("did-pkh-eip155-1-0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed")
+                .is_some()
+        );
+    }
+
+    /// The display name's claim: the text as stored, only when it starts with `did:`.
+    #[test]
+    fn a_display_name_claims_itself_byte_for_byte_when_it_starts_with_did() {
+        for name in [
+            DID_A,
+            DID_C,
+            "did:key:z6Mk with a space ",
+            "did:",
+            "did:key:zAb\n",
+        ] {
+            assert_eq!(display_name_claim(Some(name)).as_deref(), Some(name));
+        }
+        for none in [
+            None,
+            Some(""),
+            Some("Ann Example"),
+            Some("did-key-z6mk"),
+            Some("Did:key:z6MkmWziJJ2k3ckqVqnmMGVKefMhDSe4ZxrfvqksxDMGBa4v"),
+            Some("DID:key:z6MkmWziJJ2k3ckqVqnmMGVKefMhDSe4ZxrfvqksxDMGBa4v"),
+            Some(" did:key:z6MkmWziJJ2k3ckqVqnmMGVKefMhDSe4ZxrfvqksxDMGBa4v"),
+            Some("my did:key:z6MkmWziJJ2k3ckqVqnmMGVKefMhDSe4ZxrfvqksxDMGBa4v"),
+        ] {
+            assert_eq!(display_name_claim(none), None, "{none:?}");
+        }
+    }
+
+    /// The display name is read only when the account name gave no claim.
+    #[test]
+    fn the_display_name_is_read_only_when_the_account_name_gave_no_claim() {
+        let lp = legacy_pkh_localpart();
+        assert_eq!(
+            absent_field_claim(&lp, Some(DID_B)),
+            Some((pkh(CHECKSUMMED_ADDRESS), ClaimSource::AccountName))
+        );
+        assert_eq!(
+            absent_field_claim(&lp, None),
+            Some((pkh(CHECKSUMMED_ADDRESS), ClaimSource::AccountName))
+        );
+        assert_eq!(
+            absent_field_claim("ann", Some(DID_B)),
+            Some((DID_B.to_string(), ClaimSource::DisplayName))
+        );
+        assert_eq!(absent_field_claim("ann", Some("Ann")), None);
+        assert_eq!(absent_field_claim("ann", None), None);
+    }
+
+    /// The claim the account name builds is confirmed by the real authority for the account it
+    /// was read from.
+    #[tokio::test]
+    async fn the_account_name_claim_is_confirmed_by_the_derivation() {
+        let fx = fixture!();
+        let lp = legacy_pkh_localpart();
+        fx.add_user(&lp);
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+        let claim = account_name_claim(&lp).unwrap();
+
+        let verdict = authority
+            .confirm(&lp, std::slice::from_ref(&claim))
+            .await
+            .unwrap();
+
+        assert_eq!(verdict, Confirmation::Bound(claim));
+    }
+
+    /// (a) A legacy wallet account with no field: the dry run counts it, `--apply` writes the
+    /// checksummed DID with a proof that verifies, and a rerun finds it current.
+    #[tokio::test]
+    async fn a_legacy_wallet_account_with_no_field_gets_its_checksummed_binding() {
+        let fx = fixture!();
+        let current = key();
+        let lp = legacy_pkh_localpart();
+        let did = pkh(CHECKSUMMED_ADDRESS);
+        fx.add_user(&lp);
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        let dry = go(&fx, &current, &authority, false).await;
+
+        assert_eq!(dry.would_write, 1, "{dry:?}");
+        assert_eq!(dry.created_from_account_name, 1);
+        assert_eq!(dry.created_from_display_name, 0);
+        assert_eq!(dry.written, 0);
+        assert!(fx.puts().is_empty(), "a dry run writes nothing");
+        let shown = dry.render(false);
+        assert!(shown.contains("  would_write: 1\n"), "{shown}");
+        assert!(
+            shown.contains("  created_from_account_name: 1\n"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("  created_from_display_name: 0\n"),
+            "{shown}"
+        );
+
+        let applied = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(applied.written, 1, "{applied:?}");
+        assert_eq!(applied.created_from_account_name, 1);
+        assert_eq!(applied.created_from_display_name, 0);
+        assert!(applied.is_clean(), "{applied:?}");
+        let shown = applied.render(true);
+        assert!(shown.contains("  written: 1\n"), "{shown}");
+        assert!(
+            shown.contains("  created_from_account_name: 1\n"),
+            "{shown}"
+        );
+        let stored = fx.profile(&lp).expect("the field was written");
+        assert_eq!(
+            stored["did"], did,
+            "the checksummed text, as a wallet writes it"
+        );
+        assert!(
+            binding_is_current(
+                &stored,
+                &current,
+                "https://auth.example.org/",
+                &did,
+                &mxid_of(&lp)
+            ),
+            "the proof verifies under the current key"
+        );
+        let claims = verify_own_proof(stored["proof"].as_str().unwrap(), &current).unwrap();
+        assert_eq!(claims.sub, did);
+        let writes = fx.puts().len();
+
+        let again = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(again.written, 0, "{again:?}");
+        assert_eq!(again.skipped_current, 1);
+        assert_eq!(again.created_from_account_name, 0);
+        assert_eq!(again.created_from_display_name, 0);
+        assert_eq!(fx.puts().len(), writes, "the rerun wrote nothing");
+    }
+
+    // -- Which 404 on the field read means "no field" ------------------------------------------
+
+    /// A legacy wallet account that HAS a (stale) field, whose field read answers `kind` of 404:
+    /// the case a wrong "unset" would rewrite on every run. The read fails; nothing is
+    /// counted as created, planned or written, and the field is as it was.
+    async fn a_404_that_is_not_synapses_own_fails_the_read(kind: Field404) {
+        let fx = fixture!();
+        let current = key();
+        let old = key();
+        let lp = legacy_pkh_localpart();
+        let did = pkh(CHECKSUMMED_ADDRESS);
+        fx.add_user(&lp);
+        let stale = mint_value(&old, &did, &mxid_of(&lp)).await;
+        fx.set_profile(&lp, stale.clone());
+        fx.answer_field_404(&lp, kind);
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        for apply in [false, true] {
+            let report = go(&fx, &current, &authority, apply).await;
+
+            assert_eq!(
+                report.errors.get(&ErrorClass::ReadProfile),
+                Some(&1),
+                "apply={apply}: {report:?}"
+            );
+            assert_eq!(report.error_count(), 1, "apply={apply}: {report:?}");
+            assert_eq!(report.would_write, 0, "apply={apply}: {report:?}");
+            assert_eq!(report.written, 0, "apply={apply}: {report:?}");
+            assert_eq!(report.created_from_account_name, 0, "apply={apply}");
+            assert_eq!(report.created_from_display_name, 0, "apply={apply}");
+            assert!(!report.is_clean(), "apply={apply}: {report:?}");
+        }
+        assert!(fx.puts().is_empty(), "no write was made");
+        assert_eq!(
+            fx.profile(&lp),
+            Some(stale),
+            "the account's field is untouched"
+        );
+    }
+
+    /// A reverse proxy's 404 page has no JSON: it says nothing about the field.
+    #[tokio::test]
+    async fn a_404_with_no_json_on_the_field_read_is_a_read_failure_and_creates_nothing() {
+        a_404_that_is_not_synapses_own_fails_the_read(Field404::NotJson).await;
+    }
+
+    /// A homeserver that does not know the route answers `M_UNRECOGNIZED`: not "field unset".
+    #[tokio::test]
+    async fn a_404_m_unrecognized_on_the_field_read_is_a_read_failure_and_creates_nothing() {
+        a_404_that_is_not_synapses_own_fails_the_read(Field404::Unrecognized).await;
+    }
+
+    /// Synapse's own `404 M_NOT_FOUND` is the one answer that means "the field is not set": the
+    /// binding is created and counted, and the write lands only with `--apply`.
+    #[tokio::test]
+    async fn a_404_m_not_found_on_the_field_read_is_an_unset_field_and_gets_its_binding() {
+        let fx = fixture!();
+        let current = key();
+        let lp = legacy_pkh_localpart();
+        fx.add_user(&lp);
+        fx.answer_field_404(&lp, Field404::NotFound);
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        let dry = go(&fx, &current, &authority, false).await;
+
+        assert_eq!(dry.would_write, 1, "{dry:?}");
+        assert_eq!(dry.created_from_account_name, 1, "{dry:?}");
+        assert_eq!(dry.error_count(), 0, "{dry:?}");
+        assert!(fx.puts().is_empty(), "a dry run writes nothing");
+
+        let applied = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(applied.written, 1, "{applied:?}");
+        assert_eq!(applied.created_from_account_name, 1, "{applied:?}");
+        assert!(applied.is_clean(), "{applied:?}");
+        assert_eq!(fx.puts().len(), 1);
+    }
+
+    /// (b) A legacy `did:key` account with no field, whose display name is exactly its DID.
+    #[tokio::test]
+    async fn a_legacy_did_key_account_with_its_did_as_display_name_gets_a_binding() {
+        let fx = fixture!();
+        let current = key();
+        let lp = mxid::legacy_localpart(DID_A);
+        fx.add_user_named(&lp, DID_A);
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        let dry = go(&fx, &current, &authority, false).await;
+
+        assert_eq!(dry.would_write, 1, "{dry:?}");
+        assert_eq!(dry.created_from_display_name, 1);
+        assert_eq!(dry.created_from_account_name, 0);
+        assert!(fx.puts().is_empty());
+
+        let applied = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(applied.written, 1, "{applied:?}");
+        assert_eq!(applied.created_from_display_name, 1);
+        assert_eq!(applied.created_from_account_name, 0);
+        let stored = fx.profile(&lp).expect("the field was written");
+        assert_eq!(stored["did"], DID_A, "the exact case of the DID");
+        assert!(binding_is_current(
+            &stored,
+            &current,
+            "https://auth.example.org/",
+            DID_A,
+            &mxid_of(&lp)
+        ));
+        let again = go(&fx, &current, &authority, true).await;
+        assert_eq!(again.written, 0, "{again:?}");
+        assert_eq!(again.skipped_current, 1);
+    }
+
+    /// A hash-shaped account takes the same route, and the derivation pins its DID exactly.
+    #[tokio::test]
+    async fn a_hash_shaped_account_with_its_did_as_display_name_gets_a_binding() {
+        let fx = fixture!();
+        let current = key();
+        let lp = modern(DID_B);
+        fx.add_user_named(&lp, DID_B);
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        let report = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(report.written, 1, "{report:?}");
+        assert_eq!(report.created_from_display_name, 1);
+        assert_eq!(fx.profile(&lp).unwrap()["did"], DID_B);
+    }
+
+    /// (c) A display name that is a DID, but not one that derives to this account: nothing is
+    /// signed, for a legacy account and a hash-shaped one alike.
+    #[tokio::test]
+    async fn a_display_name_that_does_not_derive_to_the_account_is_no_mapping() {
+        let fx = fixture!();
+        let current = key();
+        fx.add_user_named(&mxid::legacy_localpart(DID_A), DID_B);
+        fx.add_user_named(&modern(DID_A), DID_B);
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        let report = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(report.written, 0, "{report:?}");
+        assert_eq!(report.created_from_display_name, 0);
+        assert_eq!(
+            report.skipped_no_mapping, 3,
+            "both accounts and the admin one"
+        );
+        assert!(fx.puts().is_empty());
+    }
+
+    /// A display name that derives to the legacy account but is not DID text a sign-in writes
+    /// (a case change that breaks the key) is counted `skipped_not_canonical` and not signed.
+    #[tokio::test]
+    async fn a_display_name_in_a_form_no_sign_in_writes_is_not_signed() {
+        let fx = fixture!();
+        let current = key();
+        let lp = mxid::legacy_localpart(DID_B);
+        fx.add_user_named(
+            &lp,
+            "did:key:z6MKmWziJJ2k3ckqVqnmMGVKefMhDSe4ZxrfvqksxDMGBa4v",
+        );
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        let report = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(report.written, 0, "{report:?}");
+        assert_eq!(report.skipped_not_canonical, 1);
+        assert_eq!(report.created_from_display_name, 0);
+        assert!(fx.puts().is_empty());
+    }
+
+    /// (d) A display name that is not a DID makes no claim: no mapping. A name that only looks
+    /// like one (other case, a leading space, another prefix) makes none either.
+    #[tokio::test]
+    async fn a_display_name_that_is_not_a_did_is_no_mapping() {
+        let fx = fixture!();
+        let current = key();
+        let names = [
+            (mxid::legacy_localpart(DID_A), "Ann Example"),
+            (modern(DID_B), "did-key-z6mk"),
+            (
+                modern(DID_C),
+                " did:key:z6MkmWziJJ2k3ckqVqnmMGVKefMhDSe4ZxrfvqksxDMGBa4v",
+            ),
+            (
+                modern(DID_D),
+                "Did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+            ),
+        ];
+        for (account, name) in &names {
+            fx.add_user_named(account, name);
+        }
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        let report = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(report.written, 0, "{report:?}");
+        assert_eq!(
+            report.skipped_no_mapping, 5,
+            "four accounts and the admin one"
+        );
+        assert_eq!(report.created_from_display_name, 0);
+        assert!(fx.puts().is_empty());
+    }
+
+    /// (e) A legacy wallet account whose display name is another DID: the account name is the
+    /// claim, the display name is not read, and the outcome is never `Ambiguous`.
+    #[tokio::test]
+    async fn the_account_name_wins_over_a_display_name_that_names_another_did() {
+        let fx = fixture!();
+        let current = key();
+        let lp = legacy_pkh_localpart();
+        let did = pkh(CHECKSUMMED_ADDRESS);
+        fx.add_user_named(&lp, DID_B);
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        let report = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(report.written, 1, "{report:?}");
+        assert_eq!(report.skipped_ambiguous, 0);
+        assert_eq!(report.created_from_account_name, 1);
+        assert_eq!(report.created_from_display_name, 0);
+        let stored = fx.profile(&lp).unwrap();
+        assert_eq!(stored["did"], did);
+        assert!(!stored.to_string().contains(DID_B));
+    }
+
+    /// The same when the display name is the account's own DID in its lower-case spelling:
+    /// still the account name's checksummed claim, never two claims.
+    #[tokio::test]
+    async fn a_display_name_in_another_spelling_of_the_account_did_is_not_a_second_claim() {
+        let fx = fixture!();
+        let current = key();
+        let lp = legacy_pkh_localpart();
+        fx.add_user_named(&lp, &mxid::canonicalize(&pkh(CHECKSUMMED_ADDRESS)));
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        let report = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(report.written, 1, "{report:?}");
+        assert_eq!(report.skipped_ambiguous, 0);
+        assert_eq!(report.created_from_account_name, 1);
+        assert_eq!(fx.profile(&lp).unwrap()["did"], pkh(CHECKSUMMED_ADDRESS));
+    }
+
+    /// (f) A field that is present keeps today's behaviour: its claims decide, and the display
+    /// name is never read. The profile names somebody else and the display name names the DID
+    /// the account derives from: nothing is signed (today's outcome), the display name rescues
+    /// nothing.
+    #[tokio::test]
+    async fn a_display_name_is_ignored_for_an_account_that_has_the_field() {
+        let fx = fixture!();
+        let (old, current) = (key(), key());
+        let lp = mxid::legacy_localpart(DID_A);
+        fx.add_user_named(&lp, DID_A);
+        let tampered = mint_value(&old, DID_B, &mxid_of(&lp)).await;
+        fx.set_profile(&lp, tampered.clone());
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        let report = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(report.written, 0, "{report:?}");
+        assert_eq!(
+            report.skipped_no_mapping, 2,
+            "this account and the admin one"
+        );
+        assert_eq!(report.created_from_display_name, 0);
+        assert!(fx.puts().is_empty());
+        assert_eq!(fx.profile(&lp), Some(tampered), "left as it was");
+    }
+
+    /// (f) A field that is present is re-signed as before, and that is not a creation: the
+    /// counters stay at zero.
+    #[tokio::test]
+    async fn re_signing_an_existing_binding_is_not_counted_as_a_creation() {
+        let fx = fixture!();
+        let (old, current) = (key(), key());
+        let lp = legacy_pkh_localpart();
+        let did = pkh(CHECKSUMMED_ADDRESS);
+        fx.add_user_named(&lp, DID_B);
+        fx.set_profile(&lp, mint_value(&old, &did, &mxid_of(&lp)).await);
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        let dry = go(&fx, &current, &authority, false).await;
+        assert_eq!(dry.would_write, 1, "{dry:?}");
+        assert_eq!(dry.created_from_account_name, 0);
+        assert_eq!(dry.created_from_display_name, 0);
+
+        let report = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(report.written, 1, "{report:?}");
+        assert_eq!(report.created_from_account_name, 0);
+        assert_eq!(report.created_from_display_name, 0);
+        assert_eq!(fx.profile(&lp).unwrap()["did"], did);
+    }
+
+    /// A second account for a DID that already has its legacy account is not the one
+    /// siwx-oidc keeps: its display name (the DID) gets it nothing, and the legacy account
+    /// still gets its binding from its name.
+    #[tokio::test]
+    async fn a_second_account_for_a_did_gets_nothing_from_its_display_name() {
+        let fx = fixture!();
+        let current = key();
+        let legacy = mxid::legacy_localpart(DID_C);
+        let shadow = modern(DID_C);
+        fx.add_user(&legacy);
+        fx.add_user_named(&shadow, DID_C);
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        let report = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(report.written, 1, "{report:?}");
+        assert_eq!(report.created_from_account_name, 1);
+        assert_eq!(report.created_from_display_name, 0);
+        assert_eq!(report.skipped_not_canonical, 1, "the shadow account");
+        assert_eq!(fx.puts().len(), 1);
+        assert_eq!(fx.puts()[0].0, legacy);
+        assert!(fx.profile(&shadow).is_none());
+    }
+
+    /// An absent field and no profile row: the existing path, counted and no failure, and
+    /// nothing is created.
+    #[tokio::test]
+    async fn an_account_with_no_field_and_no_profile_row_is_still_left_for_its_next_sign_in() {
+        let fx = fixture!();
+        let current = key();
+        let lp = legacy_pkh_localpart();
+        fx.add_user(&lp);
+        fx.hs.lock().unwrap().rowless.insert(lp.clone());
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        let report = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(report.skipped_no_profile_row, 1, "{report:?}");
+        assert_eq!(report.written, 0);
+        assert_eq!(report.created_from_account_name, 0);
+        assert!(report.is_clean(), "{report:?}");
+        assert!(fx.puts().is_empty());
+    }
+
+    /// Counts only, with the new counters in the picture: a created binding names no account,
+    /// DID, display name or proof in the report or its Debug text.
+    #[tokio::test]
+    async fn the_report_of_a_creation_names_no_account_did_or_display_name() {
+        let fx = fixture!();
+        let current = key();
+        let by_name = legacy_pkh_localpart();
+        let by_display = mxid::legacy_localpart(DID_A);
+        fx.add_user(&by_name);
+        fx.add_user_named(&by_display, DID_A);
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        for apply in [false, true] {
+            let report = go(&fx, &current, &authority, apply).await;
+            let mut shown = report.render(apply);
+            shown.push_str(&format!("{report:?}"));
+            for secret in [
+                by_name.as_str(),
+                by_display.as_str(),
+                DID_A,
+                CHECKSUMMED_ADDRESS,
+                "5aaeb6053f3e",
+                SERVER,
+                "shared-secret",
+            ] {
+                assert!(
+                    !shown.contains(secret),
+                    "the report must not show {} (apply={apply}): {shown}",
+                    &secret[..secret.len().min(12)]
+                );
+            }
         }
     }
 

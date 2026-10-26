@@ -62,7 +62,7 @@ everything else exists only in the binary crate.
 | `db/tokens.rs` (lib) | Token formats (`mat_`, `msa_`, `mcr_{handle}_{secret}`), `parse_refresh_token` (never panics), `digest` (the SHA-256 every credential a client holds is stored as). |
 | `db/seal.rs` (lib) | The sealed successor pair: AES-256-GCM under a key HKDF-derived from the previous refresh token, so only its presenter can open it. |
 | `bin/migrate-credentials.rs` | Operator tool for the credential backfill. Dry run unless `--apply`. |
-| `remint.rs` | Operator tool `remint-did-assertions`: signs again, under the current key, the `io.inblock.did` bindings a key rotation left unverifiable. Dry run unless `--apply`, idempotent, counts-only output, `--limit` and `--delay-ms`. Lives in the binary crate because it needs `config`, `synapse_client` and `did_assertion`; the image links `siwx-oidc` under its name. The DID comes from `DidAuthority`, whose production form (`DerivationAuthority`) confirms a claim found in the profile only if siwx-oidc's own derivation binds it to exactly that account and the claim is DID text in the exact form a sign-in writes (`in_sign_in_form`). It refuses a signing key the server does not publish at `/jwk` (`check_key_is_published`) before it reads anything, so it runs after the new key is live. A 429 on its anonymous profile read (Synapse `rc_profile`) is waited out (`read_published`: the server's hint, at most 60 s, 1 s by default, 30 reads in a row before giving up) and counted as `rate_limited_waits`; the shared client only hands the 429 back typed (`ProfileRateLimited`), it never sleeps. `invoked_as_tool` is the dispatch decision `main` makes over `args_os`. |
+| `remint.rs` | Operator tool `remint-did-assertions`: signs again, under the current key, the `io.inblock.did` bindings a key rotation left unverifiable. Dry run unless `--apply`, idempotent, counts-only output, `--limit` and `--delay-ms`. Lives in the binary crate because it needs `config`, `synapse_client` and `did_assertion`; the image links `siwx-oidc` under its name. The DID comes from `DidAuthority`, whose production form (`DerivationAuthority`) confirms a claim found in the profile only if siwx-oidc's own derivation binds it to exactly that account and the claim is DID text in the exact form a sign-in writes (`in_sign_in_form`). An account with no field at all is given a claim from the account itself (`absent_field_claim`): its name when the localpart is exactly a legacy wallet one (`account_name_claim`, EIP-55 checksummed), else its display name when it starts with `did:` (`display_name_claim`, read from the admin user list row, never for an account that has the field), and the same confirmation decides; counted as `created_from_account_name` / `created_from_display_name`. The field read is `SynapseClient::read_did_value_strict`: only a 404 with JSON `errcode` `M_NOT_FOUND` is "no field"; any other 404 (no JSON, `M_UNRECOGNIZED`, another errcode) is a `read_profile` error and no write, while `read_did_value` / `read_did_field` (`GET /resolve`) keep reading every 404 as unset. It refuses a signing key the server does not publish at `/jwk` (`check_key_is_published`) before it reads anything, so it runs after the new key is live. A 429 on its anonymous profile read (Synapse `rc_profile`) is waited out (`read_published`: the server's hint, at most 60 s, 1 s by default, 30 reads in a row before giving up) and counted as `rate_limited_waits`; the shared client only hands the 429 back typed (`ProfileRateLimited`), it never sleeps. `invoked_as_tool` is the dispatch decision `main` makes over `args_os`. |
 | `bin/siwx-signer.rs` | The signer process for `signing_backend = socket`: `serve`, `self-test`, `keygen`, `kid`. Non-dumpable, prints no key bytes. |
 
 | `siwx-oidc-auth/src/` | Role |
@@ -416,7 +416,11 @@ doc; read it before changing the code the rule covers.
   an all-upper-case address that is not its own checksum and a mixed-case address with a wrong
   checksum are all refused. A `did:key` whose case was changed and still reads as a key cannot be
   told from the original without the retired public keys. Two different claims that both pass
-  are left alone.
+  are left alone. An account with NO field gets its claim from the account name (exactly
+  `did-pkh-eip155-<reference>-0x<40 lower-case hex>`, written with the EIP-55 checksum) or, only
+  when the name gave none, from its display name (as stored, when it starts with `did:`); the
+  display name is user-editable, so it is only a claim that the same `confirm` must pass, and it
+  is never read for an account that has the field.
   A binding is current only when the profile's `did`, the proof's `sub`, `mxid` and `iss`, and
   its `kid` and signature under the CURRENT key all match. **The tool's key must be the one the
   server publishes:** before any homeserver read it fetches `base_url` + `/jwk` (the URL the
@@ -443,9 +447,21 @@ doc; read it before changing the code the rule covers.
   `the_all_users_list_includes_deactivated_and_locked_accounts_and_no_guests`,
   `the_second_apply_writes_nothing`, `an_ephemeral_key_is_refused_before_anything_is_read_or_written`,
   `the_report_names_no_account_did_proof_or_token`,
+  `a_legacy_wallet_account_with_no_field_gets_its_checksummed_binding`,
+  `a_legacy_did_key_account_with_its_did_as_display_name_gets_a_binding`,
+  `a_display_name_that_does_not_derive_to_the_account_is_no_mapping`,
+  `the_account_name_wins_over_a_display_name_that_names_another_did`,
+  `a_display_name_is_ignored_for_an_account_that_has_the_field`,
+  `an_account_name_that_is_not_exactly_a_legacy_wallet_localpart_claims_nothing`,
+  `a_404_with_no_json_on_the_field_read_is_a_read_failure_and_creates_nothing`,
+  `a_404_m_unrecognized_on_the_field_read_is_a_read_failure_and_creates_nothing`,
+  `a_404_m_not_found_on_the_field_read_is_an_unset_field_and_gets_its_binding`,
+  `the_strict_read_takes_only_synapses_own_404_as_an_unset_field` and
+  `the_lenient_reads_still_take_every_404_as_an_unset_field` (in `synapse_client.rs`),
   `an_argument_that_is_not_utf8_chooses_the_server_and_does_not_panic`, and in
   `tests/remint_did_assertions_cli.rs`
   `the_tool_remints_stale_bindings_once_and_prints_counts_only`,
+  `a_legacy_wallet_account_with_no_field_is_counted_as_created_from_its_name`,
   `a_key_the_server_does_not_publish_is_refused_before_anything_is_read`,
   `the_server_starts_with_an_argument_that_is_not_utf8`.
 - **`synapse_client` stays out of `lib.rs`.** It depends on binary-only modules, and compiling it
