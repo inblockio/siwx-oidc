@@ -704,12 +704,20 @@ async fn process(
 
 /// Whether this process was started as the tool: under the name `remint-did-assertions`, or
 /// with it as the first argument. Returns the arguments that are the tool's own.
-pub(crate) fn invoked_as_tool(mut argv: impl Iterator<Item = String>) -> Option<Vec<String>> {
+///
+/// This is the one decision `main` makes before the server starts, so it must be total: it
+/// reads the arguments as bytes (`OsString`) and compares only the program name and the first
+/// argument, never converting the list to text. `std::env::args()` panics on an argument that
+/// is not UTF-8, which would have stopped a normal server start for one it never reads.
+pub(crate) fn invoked_as_tool(
+    argv: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Option<Vec<std::ffi::OsString>> {
+    let mut argv = argv.into_iter();
     let program = argv.next()?;
     let called_by_name = std::path::Path::new(&program)
         .file_name()
         .is_some_and(|name| name == TOOL_NAME);
-    let rest: Vec<String> = argv.collect();
+    let rest: Vec<std::ffi::OsString> = argv.collect();
     if called_by_name {
         return Some(rest);
     }
@@ -719,7 +727,18 @@ pub(crate) fn invoked_as_tool(mut argv: impl Iterator<Item = String>) -> Option<
     }
 }
 
-pub(crate) async fn cli_main(args: Vec<String>) -> ExitCode {
+pub(crate) async fn cli_main(args: Vec<std::ffi::OsString>) -> ExitCode {
+    // The tool takes no argument that is not text. Refused like any it does not know, and
+    // without showing it.
+    let Ok(args) = args
+        .into_iter()
+        .map(std::ffi::OsString::into_string)
+        .collect::<Result<Vec<String>, _>>()
+    else {
+        eprintln!("{TOOL_NAME}: an argument is not valid UTF-8");
+        eprintln!("{}", usage());
+        return ExitCode::from(2);
+    };
     let args = match parse_args(args) {
         Ok(Parsed::Run(args)) => args,
         Ok(Parsed::Help) => {
@@ -1986,6 +2005,94 @@ mod tests {
         ] {
             assert!(!in_sign_in_form(not_ok), "{not_ok}");
         }
+    }
+
+    // -- Which program this process is ------------------------------------------------------
+
+    fn os(parts: &[&[u8]]) -> Vec<std::ffi::OsString> {
+        use std::os::unix::ffi::OsStringExt;
+        parts
+            .iter()
+            .map(|p| std::ffi::OsString::from_vec(p.to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn no_arguments_choose_the_server() {
+        assert_eq!(invoked_as_tool(Vec::<std::ffi::OsString>::new()), None);
+        assert_eq!(invoked_as_tool(os(&[b"siwx-oidc"])), None);
+    }
+
+    #[test]
+    fn unrelated_arguments_choose_the_server() {
+        assert_eq!(invoked_as_tool(os(&[b"siwx-oidc", b"--help"])), None);
+        assert_eq!(
+            invoked_as_tool(os(&[b"/usr/local/bin/siwx-oidc", b"serve", b"remint"])),
+            None
+        );
+        // The name has to be the whole of it: not a prefix, a suffix or a longer path part.
+        assert_eq!(invoked_as_tool(os(&[b"remint-did-assertions-x"])), None);
+        assert_eq!(invoked_as_tool(os(&[b"x-remint-did-assertions"])), None);
+        assert_eq!(
+            invoked_as_tool(os(&[b"siwx-oidc", b"remint-did-assertions-x"])),
+            None
+        );
+    }
+
+    #[test]
+    fn an_argument_that_is_not_utf8_chooses_the_server_and_does_not_panic() {
+        assert_eq!(invoked_as_tool(os(&[b"siwx-oidc", b"--\xff\xfe"])), None);
+        assert_eq!(
+            invoked_as_tool(os(&[
+                b"siwx-oidc",
+                b"--ok",
+                b"\xff",
+                b"remint-did-assertions"
+            ])),
+            None,
+            "the tool's name is the first argument or nothing"
+        );
+        // A program name that is not text and is not the tool's name.
+        assert_eq!(invoked_as_tool(os(&[b"/opt/\xff/siwx-oidc", b"--x"])), None);
+    }
+
+    #[test]
+    fn the_program_name_remint_did_assertions_chooses_the_tool() {
+        assert_eq!(
+            invoked_as_tool(os(&[
+                b"remint-did-assertions",
+                b"--apply",
+                b"--limit",
+                b"3"
+            ])),
+            Some(os(&[b"--apply", b"--limit", b"3"]))
+        );
+        assert_eq!(
+            invoked_as_tool(os(&[b"/usr/local/bin/remint-did-assertions"])),
+            Some(Vec::new())
+        );
+        // A directory that is not text does not hide the basename.
+        assert_eq!(
+            invoked_as_tool(os(&[b"/opt/\xff/remint-did-assertions", b"--apply"])),
+            Some(os(&[b"--apply"]))
+        );
+    }
+
+    #[test]
+    fn the_first_argument_remint_did_assertions_chooses_the_tool() {
+        assert_eq!(
+            invoked_as_tool(os(&[b"siwx-oidc", b"remint-did-assertions", b"--apply"])),
+            Some(os(&[b"--apply"]))
+        );
+        assert_eq!(
+            invoked_as_tool(os(&[b"siwx-oidc", b"remint-did-assertions"])),
+            Some(Vec::new())
+        );
+        // What follows is the tool's, even if it is not text: the tool refuses it itself.
+        assert_eq!(
+            invoked_as_tool(os(&[b"siwx-oidc", b"remint-did-assertions", b"\xff"])),
+            Some(os(&[b"\xff"]))
+        );
     }
 
     // -- Pure pieces ----------------------------------------------------------------------

@@ -36,8 +36,10 @@ mod webauthn;
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     // `remint-did-assertions` is this binary under a second name (the image links it), or its
-    // first argument: it needs the server's own modules, which exist only in this crate.
-    if let Some(args) = remint::invoked_as_tool(std::env::args()) {
+    // first argument: it needs the server's own modules, which exist only in this crate. The
+    // arguments are read as bytes: `std::env::args()` panics on one that is not UTF-8, and the
+    // server, which reads none, must start whatever it is given.
+    if let Some(args) = remint::invoked_as_tool(std::env::args_os()) {
         return remint::cli_main(args).await;
     }
     axum_lib::main().await;

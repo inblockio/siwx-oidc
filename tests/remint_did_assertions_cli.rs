@@ -343,3 +343,95 @@ fn an_argument_it_does_not_know_is_refused_without_echoing_its_value() {
     assert!(!shown.contains(&value), "{shown}");
     std::fs::remove_dir_all(&setup.dir).ok();
 }
+
+// -- Starting the program: the arguments are read as bytes, never required to be text -----------
+
+/// A non-UTF-8 argument: valid on Linux, and `std::env::args()` panics on it.
+fn not_utf8() -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    std::ffi::OsString::from_vec(vec![b'-', b'-', 0xff, 0xfe])
+}
+
+/// The tool refuses such an argument as it refuses any it does not know: exit code 2, a fixed
+/// message, no value echoed, and no panic.
+#[test]
+fn the_tool_refuses_an_argument_that_is_not_utf8_without_panicking() {
+    let setup = Setup {
+        synapse_url: "http://127.0.0.1:1".to_string(),
+        pem: None,
+        secret: random_secret(40),
+        dir: temp_dir("remint-cli-not-utf8"),
+    };
+    let mut command = Command::new(env!("CARGO_BIN_EXE_siwx-oidc"));
+    command
+        .arg0("remint-did-assertions")
+        .arg(not_utf8())
+        .current_dir(&setup.dir)
+        .env_clear()
+        .stdin(Stdio::null());
+
+    let output = command.output().expect("spawn the tool");
+
+    let shown = text(&output);
+    assert_eq!(output.status.code(), Some(2), "{shown}");
+    assert!(!shown.contains("panicked"), "{shown}");
+    assert!(shown.contains("not valid UTF-8"), "{shown}");
+    std::fs::remove_dir_all(&setup.dir).ok();
+}
+
+/// The normal start must not change: an argument the server never looked at, even one that is
+/// not text, does not stop it. It is started the way `tests/graceful_shutdown.rs` starts it
+/// (port 0, a Redis address nothing listens on, nothing from the caller's environment) and
+/// must say where it listens.
+#[test]
+fn the_server_starts_with_an_argument_that_is_not_utf8() {
+    use std::io::{BufRead, BufReader};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (reader, writer) = std::io::pipe().expect("create the output pipe");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_siwx-oidc"))
+        .arg(not_utf8())
+        .env_clear()
+        .env("SIWXOIDC_ADDRESS", "127.0.0.1")
+        .env("SIWXOIDC_PORT", "0")
+        .env("SIWXOIDC_BASE_URL", "http://localhost")
+        .env("SIWXOIDC_REDIS_URL", "redis://127.0.0.1:1")
+        .env("RUST_LOG", "siwx_oidc=info")
+        .stdout(writer.try_clone().expect("share the pipe"))
+        .stderr(writer)
+        .spawn()
+        .expect("spawn the server");
+    let (sender, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(reader).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut printed = Vec::new();
+    let listening = loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match lines.recv_timeout(left) {
+            Ok(line) => {
+                let found = line.contains("Listening on ");
+                printed.push(line);
+                if found {
+                    break true;
+                }
+            }
+            Err(_) => break false,
+        }
+    };
+    child.kill().ok();
+    child.wait().ok();
+
+    assert!(
+        listening,
+        "the server did not start; output:\n{}",
+        printed.join("\n")
+    );
+}
