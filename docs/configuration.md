@@ -255,8 +255,8 @@ nothing. It refuses to run with an ephemeral signing key, before it reads or wri
 
 The output is counts only (`total`, `skipped_current`, `skipped_no_mapping`,
 `skipped_not_canonical`, `skipped_ambiguous`, `skipped_deactivated`, `skipped_no_profile_row`,
-`locked_seen`, `would_write` or `written`, errors by class): it names no account, DID, token or
-proof. `skipped_no_mapping` includes service accounts and accounts with no published DID, which
+`locked_seen`, `would_write` or `written`, `rate_limited_waits`, errors by class): it names no
+account, DID, token or proof. `skipped_no_mapping` includes service accounts and accounts with no published DID, which
 renew at their next sign-in. `skipped_not_canonical` counts an account that is not the one
 siwx-oidc keeps for its DID (a legacy account exists for it) and an account whose only claim
 is not DID text in one of the forms above. `locked_seen` is informational: the locked accounts
@@ -265,6 +265,19 @@ list otherwise leaves them out; they are signed like any other and also counted 
 outcome they came to. `--limit N` stops after N writes, for a staged first run;
 `--delay-ms N` (default 250) sets the pause after each write. The exit code is 0 for a clean
 run, 1 when any account failed or the run stopped early, 2 when it could not start.
+
+Synapse's `rc_profile` bounds how fast the tool can read. The profile read is anonymous, so
+Synapse limits it per client IP: by default a burst of 500 reads, then one per second. A run over
+N accounts beyond the burst therefore takes about N - 500 seconds, and the same holds for a dry
+run followed by `--apply`. When Synapse answers 429 the tool does not fail the account: it waits
+for the `retry_after_ms` in the body or the `Retry-After` header (at most 60 seconds per wait; 1
+second when the answer gives neither) and reads the same account again. An account is given up
+on, as a `read_profile` error, only after 30 reads in a row were all answered 429. A 429 that is
+followed by an answer is no error and does not count toward the ten failures in a row that stop
+a run. `rate_limited_waits` counts the waits, so a slow run shows why it was slow. Raising
+`rc_profile` on the homeserver for the run shortens it; the profile write is not rate limited by
+Synapse (checked on 1.163: its handler for the profile `PUT` of a custom field calls no rate
+limiter), so the write has no such wait.
 
 ### Sign-in methods
 

@@ -53,6 +53,18 @@
 //! valid) with `iss` the issuer, `sub` the confirmed DID and `mxid` this account. Current
 //! bindings are skipped, so a rerun after `--apply` writes nothing.
 //!
+//! # Rate limits
+//!
+//! The profile read is anonymous, and Synapse limits it per client IP (`rc_profile`, by default
+//! a burst of 500 and then one a second), so on a long list every account past the burst is
+//! answered 429. The tool waits out a 429 instead of failing the account (see `read_published`):
+//! the server's `retry_after_ms` or `Retry-After`, at most 60 seconds, one second when there is
+//! none, and the same read again; an account is given up on only after 30 reads in a row were
+//! all 429. The waits are counted (`rate_limited_waits`). The shared client does not wait,
+//! because the running service uses its read and a live request must not sleep; it only hands
+//! the 429 and its hint back (`ProfileRateLimited`). The write needs none of this: Synapse's
+//! handler for the profile `PUT` of a custom field calls no rate limiter (read on 1.163).
+//!
 //! # Output: counts only
 //!
 //! The report names no DID, no Matrix id, no token and no proof, and neither does any message
@@ -76,7 +88,9 @@ use siwx_oidc::signing::{EcdsaSigningKey, ProviderSigner};
 
 use crate::config::{self, Config, SigningBackend};
 use crate::did_assertion::{did_profile_value, unverified_subject, verify_own_proof};
-use crate::synapse_client::{matrix_user_id, AdminUserRow, PublishOutcome, SynapseClient};
+use crate::synapse_client::{
+    matrix_user_id, AdminUserRow, ProfileRateLimited, PublishOutcome, SynapseClient,
+};
 
 /// The name the tool is called by.
 pub(crate) const TOOL_NAME: &str = "remint-did-assertions";
@@ -88,6 +102,16 @@ const DEFAULT_DELAY_MS: u64 = 250;
 /// A run stops after this many failures in a row: a homeserver or a signer that is down fails
 /// every account the same way, and going on only repeats it.
 const MAX_CONSECUTIVE_ERRORS: u32 = 10;
+
+/// How long to wait when the homeserver rate-limits a profile read and gives no hint of its own.
+const RATE_LIMIT_DEFAULT_WAIT: Duration = Duration::from_secs(1);
+
+/// The longest single wait on a rate-limited profile read, whatever the homeserver asks for.
+const RATE_LIMIT_MAX_WAIT: Duration = Duration::from_secs(60);
+
+/// An account whose profile read is rate-limited this many times in a row is given up on and
+/// counted as a `read_profile` failure.
+const RATE_LIMITED_READS_BEFORE_GIVING_UP: u32 = 30;
 
 // -- Arguments --------------------------------------------------------------------------------
 
@@ -419,6 +443,9 @@ pub(crate) struct Report {
     pub locked_seen: u64,
     pub would_write: u64,
     pub written: u64,
+    /// Waits for a rate-limited profile read (HTTP 429), over all accounts: why a run was
+    /// slow. A count only; the wait ended in a success or in a `read_profile` failure.
+    pub rate_limited_waits: u64,
     pub errors: BTreeMap<ErrorClass, u64>,
     /// The run stopped at `--limit`, so `total` is not the whole list.
     pub limit_reached: bool,
@@ -474,6 +501,10 @@ impl Report {
         } else {
             out.push_str(&format!("  would_write: {}\n", self.would_write));
         }
+        out.push_str(&format!(
+            "  rate_limited_waits: {}\n",
+            self.rate_limited_waits
+        ));
         if self.errors.is_empty() {
             out.push_str("  errors: none\n");
         } else {
@@ -618,6 +649,23 @@ fn key_set_holds(keys: &[Value], signer: &dyn ProviderSigner) -> bool {
         })
 }
 
+/// How the tool waits out a rate-limited read: a seam, so a test records the waits instead of
+/// sitting through them, as `now` lets a test fix the clock.
+#[async_trait]
+pub(crate) trait Pause: Send + Sync {
+    async fn pause(&self, duration: Duration);
+}
+
+/// The real wait.
+pub(crate) struct SleepPause;
+
+#[async_trait]
+impl Pause for SleepPause {
+    async fn pause(&self, duration: Duration) {
+        tokio::time::sleep(duration).await;
+    }
+}
+
 pub(crate) struct Run<'a> {
     pub synapse: &'a SynapseClient,
     pub signer: &'a dyn ProviderSigner,
@@ -631,6 +679,8 @@ pub(crate) struct Run<'a> {
     pub delay: Duration,
     /// A fixed `iat`, for tests. `None` reads the clock at each mint, as a sign-in does.
     pub now: Option<i64>,
+    /// How a rate-limited profile read is waited out.
+    pub pause: &'a dyn Pause,
 }
 
 /// What one listed account came to.
@@ -700,6 +750,52 @@ pub(crate) async fn run(run: &Run<'_>) -> Result<Report, Refused> {
     Ok(report)
 }
 
+/// Why the profile field of an account could not be read.
+enum ReadFailure {
+    /// Every one of the allowed reads was answered 429.
+    RateLimited,
+    /// Any other failure; the text of it names the account, so it is not kept.
+    Other,
+}
+
+/// How long to wait after a 429 that carried this hint: the server's word, at most
+/// [`RATE_LIMIT_MAX_WAIT`], and [`RATE_LIMIT_DEFAULT_WAIT`] when it gave none.
+fn rate_limit_wait(hint: Option<Duration>) -> Duration {
+    hint.unwrap_or(RATE_LIMIT_DEFAULT_WAIT)
+        .min(RATE_LIMIT_MAX_WAIT)
+}
+
+/// Read the published field of one account, waiting out Synapse's `rc_profile` limit.
+///
+/// The read is anonymous, so Synapse limits it per client IP (burst 500, then one a second):
+/// on a long list every account past the burst is answered 429. Each 429 is waited out (see
+/// [`rate_limit_wait`]) and counted in `rate_limited_waits`, and the same read is tried again;
+/// a 429 that ends in an answer is no failure. After
+/// [`RATE_LIMITED_READS_BEFORE_GIVING_UP`] answers in a row that were all 429, the account is
+/// given up on. The shared client does not do this: a live request must not sleep.
+async fn read_published(
+    run: &Run<'_>,
+    localpart: &str,
+    report: &mut Report,
+) -> Result<Option<Value>, ReadFailure> {
+    let mut limited_in_a_row: u32 = 0;
+    loop {
+        let err = match run.synapse.read_did_value(localpart, run.server_name).await {
+            Ok(published) => return Ok(published),
+            Err(err) => err,
+        };
+        let Some(limited) = err.downcast_ref::<ProfileRateLimited>() else {
+            return Err(ReadFailure::Other);
+        };
+        limited_in_a_row += 1;
+        if limited_in_a_row >= RATE_LIMITED_READS_BEFORE_GIVING_UP {
+            return Err(ReadFailure::RateLimited);
+        }
+        report.rate_limited_waits += 1;
+        run.pause.pause(rate_limit_wait(limited.retry_after)).await;
+    }
+}
+
 /// One listed account: judge its binding and, with `--apply`, sign it again.
 async fn process(
     run: &Run<'_>,
@@ -734,9 +830,15 @@ async fn process(
         }
     };
 
-    let published = match run.synapse.read_did_value(localpart, run.server_name).await {
+    let published = match read_published(run, localpart, report).await {
         Ok(published) => published,
-        Err(_) => {
+        // Nothing but a 429 was ever answered: the profile-row probe below asks a route with
+        // the same limit, and no 500 is in play, so it would only add to the load.
+        Err(ReadFailure::RateLimited) => {
+            report.error(ErrorClass::ReadProfile);
+            return Outcome::Failed;
+        }
+        Err(ReadFailure::Other) => {
             // A 500 on this route is also what an account with no profile row answers
             // (element-hq/synapse#19702), and a sign-in cannot publish for it either. The
             // probe says "absent" only when it is sure; any doubt stays a failure.
@@ -1002,6 +1104,7 @@ async fn run_cli(args: &Args) -> Result<ExitCode> {
         limit: args.limit,
         delay: args.delay,
         now: None,
+        pause: &SleepPause,
     })
     .await
     .map_err(|refused| anyhow!(refused))?;
@@ -1080,6 +1183,17 @@ mod tests {
         rowless: std::collections::HashSet<String>,
         /// accounts whose field GET answers 500 although the profile row is there
         unreadable: std::collections::HashSet<String>,
+        /// accounts whose field GET answers 429 (`rc_profile`) a number of times first
+        rate_limited: HashMap<String, Limited>,
+    }
+
+    /// A 429 on the field GET, answered `remaining` more times.
+    struct Limited {
+        remaining: u32,
+        /// `retry_after_ms` in the body, as Synapse sends it
+        retry_after_ms: Option<u64>,
+        /// the `Retry-After` header, in seconds
+        retry_after_header: Option<&'static str>,
     }
 
     type Shared = Arc<Mutex<Hs>>;
@@ -1137,22 +1251,44 @@ mod tests {
         Json(body)
     }
 
-    async fn get_field(State(hs): State<Shared>, Path(user): Path<String>) -> impl IntoResponse {
+    async fn get_field(
+        State(hs): State<Shared>,
+        Path(user): Path<String>,
+    ) -> axum::response::Response {
         let mut hs = hs.lock().unwrap();
         hs.profile_gets += 1;
-        if hs.rowless.contains(&localpart_of(&user)) || hs.unreadable.contains(&localpart_of(&user))
-        {
+        let lp = localpart_of(&user);
+        if let Some(limit) = hs.rate_limited.get_mut(&lp).filter(|l| l.remaining > 0) {
+            limit.remaining -= 1;
+            let mut body = json!({"errcode": "M_LIMIT_EXCEEDED", "error": "Too Many Requests"});
+            if let Some(ms) = limit.retry_after_ms {
+                body["retry_after_ms"] = json!(ms);
+            }
+            let mut reply = (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+            if let Some(seconds) = limit.retry_after_header {
+                reply.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_static(seconds),
+                );
+            }
+            return reply;
+        }
+        if hs.rowless.contains(&lp) || hs.unreadable.contains(&lp) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"errcode": "M_UNKNOWN", "error": "Internal server error"})),
-            );
+            )
+                .into_response();
         }
-        match hs.profile.get(&localpart_of(&user)) {
-            Some(value) => (StatusCode::OK, Json(json!({ DID_PROFILE_FIELD: value }))),
+        match hs.profile.get(&lp) {
+            Some(value) => {
+                (StatusCode::OK, Json(json!({ DID_PROFILE_FIELD: value }))).into_response()
+            }
             None => (
                 StatusCode::NOT_FOUND,
                 Json(json!({"errcode": "M_NOT_FOUND", "error": "no such field"})),
-            ),
+            )
+                .into_response(),
         }
     }
 
@@ -1293,6 +1429,28 @@ mod tests {
                 .insert(localpart.to_string(), value);
         }
 
+        /// Make the field GET of this account answer 429 `times` times, then normally.
+        fn rate_limit(
+            &self,
+            localpart: &str,
+            times: u32,
+            retry_after_ms: Option<u64>,
+            retry_after_header: Option<&'static str>,
+        ) {
+            self.hs.lock().unwrap().rate_limited.insert(
+                localpart.to_string(),
+                Limited {
+                    remaining: times,
+                    retry_after_ms,
+                    retry_after_header,
+                },
+            );
+        }
+
+        fn profile_gets(&self) -> usize {
+            self.hs.lock().unwrap().profile_gets
+        }
+
         fn profile(&self, localpart: &str) -> Option<Value> {
             self.hs.lock().unwrap().profile.get(localpart).cloned()
         }
@@ -1358,6 +1516,47 @@ mod tests {
             limit,
             delay: Duration::ZERO,
             now: Some(IAT),
+            pause: &SleepPause,
+        })
+        .await
+        .expect("the run starts")
+    }
+
+    /// The waits a run asked for, recorded instead of slept.
+    #[derive(Default)]
+    struct RecordedPauses(Mutex<Vec<Duration>>);
+
+    impl RecordedPauses {
+        fn waits(&self) -> Vec<Duration> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Pause for RecordedPauses {
+        async fn pause(&self, duration: Duration) {
+            self.0.lock().unwrap().push(duration);
+        }
+    }
+
+    async fn go_paused(
+        fx: &Fixture,
+        signer: &dyn ProviderSigner,
+        authority: &dyn DidAuthority,
+        apply: bool,
+        pauses: &RecordedPauses,
+    ) -> Report {
+        super::run(&Run {
+            synapse: &fx.synapse,
+            signer,
+            authority,
+            issuer: "https://auth.example.org/",
+            server_name: SERVER,
+            apply,
+            limit: None,
+            delay: Duration::ZERO,
+            now: Some(IAT),
+            pause: pauses,
         })
         .await
         .expect("the run starts")
@@ -1609,6 +1808,174 @@ mod tests {
         assert!(fx.puts().is_empty());
     }
 
+    // -- A rate-limited profile read (Synapse `rc_profile`) is waited out, not failed -------
+
+    /// A stale binding to re-sign, for an account whose read will be rate limited.
+    async fn stale_account(fx: &Fixture, old: &EcdsaSigningKey, localpart: &str, did: &str) {
+        fx.add_user(localpart);
+        fx.set_profile(localpart, mint_value(old, did, &mxid_of(localpart)).await);
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_read_is_waited_out_and_the_account_is_written() {
+        let fx = fixture!();
+        let (old, current) = (key(), key());
+        stale_account(&fx, &old, "ann", DID_A).await;
+        fx.rate_limit("ann", 3, Some(40), None);
+        let store = StoreFake::of(&[("ann", DID_A)]);
+        let pauses = RecordedPauses::default();
+
+        let report = go_paused(&fx, &current, &store, true, &pauses).await;
+
+        assert_eq!(report.written, 1, "{report:?}");
+        assert_eq!(report.rate_limited_waits, 3, "{report:?}");
+        assert_eq!(report.error_count(), 0, "{report:?}");
+        assert!(report.is_clean());
+        assert_eq!(
+            pauses.waits(),
+            vec![Duration::from_millis(40); 3],
+            "it waited what the server asked, once per 429"
+        );
+        assert_eq!(fx.puts().len(), 1);
+        assert!(report.render(true).contains("  rate_limited_waits: 3\n"));
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_waits_out_a_rate_limited_read_too() {
+        let fx = fixture!();
+        let (old, current) = (key(), key());
+        stale_account(&fx, &old, "ann", DID_A).await;
+        fx.rate_limit("ann", 2, Some(10), None);
+        let store = StoreFake::of(&[("ann", DID_A)]);
+        let pauses = RecordedPauses::default();
+
+        let report = go_paused(&fx, &current, &store, false, &pauses).await;
+
+        assert_eq!(report.would_write, 1, "{report:?}");
+        assert_eq!(report.rate_limited_waits, 2, "{report:?}");
+        assert_eq!(report.error_count(), 0, "{report:?}");
+        assert!(fx.puts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn thirty_rate_limited_reads_in_a_row_give_up_on_that_account_only() {
+        let fx = fixture!();
+        let (old, current) = (key(), key());
+        stale_account(&fx, &old, "ann", DID_A).await;
+        stale_account(&fx, &old, "bob", DID_B).await;
+        fx.rate_limit("ann", 1000, Some(5), None);
+        let store = StoreFake::of(&[("ann", DID_A), ("bob", DID_B)]);
+        let pauses = RecordedPauses::default();
+
+        let report = go_paused(&fx, &current, &store, true, &pauses).await;
+
+        assert_eq!(
+            report.errors.get(&ErrorClass::ReadProfile),
+            Some(&1),
+            "one account given up on, one error: {report:?}"
+        );
+        assert_eq!(report.error_count(), 1, "{report:?}");
+        assert_eq!(
+            report.written, 1,
+            "the next account is still done: {report:?}"
+        );
+        assert_eq!(report.aborted, None);
+        assert_eq!(
+            report.rate_limited_waits, 29,
+            "it read 30 times and waited between them, not after the last"
+        );
+        assert_eq!(pauses.waits().len(), 29);
+        assert_eq!(
+            fx.profile_gets(),
+            30 + 1 + 1,
+            "ann 30 times, bob once, the admin once"
+        );
+    }
+
+    #[tokio::test]
+    async fn twenty_nine_rate_limited_reads_in_a_row_are_still_waited_out() {
+        let fx = fixture!();
+        let (old, current) = (key(), key());
+        stale_account(&fx, &old, "ann", DID_A).await;
+        fx.rate_limit("ann", 29, Some(1), None);
+        let store = StoreFake::of(&[("ann", DID_A)]);
+        let pauses = RecordedPauses::default();
+
+        let report = go_paused(&fx, &current, &store, true, &pauses).await;
+
+        assert_eq!(report.written, 1, "{report:?}");
+        assert_eq!(report.rate_limited_waits, 29, "{report:?}");
+        assert_eq!(report.error_count(), 0, "{report:?}");
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_header_alone_is_honoured() {
+        let fx = fixture!();
+        let (old, current) = (key(), key());
+        stale_account(&fx, &old, "ann", DID_A).await;
+        fx.rate_limit("ann", 2, None, Some("7"));
+        let store = StoreFake::of(&[("ann", DID_A)]);
+        let pauses = RecordedPauses::default();
+
+        let report = go_paused(&fx, &current, &store, true, &pauses).await;
+
+        assert_eq!(report.written, 1, "{report:?}");
+        assert_eq!(pauses.waits(), vec![Duration::from_secs(7); 2]);
+    }
+
+    #[tokio::test]
+    async fn a_wait_is_capped_and_defaults_to_one_second() {
+        let fx = fixture!();
+        let (old, current) = (key(), key());
+        stale_account(&fx, &old, "ann", DID_A).await;
+        stale_account(&fx, &old, "bob", DID_B).await;
+        // An hour asked for, and no hint at all.
+        fx.rate_limit("ann", 1, Some(3_600_000), None);
+        fx.rate_limit("bob", 1, None, None);
+        let store = StoreFake::of(&[("ann", DID_A), ("bob", DID_B)]);
+        let pauses = RecordedPauses::default();
+
+        let report = go_paused(&fx, &current, &store, true, &pauses).await;
+
+        assert_eq!(report.written, 2, "{report:?}");
+        assert_eq!(
+            pauses.waits(),
+            vec![Duration::from_secs(60), Duration::from_secs(1)],
+            "ann is listed before bob"
+        );
+    }
+
+    /// A 429 that ends in a success is not a failure, so it is not one of the ten in a row that
+    /// stop the run.
+    #[tokio::test]
+    async fn rate_limited_accounts_that_succeed_do_not_trip_the_failure_stop() {
+        let fx = fixture!();
+        let (old, current) = (key(), key());
+        let n = (MAX_CONSECUTIVE_ERRORS + 2) as usize;
+        let mut entries = Vec::new();
+        let dids: Vec<String> = (0..n).map(|i| format!("did:key:z6Mk{i:0>44}")).collect();
+        for (i, did) in dids.iter().enumerate() {
+            let lp = format!("u{i:02}");
+            stale_account(&fx, &old, &lp, did).await;
+            fx.rate_limit(&lp, 1, Some(1), None);
+            entries.push((lp, did.clone()));
+        }
+        let store = StoreFake::of(
+            &entries
+                .iter()
+                .map(|(lp, did)| (lp.as_str(), did.as_str()))
+                .collect::<Vec<_>>(),
+        );
+        let pauses = RecordedPauses::default();
+
+        let report = go_paused(&fx, &current, &store, false, &pauses).await;
+
+        assert_eq!(report.aborted, None, "{report:?}");
+        assert_eq!(report.rate_limited_waits, n as u64, "{report:?}");
+        assert_eq!(report.error_count(), 0, "{report:?}");
+        assert_eq!(report.would_write, n as u64, "{report:?}");
+    }
+
     #[tokio::test]
     async fn a_dry_run_writes_nothing() {
         let fx = fixture!();
@@ -1667,6 +2034,7 @@ mod tests {
             limit: None,
             delay: Duration::ZERO,
             now: Some(IAT),
+            pause: &SleepPause,
         })
         .await;
 
@@ -1858,6 +2226,7 @@ mod tests {
             limit: None,
             delay: Duration::ZERO,
             now: Some(IAT),
+            pause: &SleepPause,
         })
         .await
         .unwrap();
