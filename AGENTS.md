@@ -62,7 +62,7 @@ everything else exists only in the binary crate.
 | `db/tokens.rs` (lib) | Token formats (`mat_`, `msa_`, `mcr_{handle}_{secret}`), `parse_refresh_token` (never panics), `digest` (the SHA-256 every credential a client holds is stored as). |
 | `db/seal.rs` (lib) | The sealed successor pair: AES-256-GCM under a key HKDF-derived from the previous refresh token, so only its presenter can open it. |
 | `bin/migrate-credentials.rs` | Operator tool for the credential backfill. Dry run unless `--apply`. |
-| `remint.rs` | Operator tool `remint-did-assertions`: signs again, under the current key, the `io.inblock.did` bindings a key rotation left unverifiable. Dry run unless `--apply`, idempotent, counts-only output, `--limit` and `--delay-ms`. Lives in the binary crate because it needs `config`, `synapse_client` and `did_assertion`; the image links `siwx-oidc` under its name. The DID comes from `DidAuthority`, whose production form (`DerivationAuthority`) confirms a claim found in the profile only if siwx-oidc's own derivation binds it to exactly that account. |
+| `remint.rs` | Operator tool `remint-did-assertions`: signs again, under the current key, the `io.inblock.did` bindings a key rotation left unverifiable. Dry run unless `--apply`, idempotent, counts-only output, `--limit` and `--delay-ms`. Lives in the binary crate because it needs `config`, `synapse_client` and `did_assertion`; the image links `siwx-oidc` under its name. The DID comes from `DidAuthority`, whose production form (`DerivationAuthority`) confirms a claim found in the profile only if siwx-oidc's own derivation binds it to exactly that account and the claim is DID text in the exact form a sign-in writes (`in_sign_in_form`). It refuses a signing key the server does not publish at `/jwk` (`check_key_is_published`) before it reads anything, so it runs after the new key is live. `invoked_as_tool` is the dispatch decision `main` makes over `args_os`. |
 | `bin/siwx-signer.rs` | The signer process for `signing_backend = socket`: `serve`, `self-test`, `keygen`, `kid`. Non-dumpable, prints no key bytes. |
 
 | `siwx-oidc-auth/src/` | Role |
@@ -403,16 +403,42 @@ doc; read it before changing the code the rule covers.
   account, and never trusts the profile.** The `did` member and the `sub` of an old proof are
   claims; `DerivationAuthority` returns one only if it derives to the account's localpart and
   `resolve_identity` picks that localpart for it (a legacy account stays on its legacy
-  localpart, a second account for the same DID gets nothing). Two different claims that both
-  pass are left alone. A binding is current only when the profile's `did`, the proof's `sub`,
-  `mxid` and `iss`, and its `kid` and signature under the CURRENT key all match. It refuses an
-  ephemeral key before reading anything, never scans Redis, and prints counts only (no account,
-  DID, token or proof, and no per-account error text: the text of an HTTP error names the
-  account). Pin: `a_tampered_profile_cannot_make_the_tool_sign_a_did_the_account_is_not_derived_from`,
+  localpart, a second account for the same DID gets nothing). `legacy_localpart` folds case and
+  turns `:` into `-`, so the claim must also be DID text a sign-in writes: it parses through
+  `resolve::check_did` (the sign-in's parsers) and equals `mxid::canonicalize` of itself byte
+  for byte, else it is `skipped_non_canonical` and nothing is written (never a second parser or
+  a second canonical form). A mixed-case `did:pkh` (EIP-55) is therefore left to the next
+  sign-in; a `did:key` whose case was changed and still reads as a key cannot be told from the
+  original without the retired public keys. Two different claims that both pass are left alone.
+  A binding is current only when the profile's `did`, the proof's `sub`, `mxid` and `iss`, and
+  its `kid` and signature under the CURRENT key all match. **The tool's key must be the one the
+  server publishes:** before any homeserver read it fetches `base_url` + `/jwk` (the URL the
+  server derives for `jwks_uri`, no redirect followed) and exits 2 with a fixed message unless
+  that set holds a key with the signer's `kid` and the same public key (every entry with that
+  `kid` must be the key); so it runs after the new key is live, and `--apply` can never rewrite
+  bindings into ones nobody can verify. It lists locked accounts too (`locked=true`; `guests=true`
+  stays out, MAS delegation rejects it), processes them like any other and counts them in
+  `locked_seen`. It refuses an ephemeral key before reading anything, never scans Redis, and
+  prints counts only (no account, DID, token or proof, and no per-account error text: the text
+  of an HTTP error names the account). The dispatch in `main` (`invoked_as_tool`) reads
+  `args_os` and compares only the program name and the first argument, so a normal server start
+  cannot panic on an argument that is not UTF-8. Pin:
+  `a_tampered_profile_cannot_make_the_tool_sign_a_did_the_account_is_not_derived_from`,
   `only_the_canonical_account_of_a_did_is_signed`, `a_proof_with_the_wrong_mxid_is_reminted`,
+  `a_did_with_a_colon_turned_into_a_dash_is_not_signed`, `an_upper_case_did_pkh_is_not_signed`,
+  `a_mixed_case_did_pkh_is_not_canonical_and_waits_for_the_next_sign_in`,
+  `a_modern_canonical_did_pkh_is_still_signed`,
+  `a_key_set_without_the_signers_kid_is_refused`,
+  `a_key_set_with_the_signers_kid_but_another_public_key_is_refused`,
+  `a_locked_account_with_a_stale_binding_is_reminted`,
+  `the_all_users_list_includes_deactivated_and_locked_accounts_and_no_guests`,
   `the_second_apply_writes_nothing`, `an_ephemeral_key_is_refused_before_anything_is_read_or_written`,
-  `the_report_names_no_account_did_proof_or_token`, and in `tests/remint_did_assertions_cli.rs`
-  `the_tool_remints_stale_bindings_once_and_prints_counts_only`.
+  `the_report_names_no_account_did_proof_or_token`,
+  `an_argument_that_is_not_utf8_chooses_the_server_and_does_not_panic`, and in
+  `tests/remint_did_assertions_cli.rs`
+  `the_tool_remints_stale_bindings_once_and_prints_counts_only`,
+  `a_key_the_server_does_not_publish_is_refused_before_anything_is_read`,
+  `the_server_starts_with_an_argument_that_is_not_utf8`.
 - **`synapse_client` stays out of `lib.rs`.** It depends on binary-only modules, and compiling it
   into both crates produced two types with one name.
 

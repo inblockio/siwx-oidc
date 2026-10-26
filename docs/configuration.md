@@ -196,7 +196,8 @@ proof already written unverifiable for users who do not sign in again.
    old public key (append earlier retired keys; comments between blocks are allowed).
 4. Restart. The JWKS now lists both `kid`s; only the new key signs. Each user's proof is
    re-minted under the new key at their next sign-in, or at once by
-   [`remint-did-assertions`](#re-signing-the-bindings-after-a-rotation).
+   [`remint-did-assertions`](#re-signing-the-bindings-after-a-rotation), which you run once the
+   new key is live in `/jwk`.
 
 A **private** key in the retired list is a startup error, not a warning, and so is a malformed
 block. Keeping a rotated-out, possibly compromised private key in the environment is exactly
@@ -218,21 +219,45 @@ remint-did-assertions               # dry run: counts only, nothing is written
 remint-did-assertions --apply       # sign the stale bindings again
 ```
 
-It pages through the local accounts of the homeserver and, for each, reads the profile field
+**Run it after the new key is live in `/jwk`.** The tool's "current key" is whatever its own
+configuration loads, so before anything else it fetches the key set the server publishes (the
+`/jwk` URL under `base_url`, the one discovery names as `jwks_uri`) and refuses to go on unless
+that set holds a key with the signer's `kid` and the same public key. Otherwise `--apply` would
+rewrite every valid binding into one nobody can verify: the case of a stale environment, or of a
+run during a rotation before the restart that publishes the new key. The refusal comes before
+any read of the homeserver, in a dry run too, with exit code 2 and a fixed message that shows
+no `kid` or key. So `base_url` must be reachable from where the tool runs (a key set that
+cannot be read is refused as well, with its own fixed message), and a redirect is not followed.
+
+It pages through the local accounts of the homeserver, locked accounts included (they are
+processed like any other and only counted), and, for each, reads the profile field
 `io.inblock.did`. It signs a DID again only when siwx-oidc's own rules bind that DID to exactly
 this account: the DID the profile (or the old proof) names must derive to the account's
 localpart under the rule a sign-in uses (a legacy `did-pkh-…` account stays on its legacy
 localpart). The profile is a claim, never the authority, so a tampered profile or a forged old
-proof cannot make it sign a DID the account is not derived from. It then writes the value the
-way a sign-in does. A binding that already verifies under the current key, for that DID, that
+proof cannot make it sign a DID the account is not derived from. It signs only DID text in the
+exact form a sign-in writes: a claim must parse the way a sign-in parses it and equal its own
+canonical form (`mxid::canonicalize`) byte for byte. A legacy localpart folds case and turns `:`
+into `-`, so a claim such as `did:pkh:eip155:1-0x…` or `did:pkh:EIP155:1:0X…` would derive to a
+legacy account without being text any sign-in wrote; it is counted under `skipped_non_canonical`
+and nothing is written. That includes a `did:pkh` whose address is in mixed case (the EIP-55
+spelling): it is the same account, but not the canonical text, and renews at the holder's next
+sign-in. What it cannot rule out: a `did:key` or `did:peer` whose case was changed and that
+still reads as a valid key, because case is key material there and only the retired public keys
+could tell it from the original. It then writes the value the way a sign-in does. A binding that already verifies under the current key, for that DID, that
 account and this issuer, is left alone, so a rerun after `--apply` writes nothing. It refuses
 to run with an ephemeral signing key, before it reads or writes anything.
 
 The output is counts only (`total`, `skipped_current`, `skipped_no_mapping`,
 `skipped_not_canonical`, `skipped_ambiguous`, `skipped_deactivated`, `skipped_no_profile_row`,
-`would_write` or `written`, errors by class): it names no account, DID, token or proof.
-`skipped_no_mapping` includes service accounts and accounts with no published DID, which
-renew at their next sign-in. `--limit N` stops after N writes, for a staged first run;
+`locked_seen`, `would_write` or `written`, errors by class): it names no account, DID, token or
+proof. `skipped_no_mapping` includes service accounts and accounts with no published DID, which
+renew at their next sign-in. `skipped_not_canonical` counts an account that is not the one
+siwx-oidc keeps for its DID (a legacy account exists for it) and an account whose only claim
+is not DID text in the exact form above. `locked_seen` is informational: the locked accounts
+among those processed, which the tool asks Synapse to list (`locked=true`) because its user
+list otherwise leaves them out; they are signed like any other and also counted under the
+outcome they came to. `--limit N` stops after N writes, for a staged first run;
 `--delay-ms N` (default 250) sets the pause after each write. The exit code is 0 for a clean
 run, 1 when any account failed or the run stopped early, 2 when it could not start.
 

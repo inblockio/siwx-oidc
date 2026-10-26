@@ -22,7 +22,7 @@ probe → headless browser E2E (wallet + passkey).
 | File | What |
 |------|------|
 | `up.sh` / `down.sh` | Start/stop Redis + Synapse mock + siwx-oidc (podman) |
-| `synapse_mock.py` | Faithful in-memory mock of the Synapse endpoints siwx-oidc calls — both credential surfaces (see below) — with `/__seed_user`, `/__lock`, `/__seed_device`, `/__profile`, `/__state`, `/__set_secret`, `/__reject_admin_token`, `/__fail`, `/__reset` test hooks |
+| `synapse_mock.py` | Faithful in-memory mock of the Synapse endpoints siwx-oidc calls (both credential surfaces, see below) with `/__seed_user`, `/__lock`, `/__seed_device`, `/__profile`, `/__state`, `/__set_secret`, `/__reject_admin_token`, `/__fail`, `/__reset` test hooks |
 | `../tests/e2e_race_teardown.rs` | The race/teardown hazard register (H1..H14), the grandfathered-localpart invariant, and the attested-DID sign-in path. Run: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1` |
 | `../tests/e2e_account_management.rs` | Drives the exact HTTP requests the page JS makes — real EIP-191 wallet signatures, the account-session cookie, `/account/action`. Run: `cargo test --test e2e_account_management -- --ignored --test-threads=1` |
 | `../tests/e2e_client_lifetime.rs` | Static clients carry no TTL and still authorize; a dynamic client's next use restores its 30-day lifetime. Needs the static client `e2estatic` that `env.sh` and the CI job configure. Run: `cargo test --test e2e_client_lifetime -- --ignored --test-threads=1` |
