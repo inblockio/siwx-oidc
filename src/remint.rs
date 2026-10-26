@@ -464,12 +464,18 @@ impl Report {
 
 // -- The run ----------------------------------------------------------------------------------
 
-/// A run that did not start.
+/// A run that did not start. Every message is fixed text: none carries a kid, a key, a URL or
+/// anything the server said.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Refused {
     /// The signing key is ephemeral: no proof would be minted, and a profile would be
     /// rewritten without one.
     EphemeralKey,
+    /// The key set the server publishes could not be read.
+    KeySetUnreadable,
+    /// The key set the server publishes does not hold the key this tool would sign with (no
+    /// key with its `kid`, or one with that `kid` and another public key).
+    KeyNotPublished,
 }
 
 impl std::fmt::Display for Refused {
@@ -480,8 +486,100 @@ impl std::fmt::Display for Refused {
                  written would lose its proof. Set SIWXOIDC_SIGNING_KEY_PEM (or use the socket \
                  backend). Nothing was read or written.",
             ),
+            Refused::KeySetUnreadable => f.write_str(
+                "the key set the server publishes (/jwk under base_url) could not be read, so \
+                 it is not known whether the signing key is published. Check base_url and that \
+                 the server is reachable from here. Nothing was read or written.",
+            ),
+            Refused::KeyNotPublished => f.write_str(
+                "the signing key this tool loaded is not in the key set the server publishes \
+                 (/jwk under base_url): no key with its kid and the same public key. A binding \
+                 signed with it would verify nowhere. Run the tool after the new key is live in \
+                 /jwk, with the signing settings the server uses. Nothing was read or written.",
+            ),
         }
     }
+}
+
+/// How long the tool waits for the server's key set.
+const KEY_SET_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The most of a key set the tool reads. A set of a few keys is under a kilobyte.
+const KEY_SET_MAX_BYTES: usize = 256 * 1024;
+
+/// Refuse unless the key set the server publishes at `jwks_url` holds the key this tool would
+/// sign with: a key with the signer's `kid` AND the same public key.
+///
+/// A binding is worth something only if a consumer can verify it against `/jwk`. The tool's
+/// "current key" is whatever its own configuration loads, so with a stale environment, or a run
+/// during a rotation before the new key is live, `--apply` would rewrite every valid binding
+/// into one nobody can verify. The `kid` is derived from the public key, but a set is trusted
+/// by key, never by name: a set that names this `kid` for another key is refused too. Every
+/// entry that carries the `kid` must be the signer's key; there must be at least one.
+///
+/// Nothing the server said is returned or shown: a failure is one of two fixed refusals.
+pub(crate) async fn check_key_is_published(
+    jwks_url: &str,
+    signer: &dyn ProviderSigner,
+) -> Result<(), Refused> {
+    let set = fetch_key_set(jwks_url)
+        .await
+        .ok_or(Refused::KeySetUnreadable)?;
+    let keys = set
+        .get("keys")
+        .and_then(Value::as_array)
+        .ok_or(Refused::KeySetUnreadable)?;
+    if key_set_holds(keys, signer) {
+        Ok(())
+    } else {
+        Err(Refused::KeyNotPublished)
+    }
+}
+
+/// `GET jwks_url`: a 2xx JSON body of bounded size, no redirect followed (the URL is the one
+/// the server derives for itself, and a redirect would let another host answer for it).
+async fn fetch_key_set(jwks_url: &str) -> Option<Value> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(KEY_SET_TIMEOUT)
+        .build()
+        .ok()?;
+    let mut response = client.get(jwks_url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        body.extend_from_slice(&chunk);
+        if body.len() > KEY_SET_MAX_BYTES {
+            return None;
+        }
+    }
+    serde_json::from_slice(&body).ok()
+}
+
+/// The members that make a public key: its type, curve and point.
+const KEY_MEMBERS: [&str; 4] = ["kty", "crv", "x", "y"];
+
+fn key_set_holds(keys: &[Value], signer: &dyn ProviderSigner) -> bool {
+    // The JWK the server itself publishes for this signer: the one function builds it.
+    let Ok(ours) = serde_json::to_value(signer.verification_jwk()) else {
+        return false;
+    };
+    let member = |key: &Value, name: &str| key.get(name).and_then(Value::as_str).map(str::to_owned);
+    if KEY_MEMBERS.iter().any(|name| member(&ours, name).is_none()) {
+        return false;
+    }
+    let named: Vec<&Value> = keys
+        .iter()
+        .filter(|key| member(key, "kid").as_deref() == Some(signer.kid()))
+        .collect();
+    !named.is_empty()
+        && named.iter().all(|key| {
+            KEY_MEMBERS
+                .iter()
+                .all(|name| member(key, name) == member(&ours, name))
+        })
 }
 
 pub(crate) struct Run<'a> {
@@ -823,6 +921,16 @@ async fn run_cli(args: &Args) -> Result<ExitCode> {
         return Err(anyhow!(Refused::EphemeralKey));
     }
 
+    // Before anything is read: the key must be the one the server publishes, at the URL the
+    // server derives for its own `jwks_uri`.
+    let jwks_url = config
+        .base_url
+        .join(crate::oidc::JWK_PATH)
+        .map_err(|_| anyhow!("base_url cannot be joined with the key set path"))?;
+    check_key_is_published(jwks_url.as_str(), signer.as_ref())
+        .await
+        .map_err(|refused| anyhow!(refused))?;
+
     // The same Redis, token store and admin mint the server uses to talk to Synapse.
     let redis = RedisClient::new(&config.redis_url)
         .await
@@ -846,7 +954,7 @@ async fn run_cli(args: &Args) -> Result<ExitCode> {
         }
     );
     println!("  issuer: {}", siwx_oidc::redact::redact_url(issuer));
-    println!("  signing kid: {}", signer.kid());
+    println!("  signing kid: {} (published at /jwk)", signer.kid());
 
     let report = run(&Run {
         synapse: &synapse,
@@ -2004,6 +2112,145 @@ mod tests {
             "",
         ] {
             assert!(!in_sign_in_form(not_ok), "{not_ok}");
+        }
+    }
+
+    // -- The signing key must be the one the server publishes -------------------------------
+
+    /// A server that answers `GET /jwk` with `body` and `status`, and counts what it was
+    /// asked.
+    async fn spawn_key_set(
+        body: Value,
+        status: StatusCode,
+    ) -> (String, Arc<Mutex<usize>>, tokio::task::JoinHandle<()>) {
+        let asked = Arc::new(Mutex::new(0usize));
+        let counter = asked.clone();
+        let app = Router::new().route(
+            "/jwk",
+            get(move || {
+                let body = body.clone();
+                let counter = counter.clone();
+                async move {
+                    *counter.lock().unwrap() += 1;
+                    (status, Json(body))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/jwk", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (url, asked, handle)
+    }
+
+    fn key_set_of(keys: &[&dyn ProviderSigner]) -> Value {
+        json!({"keys": keys.iter().map(|k| serde_json::to_value(k.verification_jwk()).unwrap()).collect::<Vec<_>>()})
+    }
+
+    #[tokio::test]
+    async fn a_key_set_that_holds_the_signers_key_passes() {
+        let current = key();
+        let (url, asked, server) = spawn_key_set(key_set_of(&[&current]), StatusCode::OK).await;
+
+        assert_eq!(check_key_is_published(&url, &current).await, Ok(()));
+
+        assert_eq!(*asked.lock().unwrap(), 1);
+        server.abort();
+    }
+
+    /// Retired keys that are still published sit beside the live one.
+    #[tokio::test]
+    async fn other_keys_beside_the_signers_key_do_not_matter() {
+        let (current, retired) = (key(), key());
+        let (url, _, server) =
+            spawn_key_set(key_set_of(&[&retired, &current]), StatusCode::OK).await;
+
+        assert_eq!(check_key_is_published(&url, &current).await, Ok(()));
+        server.abort();
+    }
+
+    /// A stale environment, or a run during a rotation before the new key is live: the key the
+    /// tool loaded is not in the set.
+    #[tokio::test]
+    async fn a_key_set_without_the_signers_kid_is_refused() {
+        let (current, published) = (key(), key());
+        assert_ne!(current.kid(), published.kid());
+        let (url, _, server) = spawn_key_set(key_set_of(&[&published]), StatusCode::OK).await;
+
+        assert_eq!(
+            check_key_is_published(&url, &current).await,
+            Err(Refused::KeyNotPublished)
+        );
+        server.abort();
+    }
+
+    /// The `kid` is derived from the public key, so a set that names this `kid` for another
+    /// key is not this server's set (or is a forged one): refused, not trusted by name.
+    #[tokio::test]
+    async fn a_key_set_with_the_signers_kid_but_another_public_key_is_refused() {
+        let (current, other) = (key(), key());
+        let mut set = key_set_of(&[&other]);
+        set["keys"][0]["kid"] = json!(current.kid());
+        let (url, _, server) = spawn_key_set(set, StatusCode::OK).await;
+
+        assert_eq!(
+            check_key_is_published(&url, &current).await,
+            Err(Refused::KeyNotPublished)
+        );
+        server.abort();
+    }
+
+    /// Two entries with one `kid` are not a set to pick from: every entry that carries the
+    /// `kid` must be the signer's key.
+    #[tokio::test]
+    async fn a_second_key_under_the_signers_kid_makes_the_set_unusable() {
+        let (current, other) = (key(), key());
+        let mut set = key_set_of(&[&current, &other]);
+        set["keys"][1]["kid"] = json!(current.kid());
+        let (url, _, server) = spawn_key_set(set, StatusCode::OK).await;
+
+        assert_eq!(
+            check_key_is_published(&url, &current).await,
+            Err(Refused::KeyNotPublished)
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_key_set_that_cannot_be_read_is_refused() {
+        let current = key();
+        // Not found, not a key set, and a server that is not there.
+        for (body, status) in [
+            (json!({"errcode": "M_NOT_FOUND"}), StatusCode::NOT_FOUND),
+            (json!({"keys": []}), StatusCode::INTERNAL_SERVER_ERROR),
+            (json!("<html>"), StatusCode::OK),
+            (json!({"keys": "no"}), StatusCode::OK),
+            (json!({}), StatusCode::OK),
+        ] {
+            let (url, _, server) = spawn_key_set(body.clone(), status).await;
+            assert_eq!(
+                check_key_is_published(&url, &current).await,
+                Err(Refused::KeySetUnreadable),
+                "{status} {body}"
+            );
+            server.abort();
+        }
+        assert_eq!(
+            check_key_is_published("http://127.0.0.1:1/jwk", &current).await,
+            Err(Refused::KeySetUnreadable)
+        );
+    }
+
+    /// The messages are fixed text: not a kid, a key or a URL in any of them.
+    #[test]
+    fn a_refusal_names_no_kid_key_or_url() {
+        let current = key();
+        for refused in [Refused::KeyNotPublished, Refused::KeySetUnreadable] {
+            let shown = refused.to_string();
+            assert!(!shown.contains(current.kid()), "{shown}");
+            assert!(!shown.contains("http"), "{shown}");
+            assert!(shown.contains("Nothing was read or written"), "{shown}");
         }
     }
 

@@ -25,7 +25,8 @@ use siwx_oidc::signing::EcdsaSigningKey;
 use siwx_oidc::test_support::{random_secret, redis, redis_url, temp_dir};
 
 const SERVER: &str = "hs.example.org";
-const ISSUER: &str = "https://auth.example.org/";
+/// For the cases that never reach the key-set check; a run that does uses the fake's own URL.
+const UNUSED_ISSUER: &str = "https://auth.example.org/";
 const FIELD: &str = "io.inblock.did";
 const ADMIN: &str = "siwx-admin";
 const DID_ANN: &str = "did:key:zDnaeUKTWUXc1mxSoRrEfV6wPWmQyHrKuTHLZgAkyUKfSbeMB";
@@ -40,11 +41,17 @@ fn pem() -> String {
         .to_string()
 }
 
+/// The key set a server publishes for these keys.
+fn key_set(keys: &[&EcdsaSigningKey]) -> Value {
+    use siwx_oidc::signing::ProviderSigner;
+    json!({"keys": keys.iter().map(|k| serde_json::to_value(k.verification_jwk()).unwrap()).collect::<Vec<_>>()})
+}
+
 /// A proof as the server's minter writes it, built here from the public wire format so the
 /// test does not call the code under test to prepare its input.
-fn proof(key: &EcdsaSigningKey, did: &str, mxid: &str) -> String {
+fn proof(key: &EcdsaSigningKey, issuer: &str, did: &str, mxid: &str) -> String {
     let header = json!({"alg": "ES256", "typ": "JWT", "kid": key.kid()});
-    let claims = json!({"iss": ISSUER, "sub": did, "mxid": mxid, "iat": 1_700_000_000});
+    let claims = json!({"iss": issuer, "sub": did, "mxid": mxid, "iat": 1_700_000_000});
     let input = format!(
         "{}.{}",
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap()),
@@ -63,6 +70,12 @@ struct Hs {
     profile: HashMap<String, Value>,
     puts: usize,
     list_requests: usize,
+    /// Every request to a homeserver route (the user list, the profile field, the MAS probe):
+    /// what "nothing was read" counts.
+    reads: usize,
+    /// What `GET /jwk` answers: the server's own key set.
+    jwks: Value,
+    jwks_requests: usize,
 }
 
 type Shared = Arc<Mutex<Hs>>;
@@ -75,9 +88,16 @@ fn localpart_of(user: &str) -> String {
         .to_string()
 }
 
+async fn jwk(State(hs): State<Shared>) -> impl IntoResponse {
+    let mut hs = hs.lock().unwrap();
+    hs.jwks_requests += 1;
+    Json(hs.jwks.clone())
+}
+
 async fn list_users(State(hs): State<Shared>) -> impl IntoResponse {
     let mut hs = hs.lock().unwrap();
     hs.list_requests += 1;
+    hs.reads += 1;
     let rows: Vec<Value> = hs
         .users
         .iter()
@@ -89,7 +109,9 @@ async fn list_users(State(hs): State<Shared>) -> impl IntoResponse {
 }
 
 async fn get_field(State(hs): State<Shared>, Path(user): Path<String>) -> impl IntoResponse {
-    match hs.lock().unwrap().profile.get(&localpart_of(&user)) {
+    let mut hs = hs.lock().unwrap();
+    hs.reads += 1;
+    match hs.profile.get(&localpart_of(&user)) {
         Some(value) => (StatusCode::OK, Json(json!({ FIELD: value }))),
         None => (
             StatusCode::NOT_FOUND,
@@ -104,6 +126,7 @@ async fn put_field(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let mut hs = hs.lock().unwrap();
+    hs.reads += 1;
     hs.puts += 1;
     hs.profile.insert(
         localpart_of(&user),
@@ -117,6 +140,7 @@ async fn probe(
     Query(q): Query<HashMap<String, String>>,
 ) -> axum::response::Response {
     let lp = q.get("localpart").cloned().unwrap_or_default();
+    hs.lock().unwrap().reads += 1;
     if hs.lock().unwrap().users.contains_key(&lp) {
         (
             StatusCode::BAD_REQUEST,
@@ -131,6 +155,7 @@ async fn probe(
 async fn homeserver() -> (Shared, String, tokio::task::JoinHandle<()>) {
     let hs: Shared = Arc::new(Mutex::new(Hs::default()));
     let app = Router::new()
+        .route("/jwk", get(jwk))
         .route("/_synapse/admin/v2/users", get(list_users))
         .route("/_synapse/mas/is_localpart_available", get(probe))
         .route(
@@ -157,6 +182,8 @@ enum Start {
 
 struct Setup {
     synapse_url: String,
+    /// `base_url`, the issuer: the fake's own address when the run must find its key set.
+    base_url: String,
     pem: Option<String>,
     secret: String,
     dir: std::path::PathBuf,
@@ -177,7 +204,7 @@ impl Setup {
             .args(args)
             .current_dir(&self.dir)
             .env_clear()
-            .env("SIWXOIDC_BASE_URL", ISSUER)
+            .env("SIWXOIDC_BASE_URL", &self.base_url)
             .env("SIWXOIDC_REDIS_URL", redis_url().as_str())
             .env("SIWXOIDC_SYNAPSE_ENDPOINT", &self.synapse_url)
             .env("SIWXOIDC_MAS_SHARED_SECRET", &self.secret)
@@ -207,6 +234,8 @@ async fn the_tool_remints_stale_bindings_once_and_prints_counts_only() {
         return;
     }
     let (hs, synapse_url, server) = homeserver().await;
+    // The fake is also the issuer: the tool reads its key set from `base_url`.
+    let issuer = format!("{synapse_url}/");
     let current_pem = pem();
     let current = EcdsaSigningKey::from_pem(&current_pem).unwrap();
     let old = EcdsaSigningKey::from_pem(&pem()).unwrap();
@@ -217,16 +246,17 @@ async fn the_tool_remints_stale_bindings_once_and_prints_counts_only() {
     );
     {
         let mut hs = hs.lock().unwrap();
+        hs.jwks = key_set(&[&current]);
         for lp in [&ann, &bob, &cy, &ADMIN.to_string()] {
             hs.users.insert(lp.clone(), false);
         }
         hs.users.insert("gone".to_string(), true);
         // ann: signed by a key the current JWKS no longer lists.
-        let stale = proof(&old, DID_ANN, &format!("@{ann}:{SERVER}"));
+        let stale = proof(&old, &issuer, DID_ANN, &format!("@{ann}:{SERVER}"));
         hs.profile
             .insert(ann.clone(), json!({"did": DID_ANN, "proof": stale}));
         // bob: current.
-        let fresh = proof(&current, DID_BOB, &format!("@{bob}:{SERVER}"));
+        let fresh = proof(&current, &issuer, DID_BOB, &format!("@{bob}:{SERVER}"));
         hs.profile
             .insert(bob.clone(), json!({"did": DID_BOB, "proof": fresh}));
         // cy: no field at all, so nothing for the derivation to confirm.
@@ -234,6 +264,7 @@ async fn the_tool_remints_stale_bindings_once_and_prints_counts_only() {
     let secret = random_secret(40);
     let setup = Setup {
         synapse_url,
+        base_url: issuer.clone(),
         pem: Some(current_pem.clone()),
         secret: secret.clone(),
         dir: temp_dir("remint-cli"),
@@ -308,6 +339,7 @@ async fn an_ephemeral_key_is_refused_before_the_homeserver_is_asked_anything() {
     let (hs, synapse_url, server) = homeserver().await;
     let setup = Setup {
         synapse_url,
+        base_url: UNUSED_ISSUER.to_string(),
         pem: None,
         secret: random_secret(40),
         dir: temp_dir("remint-cli-ephemeral"),
@@ -329,6 +361,7 @@ async fn an_ephemeral_key_is_refused_before_the_homeserver_is_asked_anything() {
 fn an_argument_it_does_not_know_is_refused_without_echoing_its_value() {
     let setup = Setup {
         synapse_url: "http://127.0.0.1:1".to_string(),
+        base_url: UNUSED_ISSUER.to_string(),
         pem: None,
         secret: random_secret(40),
         dir: temp_dir("remint-cli-args"),
@@ -342,6 +375,91 @@ fn an_argument_it_does_not_know_is_refused_without_echoing_its_value() {
     assert!(shown.contains("unknown argument"), "{shown}");
     assert!(!shown.contains(&value), "{shown}");
     std::fs::remove_dir_all(&setup.dir).ok();
+}
+
+/// The tool's key must be the one the server publishes. Otherwise `--apply` rewrites every
+/// valid binding into one nobody can verify: a stale environment, or a run during a rotation
+/// before the new key is live in `/jwk`. Refused before the homeserver is asked anything, in a
+/// dry run too, with a fixed message.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_the_server_does_not_publish_is_refused_before_anything_is_read() {
+    if redis().await.is_none() {
+        return;
+    }
+    let current_pem = pem();
+    let current = EcdsaSigningKey::from_pem(&current_pem).unwrap();
+    let other = EcdsaSigningKey::from_pem(&pem()).unwrap();
+    // A set that names the tool's kid for another public key.
+    let mut forged = key_set(&[&other]);
+    forged["keys"][0]["kid"] = json!(current.kid());
+    let cases = [
+        ("no key with the kid", key_set(&[&other])),
+        ("the kid with another public key", forged),
+    ];
+    for (name, published) in cases {
+        for args in [
+            &["--delay-ms", "0"][..],
+            &["--apply", "--delay-ms", "0"][..],
+        ] {
+            let (hs, synapse_url, server) = homeserver().await;
+            hs.lock().unwrap().jwks = published.clone();
+            let setup = Setup {
+                base_url: format!("{synapse_url}/"),
+                synapse_url,
+                pem: Some(current_pem.clone()),
+                secret: random_secret(40),
+                dir: temp_dir("remint-cli-unpublished"),
+            };
+
+            let output = setup.run(Start::ByName, args);
+
+            let shown = text(&output);
+            assert_eq!(output.status.code(), Some(2), "{name}: {shown}");
+            assert!(
+                shown.contains("not in the key set the server publishes"),
+                "{name}: {shown}"
+            );
+            assert!(!shown.contains(current.kid()), "{name}: {shown}");
+            assert!(
+                !shown.contains("DRY RUN") && !shown.contains("APPLY"),
+                "{shown}"
+            );
+            let hs = hs.lock().unwrap();
+            assert_eq!(hs.jwks_requests, 1, "{name}: it did look at the key set");
+            assert_eq!(hs.reads, 0, "{name}: nothing was read");
+            assert_eq!(hs.puts, 0, "{name}: nothing was written");
+            std::fs::remove_dir_all(&setup.dir).ok();
+            server.abort();
+        }
+    }
+}
+
+/// A key set that cannot be read is no proof that the key is published: refused the same way.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreachable_key_set_is_refused_before_anything_is_read() {
+    if redis().await.is_none() {
+        return;
+    }
+    let (hs, synapse_url, server) = homeserver().await;
+    let setup = Setup {
+        synapse_url,
+        // Nothing listens here.
+        base_url: "http://127.0.0.1:1/".to_string(),
+        pem: Some(pem()),
+        secret: random_secret(40),
+        dir: temp_dir("remint-cli-unreachable-keys"),
+    };
+
+    let output = setup.run(Start::ByArgument, &["--apply"]);
+
+    let shown = text(&output);
+    assert_eq!(output.status.code(), Some(2), "{shown}");
+    assert!(shown.contains("could not be read"), "{shown}");
+    let hs = hs.lock().unwrap();
+    assert_eq!(hs.reads, 0, "nothing was read");
+    assert_eq!(hs.puts, 0, "nothing was written");
+    std::fs::remove_dir_all(&setup.dir).ok();
+    server.abort();
 }
 
 // -- Starting the program: the arguments are read as bytes, never required to be text -----------
@@ -358,6 +476,7 @@ fn not_utf8() -> std::ffi::OsString {
 fn the_tool_refuses_an_argument_that_is_not_utf8_without_panicking() {
     let setup = Setup {
         synapse_url: "http://127.0.0.1:1".to_string(),
+        base_url: UNUSED_ISSUER.to_string(),
         pem: None,
         secret: random_secret(40),
         dir: temp_dir("remint-cli-not-utf8"),
