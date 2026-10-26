@@ -267,6 +267,12 @@ for a legacy `did:key` account it pins it only up to letter case, so the worst c
 to a case variant of the DID that nobody holds (a share to it opens for nobody, and it never
 reaches another person).
 
+An account counts as having no field only when Synapse says so: a `404` whose JSON body has
+`errcode` `M_NOT_FOUND`. Any other `404` on the field read (a proxy's page with no JSON, an
+`M_UNRECOGNIZED` from a homeserver that does not know the route, another `errcode`) tells the tool
+nothing about the field, so that account is counted as a `read_profile` error and nothing is
+written for it.
+
 The output is counts only (`total`, `skipped_current`, `skipped_no_mapping`,
 `skipped_not_canonical`, `skipped_ambiguous`, `skipped_deactivated`, `skipped_no_profile_row`,
 `locked_seen`, `would_write` or `written`, `created_from_account_name`,

@@ -880,7 +880,11 @@ async fn read_published(
 ) -> Result<Option<Value>, ReadFailure> {
     let mut limited_in_a_row: u32 = 0;
     loop {
-        let err = match run.synapse.read_did_value(localpart, run.server_name).await {
+        let err = match run
+            .synapse
+            .read_did_value_strict(localpart, run.server_name)
+            .await
+        {
             Ok(published) => return Ok(published),
             Err(err) => err,
         };
@@ -1298,6 +1302,21 @@ mod tests {
         unreadable: std::collections::HashSet<String>,
         /// accounts whose field GET answers 429 (`rc_profile`) a number of times first
         rate_limited: HashMap<String, Limited>,
+        /// accounts whose field GET answers a 404 of this kind, whatever the profile holds
+        field_404: HashMap<String, Field404>,
+    }
+
+    /// The kinds of 404 the field GET can answer. Only [`Field404::NotFound`] is Synapse
+    /// saying "this field is not set"; the others are what a proxy or a homeserver that does
+    /// not know the route answers, for an account that may well have the field.
+    #[derive(Clone, Copy)]
+    enum Field404 {
+        /// Synapse's own answer for an unset field: `404 {"errcode":"M_NOT_FOUND",...}`
+        NotFound,
+        /// A reverse proxy's page: a 404 with no JSON at all
+        NotJson,
+        /// A homeserver that does not know the route: `404 {"errcode":"M_UNRECOGNIZED",...}`
+        Unrecognized,
     }
 
     /// A 429 on the field GET, answered `remaining` more times.
@@ -1386,6 +1405,26 @@ mod tests {
                 );
             }
             return reply;
+        }
+        if let Some(kind) = hs.field_404.get(&lp) {
+            return match kind {
+                Field404::NotFound => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"errcode": "M_NOT_FOUND", "error": "Profile was not found"})),
+                )
+                    .into_response(),
+                Field404::NotJson => (
+                    StatusCode::NOT_FOUND,
+                    [(axum::http::header::CONTENT_TYPE, "text/html")],
+                    "<html><body><h1>404 Not Found</h1></body></html>",
+                )
+                    .into_response(),
+                Field404::Unrecognized => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"errcode": "M_UNRECOGNIZED", "error": "Unrecognized request"})),
+                )
+                    .into_response(),
+            };
         }
         if hs.rowless.contains(&lp) || hs.unreadable.contains(&lp) {
             return (
@@ -1573,6 +1612,15 @@ mod tests {
                     retry_after_header,
                 },
             );
+        }
+
+        /// Make the field GET of this account answer this kind of 404, whatever it holds.
+        fn answer_field_404(&self, localpart: &str, kind: Field404) {
+            self.hs
+                .lock()
+                .unwrap()
+                .field_404
+                .insert(localpart.to_string(), kind);
         }
 
         fn profile_gets(&self) -> usize {
@@ -2991,6 +3039,88 @@ mod tests {
         assert_eq!(again.created_from_account_name, 0);
         assert_eq!(again.created_from_display_name, 0);
         assert_eq!(fx.puts().len(), writes, "the rerun wrote nothing");
+    }
+
+    // -- Which 404 on the field read means "no field" ------------------------------------------
+
+    /// A legacy wallet account that HAS a (stale) field, whose field read answers `kind` of 404:
+    /// the case a wrong "unset" would rewrite on every run. The read fails; nothing is
+    /// counted as created, planned or written, and the field is as it was.
+    async fn a_404_that_is_not_synapses_own_fails_the_read(kind: Field404) {
+        let fx = fixture!();
+        let current = key();
+        let old = key();
+        let lp = legacy_pkh_localpart();
+        let did = pkh(CHECKSUMMED_ADDRESS);
+        fx.add_user(&lp);
+        let stale = mint_value(&old, &did, &mxid_of(&lp)).await;
+        fx.set_profile(&lp, stale.clone());
+        fx.answer_field_404(&lp, kind);
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        for apply in [false, true] {
+            let report = go(&fx, &current, &authority, apply).await;
+
+            assert_eq!(
+                report.errors.get(&ErrorClass::ReadProfile),
+                Some(&1),
+                "apply={apply}: {report:?}"
+            );
+            assert_eq!(report.error_count(), 1, "apply={apply}: {report:?}");
+            assert_eq!(report.would_write, 0, "apply={apply}: {report:?}");
+            assert_eq!(report.written, 0, "apply={apply}: {report:?}");
+            assert_eq!(report.created_from_account_name, 0, "apply={apply}");
+            assert_eq!(report.created_from_display_name, 0, "apply={apply}");
+            assert!(!report.is_clean(), "apply={apply}: {report:?}");
+        }
+        assert!(fx.puts().is_empty(), "no write was made");
+        assert_eq!(
+            fx.profile(&lp),
+            Some(stale),
+            "the account's field is untouched"
+        );
+    }
+
+    /// A reverse proxy's 404 page has no JSON: it says nothing about the field.
+    #[tokio::test]
+    async fn a_404_with_no_json_on_the_field_read_is_a_read_failure_and_creates_nothing() {
+        a_404_that_is_not_synapses_own_fails_the_read(Field404::NotJson).await;
+    }
+
+    /// A homeserver that does not know the route answers `M_UNRECOGNIZED`: not "field unset".
+    #[tokio::test]
+    async fn a_404_m_unrecognized_on_the_field_read_is_a_read_failure_and_creates_nothing() {
+        a_404_that_is_not_synapses_own_fails_the_read(Field404::Unrecognized).await;
+    }
+
+    /// Synapse's own `404 M_NOT_FOUND` is the one answer that means "the field is not set": the
+    /// binding is created and counted, and the write lands only with `--apply`.
+    #[tokio::test]
+    async fn a_404_m_not_found_on_the_field_read_is_an_unset_field_and_gets_its_binding() {
+        let fx = fixture!();
+        let current = key();
+        let lp = legacy_pkh_localpart();
+        fx.add_user(&lp);
+        fx.answer_field_404(&lp, Field404::NotFound);
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        let dry = go(&fx, &current, &authority, false).await;
+
+        assert_eq!(dry.would_write, 1, "{dry:?}");
+        assert_eq!(dry.created_from_account_name, 1, "{dry:?}");
+        assert_eq!(dry.error_count(), 0, "{dry:?}");
+        assert!(fx.puts().is_empty(), "a dry run writes nothing");
+
+        let applied = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(applied.written, 1, "{applied:?}");
+        assert_eq!(applied.created_from_account_name, 1, "{applied:?}");
+        assert!(applied.is_clean(), "{applied:?}");
+        assert_eq!(fx.puts().len(), 1);
     }
 
     /// (b) A legacy `did:key` account with no field, whose display name is exactly its DID.
