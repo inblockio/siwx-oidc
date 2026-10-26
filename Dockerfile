@@ -93,6 +93,9 @@ COPY --from=builder /siwx-oidc/target/x86_64-unknown-linux-musl/release/migrate-
 # build, run as its own service with its own uid and the key file; the
 # siwx-oidc service never holds the key then.
 COPY --from=builder /siwx-oidc/target/x86_64-unknown-linux-musl/release/siwx-signer /usr/local/bin/
+# `remint-did-assertions` is `siwx-oidc` under a second name (src/remint.rs): it needs the
+# server's modules, which exist only in that binary.
+RUN ln -s siwx-oidc /usr/local/bin/remint-did-assertions
 WORKDIR /siwx-oidc
 RUN mkdir -p ./static
 COPY --from=node_builder /siwx-oidc/static/ ./static/

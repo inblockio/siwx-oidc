@@ -140,13 +140,58 @@ pub struct AdminUsersPage {
     pub next_token: Option<String>,
 }
 
-/// The two fields of a user row the orphan scan and the guest hand-off read.
+/// The fields of a user row the orphan scan, the guest hand-off and the DID re-mint tool read.
 #[derive(Debug, Deserialize)]
 pub struct AdminUserRow {
     /// The Matrix id, `@localpart:server`.
     pub name: String,
     #[serde(default)]
     pub user_type: Option<String>,
+    /// Whether the account is deactivated. Synapse's `v2/users` list writes it as `0`/`1`
+    /// and other routes as a bool; both are read, and a row without it reads as active.
+    /// The plain [`SynapseClient::admin_users_page`] never lists a deactivated account, so
+    /// this is `true` only on a page of [`SynapseClient::admin_all_users_page`].
+    #[serde(default, deserialize_with = "flag_from_bool_or_int")]
+    pub deactivated: bool,
+    /// Whether the account is locked (Synapse 1.91 and later). The `v2/users` list leaves a
+    /// locked account out unless the request says `locked=true`, which only
+    /// [`SynapseClient::admin_all_users_page`] does. A row without the flag, or with one that
+    /// is neither a bool nor a number, reads as unlocked: unlike `deactivated` it only feeds
+    /// an informational count, so an odd value must never fail the page for the callers that
+    /// share this row (the orphan scan, the device reaper).
+    #[serde(default, deserialize_with = "informational_flag")]
+    pub locked: bool,
+}
+
+/// A bool or a `0`/`1` flag that never fails the row: anything else is `false`.
+fn informational_flag<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Bool(b) => b,
+        serde_json::Value::Number(n) => n.as_i64().is_some_and(|n| n != 0),
+        _ => false,
+    })
+}
+
+fn flag_from_bool_or_int<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Bool(b) => Ok(b),
+        serde_json::Value::Number(n) => Ok(n.as_i64().is_some_and(|n| n != 0)),
+        serde_json::Value::Null => Ok(false),
+        other => Err(serde::de::Error::custom(format!(
+            "expected a bool or 0/1 for a user flag, got {}",
+            match other {
+                serde_json::Value::String(_) => "a string",
+                serde_json::Value::Array(_) => "an array",
+                _ => "an object",
+            }
+        ))),
+    }
 }
 
 /// A buffered admin-scoped response: status plus the body, already read.
@@ -208,6 +253,23 @@ fn admin_users_url(endpoint: &str, from: Option<&str>, typed_only: bool) -> Stri
     if typed_only {
         url.push_str("&not_user_type=");
     }
+    if let Some(from) = from {
+        url.push_str("&from=");
+        url.push_str(&urlencoding::encode(from));
+    }
+    url
+}
+
+/// The URL of one page of the user list that INCLUDES deactivated and locked accounts (guests
+/// stay out). The DID re-mint tool counts the deactivated accounts it skips, so it must see
+/// them, and it signs locked accounts like any other. Synapse's `UsersRestServletV2.on_GET`
+/// reads `locked` with default false, so without `locked=true` a locked account is never
+/// listed and its binding would stay stale for good. `guests=true` stays out: with MAS
+/// delegation Synapse rejects it.
+fn admin_all_users_url(endpoint: &str, from: Option<&str>) -> String {
+    let mut url = format!(
+        "{endpoint}/_synapse/admin/v2/users?limit=100&guests=false&deactivated=true&locked=true"
+    );
     if let Some(from) = from {
         url.push_str("&from=");
         url.push_str(&urlencoding::encode(from));
@@ -1220,7 +1282,20 @@ impl SynapseClient {
         from: Option<&str>,
         typed_only: bool,
     ) -> Result<AdminUsersPage> {
-        let url = admin_users_url(&self.endpoint, from, typed_only);
+        self.admin_users_page_at(admin_users_url(&self.endpoint, from, typed_only))
+            .await
+    }
+
+    /// One page of the same list as [`admin_users_page`](Self::admin_users_page) but with the
+    /// deactivated accounts in it (each row says so in [`AdminUserRow::deactivated`]); guests
+    /// stay out. Read-only, 100 per page, from the opaque `from` token. The body is never
+    /// logged.
+    pub async fn admin_all_users_page(&self, from: Option<&str>) -> Result<AdminUsersPage> {
+        self.admin_users_page_at(admin_all_users_url(&self.endpoint, from))
+            .await
+    }
+
+    async fn admin_users_page_at(&self, url: String) -> Result<AdminUsersPage> {
         let resp = self
             .admin_request(|http, token| http.get(&url).bearer_auth(token))
             .await
@@ -1700,6 +1775,22 @@ impl SynapseClient {
         localpart: &str,
         server_name: &str,
     ) -> Result<Option<String>> {
+        let published = self.read_did_value(localpart, server_name).await?;
+        Ok(did_from_profile_field(published.as_ref()))
+    }
+
+    /// The raw value published at [`DID_PROFILE_FIELD`] for one account, unparsed and
+    /// unverified: `Ok(None)` when the field is unset (404) or the response carries no such
+    /// member, `Err` when its state is unknown. [`read_did_field`](Self::read_did_field) is
+    /// the DID-only view of it and holds the full account of the read (anonymous first, a
+    /// minted token only when the homeserver demands one, a 500 as an error, never as
+    /// "absent"). The DID re-mint tool reads the whole object through this, to judge the
+    /// `proof` in it.
+    pub async fn read_did_value(
+        &self,
+        localpart: &str,
+        server_name: &str,
+    ) -> Result<Option<serde_json::Value>> {
         let user_id = matrix_user_id(localpart, server_name);
         // Percent-encoded path segment, for the same reason as the PUT twin:
         // `@` and `:` are sub-delims a bare interpolation would leave raw.
@@ -1802,7 +1893,7 @@ impl SynapseClient {
             .json()
             .await
             .context("read_did_field: response was not JSON")?;
-        Ok(did_from_profile_field(body.get(DID_PROFILE_FIELD)))
+        Ok(body.get(DID_PROFILE_FIELD).cloned())
     }
 
     /// The current state of a room: the `state` array of
@@ -2437,6 +2528,66 @@ mod tests {
             err.contains("without a token store"),
             "error must name the missing precondition, got: {err}"
         );
+    }
+
+    /// The DID re-mint tool counts the deactivated accounts it skips, so its list includes
+    /// them, and it signs locked accounts like any other, so the list asks for those too
+    /// (Synapse's `UsersRestServletV2.on_GET` reads `locked` with default false, which leaves
+    /// them out). Guests stay out (`guests=true` is rejected with MAS delegation), and the
+    /// token is encoded.
+    #[test]
+    fn the_all_users_list_includes_deactivated_and_locked_accounts_and_no_guests() {
+        assert_eq!(
+            admin_all_users_url("https://hs.example.org", None),
+            "https://hs.example.org/_synapse/admin/v2/users?limit=100&guests=false&deactivated=true&locked=true"
+        );
+        assert_eq!(
+            admin_all_users_url("https://hs.example.org", Some("a b")),
+            "https://hs.example.org/_synapse/admin/v2/users?limit=100&guests=false&deactivated=true&locked=true&from=a%20b"
+        );
+    }
+
+    /// Synapse's user list writes the flag as `0`/`1`; a bool is read too, and a row without
+    /// it is active.
+    #[test]
+    fn a_user_row_reads_the_deactivated_flag_as_zero_one_or_bool_and_defaults_to_active() {
+        let flag = |row: serde_json::Value| {
+            serde_json::from_value::<AdminUserRow>(row)
+                .map(|r| r.deactivated)
+                .ok()
+        };
+        assert_eq!(flag(json!({"name": "@a:hs", "deactivated": 1})), Some(true));
+        assert_eq!(
+            flag(json!({"name": "@a:hs", "deactivated": 0})),
+            Some(false)
+        );
+        assert_eq!(
+            flag(json!({"name": "@a:hs", "deactivated": true})),
+            Some(true)
+        );
+        assert_eq!(
+            flag(json!({"name": "@a:hs", "deactivated": null})),
+            Some(false)
+        );
+        assert_eq!(flag(json!({"name": "@a:hs"})), Some(false));
+        assert_eq!(flag(json!({"name": "@a:hs", "deactivated": "yes"})), None);
+    }
+
+    /// The `locked` flag feeds a count only: `0`/`1` and a bool are read, and a missing,
+    /// null or odd value is unlocked and never fails the row.
+    #[test]
+    fn a_user_row_reads_the_locked_flag_and_never_fails_on_it() {
+        let flag = |row: serde_json::Value| {
+            serde_json::from_value::<AdminUserRow>(row)
+                .map(|r| r.locked)
+                .ok()
+        };
+        assert_eq!(flag(json!({"name": "@a:hs", "locked": 1})), Some(true));
+        assert_eq!(flag(json!({"name": "@a:hs", "locked": 0})), Some(false));
+        assert_eq!(flag(json!({"name": "@a:hs", "locked": true})), Some(true));
+        assert_eq!(flag(json!({"name": "@a:hs", "locked": null})), Some(false));
+        assert_eq!(flag(json!({"name": "@a:hs"})), Some(false));
+        assert_eq!(flag(json!({"name": "@a:hs", "locked": "yes"})), Some(false));
     }
 
     /// The orphan scan asks only for typed accounts (`not_user_type=`); the plain list keeps

@@ -23,14 +23,14 @@ notice. There are no tagged releases yet; `main` is what runs.
 ## Code map
 
 Workspace: the root package `siwx-oidc` (library crate `siwx_oidc` in `src/lib.rs`, binaries
-`siwx-oidc`, `migrate-credentials` and `siwx-signer`) plus `siwx-oidc-auth/`. Crypto comes from the external
+`siwx-oidc`, `migrate-credentials` and `siwx-signer`; `remint-did-assertions` is `siwx-oidc` under a second name) plus `siwx-oidc-auth/`. Crypto comes from the external
 crate [aqua-auth](https://github.com/inblockio/aqua-auth), pinned by tag in both manifests.
 Modules marked **lib** are compiled into the library crate, so `tests/*.rs` can link them;
 everything else exists only in the binary crate.
 
 | `src/` | Role |
 |---|---|
-| `main.rs` | Binary entry point. Declares the binary-only modules and calls `axum_lib::main`. |
+| `main.rs` | Binary entry point. Declares the binary-only modules and calls `axum_lib::main`, unless the process is called `remint-did-assertions` (or has it as first argument), which runs `remint::cli_main`. |
 | `lib.rs` | Library crate root. `synapse_client` is deliberately not re-exported (see Invariants). |
 | `axum_lib.rs` | Startup: loads config through `config::figment()`, validates it (DID methods and pkh namespaces against the aqua-auth registries, signing key, retired keys, WebAuthn), `store_default_clients` (digested, no expiry, prunes the clients the map no longer names), `AppState`, the router, handler glue, the `siwx_user` / `acct_session` cookies, the CORS layer. |
 | `config.rs` | `Config`, its defaults, and `figment()`: the one place config names and precedence are defined. `Config::read_secret_files` reads `mas_shared_secret_file` and `redis_password_file` once at start. `Config` is deliberately not `Debug` (it holds secrets). Reference: [docs/configuration.md](docs/configuration.md). |
@@ -62,6 +62,7 @@ everything else exists only in the binary crate.
 | `db/tokens.rs` (lib) | Token formats (`mat_`, `msa_`, `mcr_{handle}_{secret}`), `parse_refresh_token` (never panics), `digest` (the SHA-256 every credential a client holds is stored as). |
 | `db/seal.rs` (lib) | The sealed successor pair: AES-256-GCM under a key HKDF-derived from the previous refresh token, so only its presenter can open it. |
 | `bin/migrate-credentials.rs` | Operator tool for the credential backfill. Dry run unless `--apply`. |
+| `remint.rs` | Operator tool `remint-did-assertions`: signs again, under the current key, the `io.inblock.did` bindings a key rotation left unverifiable. Dry run unless `--apply`, idempotent, counts-only output, `--limit` and `--delay-ms`. Lives in the binary crate because it needs `config`, `synapse_client` and `did_assertion`; the image links `siwx-oidc` under its name. The DID comes from `DidAuthority`, whose production form (`DerivationAuthority`) confirms a claim found in the profile only if siwx-oidc's own derivation binds it to exactly that account and the claim is DID text in the exact form a sign-in writes (`in_sign_in_form`). It refuses a signing key the server does not publish at `/jwk` (`check_key_is_published`) before it reads anything, so it runs after the new key is live. `invoked_as_tool` is the dispatch decision `main` makes over `args_os`. |
 | `bin/siwx-signer.rs` | The signer process for `signing_backend = socket`: `serve`, `self-test`, `keygen`, `kid`. Non-dumpable, prints no key bytes. |
 
 | `siwx-oidc-auth/src/` | Role |
@@ -102,15 +103,16 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
 
 - **Most `tests/*.rs` tests are `#[ignore]`d.** They need a running siwx-oidc (and most a Synapse
   mock). Run a suite explicitly: `cargo test --test e2e_race_teardown -- --ignored --test-threads=1`.
-  `cargo test --workspace` runs the unit tests of both crates plus 66 tests in fifteen files:
+  `cargo test --workspace` runs the unit tests of both crates plus 73 tests in sixteen files:
   `openapi_covers_every_route` (2), `localpart_vectors` (1), `graceful_shutdown` (7),
   `static_client_startup` (10), `secret_files_startup` (12, one of which serves requests from
   database 3 of the test Redis), `audit_pr82_findings` (4, the pins of the audit of the
   secret-file change; one of them takes database 1 of the test Redis),
   `log_hygiene_credential_store` (1),
   `log_capture_callsite_interest` (1), `siwx_signer_cli` (10) and `signing_backend_startup` (4),
-  which need nothing; `account_linking_dual_write` (6), which needs the test Redis, and `log_hygiene`
-  (4, one of them needs it);
+  which need nothing; `account_linking_dual_write` (6), which needs the test Redis, `log_hygiene`
+  (4, one of them needs it) and `remint_did_assertions_cli` (7, three of them need it; the real
+  binary against a fake homeserver and key set);
   `credential_migration_live` (2), which needs its own disposable, empty Redis named by
   `MIGRATION_TEST_REDIS_URL`; and the pure check `an_absent_strict_skips_variable_means_strict`
   in `e2e_account_lifecycle_live` and in `e2e_did_field_live` (1 each). In the headless
@@ -398,6 +400,54 @@ doc; read it before changing the code the rule covers.
 - **Row-absence is decided by `errcode`** (`M_UNKNOWN` = absent), not by a 404 alone. Pin:
   `profile_404_m_unknown_no_row_found_is_absent`,
   `profile_404_m_not_found_profile_was_not_found_is_present`.
+- **`remint-did-assertions` signs a DID only when siwx-oidc's own rules bind it to that exact
+  account, and never trusts the profile.** The `did` member and the `sub` of an old proof are
+  claims; `DerivationAuthority` returns one only if it derives to the account's localpart and
+  `resolve_identity` picks that localpart for it (a legacy account stays on its legacy
+  localpart, a second account for the same DID gets nothing). `legacy_localpart` folds case and
+  turns `:` into `-`, so the claim must also be DID text a sign-in writes: it parses through
+  `resolve::check_did` (the sign-in's parsers) and is (a) equal to `mxid::canonicalize` of itself
+  byte for byte, or (b) a `did:pkh:eip155` that equals its canonical form everywhere except the
+  address, which is exactly `aqua_auth::eip55_checksum` of the lower-case address (what a wallet
+  sign-in writes: the login page builds the DID from the checksummed address the wallet returns);
+  else it is `skipped_non_canonical` and nothing is written (never a second parser, a second
+  canonical form or a hand-rolled checksum). The text signed is the claim as stored, so a
+  checksummed DID stays checksummed. An upper-case `0X` or `EIP155`, a colon turned into a dash,
+  an all-upper-case address that is not its own checksum and a mixed-case address with a wrong
+  checksum are all refused. A `did:key` whose case was changed and still reads as a key cannot be
+  told from the original without the retired public keys. Two different claims that both pass
+  are left alone.
+  A binding is current only when the profile's `did`, the proof's `sub`, `mxid` and `iss`, and
+  its `kid` and signature under the CURRENT key all match. **The tool's key must be the one the
+  server publishes:** before any homeserver read it fetches `base_url` + `/jwk` (the URL the
+  server derives for `jwks_uri`, no redirect followed) and exits 2 with a fixed message unless
+  that set holds a key with the signer's `kid` and the same public key (every entry with that
+  `kid` must be the key); so it runs after the new key is live, and `--apply` can never rewrite
+  bindings into ones nobody can verify. It lists locked accounts too (`locked=true`; `guests=true`
+  stays out, MAS delegation rejects it), processes them like any other and counts them in
+  `locked_seen`. It refuses an ephemeral key before reading anything, never scans Redis, and
+  prints counts only (no account, DID, token or proof, and no per-account error text: the text
+  of an HTTP error names the account). The dispatch in `main` (`invoked_as_tool`) reads
+  `args_os` and compares only the program name and the first argument, so a normal server start
+  cannot panic on an argument that is not UTF-8. Pin:
+  `a_tampered_profile_cannot_make_the_tool_sign_a_did_the_account_is_not_derived_from`,
+  `only_the_canonical_account_of_a_did_is_signed`, `a_proof_with_the_wrong_mxid_is_reminted`,
+  `a_did_with_a_colon_turned_into_a_dash_is_not_signed`, `an_upper_case_did_pkh_is_not_signed`,
+  `a_checksummed_did_pkh_is_signed`, `a_checksummed_binding_that_verifies_is_skipped_as_current`,
+  `a_mixed_case_did_pkh_with_a_wrong_checksum_is_not_signed`, `an_all_upper_case_address_is_not_signed`,
+  `only_a_did_in_a_sign_in_form_is_signable`,
+  `a_modern_canonical_did_pkh_is_still_signed`,
+  `a_key_set_without_the_signers_kid_is_refused`,
+  `a_key_set_with_the_signers_kid_but_another_public_key_is_refused`,
+  `a_locked_account_with_a_stale_binding_is_reminted`,
+  `the_all_users_list_includes_deactivated_and_locked_accounts_and_no_guests`,
+  `the_second_apply_writes_nothing`, `an_ephemeral_key_is_refused_before_anything_is_read_or_written`,
+  `the_report_names_no_account_did_proof_or_token`,
+  `an_argument_that_is_not_utf8_chooses_the_server_and_does_not_panic`, and in
+  `tests/remint_did_assertions_cli.rs`
+  `the_tool_remints_stale_bindings_once_and_prints_counts_only`,
+  `a_key_the_server_does_not_publish_is_refused_before_anything_is_read`,
+  `the_server_starts_with_an_argument_that_is_not_utf8`.
 - **`synapse_client` stays out of `lib.rs`.** It depends on binary-only modules, and compiling it
   into both crates produced two types with one name.
 
