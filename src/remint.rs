@@ -200,6 +200,26 @@ pub(crate) trait DidAuthority: Send + Sync {
     async fn confirm(&self, localpart: &str, claims: &[String]) -> Result<Confirmation>;
 }
 
+/// Whether `claim` is a DID in the exact form a sign-in writes.
+///
+/// `binds_to_localpart` is lenient on purpose (it must find the account whatever the spelling):
+/// [`legacy_localpart`](siwx_oidc::mxid::legacy_localpart) folds case and turns `:` into `-`, so
+/// a profile claim such as `did:pkh:eip155:1-0x…` or `did:pkh:EIP155:1:0X…` derives to a legacy
+/// account although no sign-in can have written it, and signing it would put a binding for a
+/// DID nobody holds under the provider's key. So a claim must also be a DID a sign-in accepts
+/// ([`crate::resolve::check_did`]: the sign-in's own parsers, run on the canonical form) and
+/// must BE its canonical form ([`siwx_oidc::mxid::canonicalize`]), byte for byte. No second
+/// parser, no second canonicalisation: both are the sign-in's.
+///
+/// The consequence for `did:pkh`: the canonical form is lower case, so an address in mixed case
+/// (the EIP-55 spelling a wallet may present) is the same account but not this text, and is
+/// left to the holder's next sign-in. For `did:key` and `did:peer` case is key material and is
+/// never folded, so a case change that still reads as a valid key passes here; only the
+/// retired public keys could tell it from the original (see the module doc).
+fn in_sign_in_form(claim: &str) -> bool {
+    crate::resolve::check_did(claim).is_ok() && siwx_oidc::mxid::canonicalize(claim) == claim
+}
+
 /// The production authority: siwx-oidc's own derivation, see the module doc.
 pub(crate) struct DerivationAuthority<'a> {
     pub synapse: &'a SynapseClient,
@@ -213,6 +233,11 @@ impl DidAuthority for DerivationAuthority<'_> {
         for claim in claims {
             // Cheap and local first: a claim the account is not derived from needs no probe.
             if !crate::resolve::binds_to_localpart(claim, localpart) {
+                continue;
+            }
+            // It derives to this account, but is it text a sign-in writes?
+            if !in_sign_in_form(claim) {
+                not_canonical = true;
                 continue;
             }
             // The rule a sign-in applies, probe included: a legacy account stays on its
@@ -1796,9 +1821,40 @@ mod tests {
         assert_eq!(fx.puts()[0].0, legacy);
     }
 
-    /// Two claims that differ only in case both derive to a legacy localpart: not guessed.
+    /// Two claims that differ only in case, and that both still read as a key a sign-in could
+    /// have written, both derive to a legacy localpart: not guessed. (The old proofs cannot
+    /// tell them apart: closing this needs the retired public keys, see the module doc.)
     #[tokio::test]
     async fn two_different_claims_that_both_derive_are_left_alone() {
+        let fx = fixture!();
+        let (old, current) = (key(), key());
+        // A P-256 `did:key`: the key is not checked past its multicodec prefix, so a case
+        // change further in still reads as a key.
+        let legacy = mxid::legacy_localpart(DID_A);
+        let variant = format!("{}b", DID_A.strip_suffix('B').expect("DID_A ends in B"));
+        assert_ne!(variant, DID_A);
+        assert!(
+            in_sign_in_form(&variant),
+            "the variant reads as a valid key"
+        );
+        fx.add_user(&legacy);
+        let mut value = mint_value(&old, DID_A, &mxid_of(&legacy)).await;
+        value["did"] = json!(variant);
+        fx.set_profile(&legacy, value);
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        let report = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(report.skipped_ambiguous, 1, "{report:?}");
+        assert_eq!(report.written, 0);
+    }
+
+    /// A case change that breaks the key (its multicodec prefix) is no key a sign-in could
+    /// have written, so it is no competing claim: the real one is signed.
+    #[tokio::test]
+    async fn a_case_change_that_breaks_the_key_is_not_a_competing_claim() {
         let fx = fixture!();
         let (old, current) = (key(), key());
         let legacy = mxid::legacy_localpart(DID_D);
@@ -1812,8 +1868,124 @@ mod tests {
 
         let report = go(&fx, &current, &authority, true).await;
 
-        assert_eq!(report.skipped_ambiguous, 1, "{report:?}");
+        assert_eq!(report.written, 1, "{report:?}");
+        assert_eq!(report.skipped_ambiguous, 0);
+        assert_eq!(fx.profile(&legacy).unwrap()["did"], DID_D);
+    }
+
+    /// A legacy account's localpart is the DID with ':' turned into '-' and case folded, so a
+    /// profile claim spelled that way derives to the account. No sign-in ever writes it, and
+    /// signing it would put a binding for a DID nobody holds under the provider's key.
+    #[tokio::test]
+    async fn a_did_with_a_colon_turned_into_a_dash_is_not_signed() {
+        let fx = fixture!();
+        let (old, current) = (key(), key());
+        let legacy = mxid::legacy_localpart(DID_C);
+        let variant = DID_C.replacen(":1:0x", ":1-0x", 1);
+        assert_ne!(variant, DID_C);
+        assert_eq!(mxid::legacy_localpart(&variant), legacy, "it derives");
+        fx.add_user(&legacy);
+        fx.set_profile(&legacy, mint_value(&old, &variant, &mxid_of(&legacy)).await);
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        let report = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(report.skipped_not_canonical, 1, "{report:?}");
         assert_eq!(report.written, 0);
+        assert!(fx.puts().is_empty(), "nothing is written");
+    }
+
+    /// Upper-case method data in a `did:pkh` (`EIP155`, `0X`) folds to the same legacy
+    /// localpart, and is not the text a sign-in writes.
+    #[tokio::test]
+    async fn an_upper_case_did_pkh_is_not_signed() {
+        let fx = fixture!();
+        let (old, current) = (key(), key());
+        let legacy = mxid::legacy_localpart(DID_C);
+        let variant = DID_C.replace("eip155", "EIP155").replace(":0x", ":0X");
+        assert_ne!(variant, DID_C);
+        assert_eq!(mxid::legacy_localpart(&variant), legacy, "it derives");
+        fx.add_user(&legacy);
+        fx.set_profile(&legacy, mint_value(&old, &variant, &mxid_of(&legacy)).await);
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        let report = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(report.skipped_not_canonical, 1, "{report:?}");
+        assert_eq!(report.written, 0);
+        assert!(fx.puts().is_empty(), "nothing is written");
+    }
+
+    /// The rule the sign-in's own `canonicalize` sets: a `did:pkh` is signed only in its
+    /// canonical (lower-case) form. A mixed-case address, the EIP-55 spelling of a wallet, is
+    /// the same account but not the canonical text, so it is left for the holder's next
+    /// sign-in, which writes it again. Pinned here so the consequence is a decision and not
+    /// an accident.
+    #[tokio::test]
+    async fn a_mixed_case_did_pkh_is_not_canonical_and_waits_for_the_next_sign_in() {
+        let fx = fixture!();
+        let (old, current) = (key(), key());
+        let checksummed = "did:pkh:eip155:1:0x7a76A0f2B0d4C3e1A5b9c8D7e6f50413229A8b7c";
+        assert_eq!(mxid::canonicalize(checksummed), DID_C, "the same account");
+        let lp = modern(checksummed);
+        fx.add_user(&lp);
+        fx.set_profile(&lp, mint_value(&old, checksummed, &mxid_of(&lp)).await);
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        let report = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(report.skipped_not_canonical, 1, "{report:?}");
+        assert_eq!(report.written, 0);
+    }
+
+    /// The regression guard: a modern account whose DID is in canonical form is still signed.
+    #[tokio::test]
+    async fn a_modern_canonical_did_pkh_is_still_signed() {
+        let fx = fixture!();
+        let (old, current) = (key(), key());
+        let lp = modern(DID_C);
+        fx.add_user(&lp);
+        fx.set_profile(&lp, mint_value(&old, DID_C, &mxid_of(&lp)).await);
+        let authority = DerivationAuthority {
+            synapse: &fx.synapse,
+        };
+
+        let report = go(&fx, &current, &authority, true).await;
+
+        assert_eq!(report.written, 1, "{report:?}");
+        assert_eq!(report.skipped_not_canonical, 0);
+        assert_eq!(fx.profile(&lp).unwrap()["did"], DID_C);
+    }
+
+    /// The text rule on its own: a DID that parses the way a sign-in parses it and whose
+    /// canonical form is the text itself.
+    #[test]
+    fn only_a_did_in_the_exact_sign_in_form_is_signable() {
+        for ok in [DID_A, DID_B, DID_C, DID_D] {
+            assert!(in_sign_in_form(ok), "{ok}");
+        }
+        for not_ok in [
+            // ':' turned into '-'
+            "did:pkh:eip155:1-0x7a76a0f2b0d4c3e1a5b9c8d7e6f50413229a8b7c",
+            // upper-case method data
+            "did:pkh:EIP155:1:0X7a76a0f2b0d4c3e1a5b9c8d7e6f50413229a8b7c",
+            // EIP-55 mixed-case address: same account, not the canonical text
+            "did:pkh:eip155:1:0x7a76A0f2B0d4C3e1A5b9c8D7e6f50413229A8b7c",
+            // a key whose case change broke its multicodec prefix
+            "did:key:z6MKmWziJJ2k3ckqVqnmMGVKefMhDSe4ZxrfvqksxDMGBa4v",
+            // not a method this provider signs in, and not a DID at all
+            "did:web:example.org",
+            "not a did",
+            "",
+        ] {
+            assert!(!in_sign_in_form(not_ok), "{not_ok}");
+        }
     }
 
     // -- Pure pieces ----------------------------------------------------------------------

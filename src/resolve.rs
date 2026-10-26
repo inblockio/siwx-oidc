@@ -569,7 +569,7 @@ async fn resolve_uncapped(
 /// `did:peer` stay byte-for-byte, so a `did:key` lowercased the way a Matrix
 /// localpart forces it (siwx-oidc#17) is refused, as it names a different and
 /// invalid key.
-fn check_did(did: &str) -> Result<(), ResolveError> {
+pub(crate) fn check_did(did: &str) -> Result<(), ResolveError> {
     let has_did_shape = did
         .strip_prefix("did:")
         .and_then(|rest| rest.split_once(':'))
