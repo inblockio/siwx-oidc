@@ -65,7 +65,7 @@ nondeterministic, so every admin request introspects.
   POST   /_synapse/mas/reactivate_user            synapse_client::reactivate_user
 
   -- admin surface (minted admin token) --------------------------------------
-  GET    /_synapse/admin/v2/users                 synapse_client::admin_users_page (device reaper, orphan scan)
+  GET    /_synapse/admin/v2/users                 synapse_client::admin_users_page (device reaper, orphan scan), admin_all_users_page (remint-did-assertions: `deactivated=true`)
   GET    /_synapse/admin/v2/users/{mxid}/devices  synapse_client::list_devices (and get_device)
   POST   /_matrix/client/v3/keys/query            synapse_client::has_cross_signing_keys
   PUT    /_matrix/client/v3/profile/{mxid}/{field} synapse_client::publish_did_field
@@ -693,6 +693,8 @@ class Handler(BaseHTTPRequestHandler):
         # orphan scan). Every account that exists or carries a device, active only
         # (`deactivated=false`), `not_user_type=` (empty) leaves out untyped accounts
         # as Synapse does; `from` is an offset, `next_token` absent on the last page.
+        # `deactivated=true` (admin_all_users_page) lists the deactivated accounts too,
+        # each row carrying `deactivated` as 0 or 1 as Synapse writes it.
         if path == "/_synapse/admin/v2/users":
             denied = self._admin_auth()
             if denied:
@@ -702,8 +704,16 @@ class Handler(BaseHTTPRequestHandler):
             start = int((q.get("from") or ["0"])[0] or 0)
             with LOCK:
                 names = sorted({_mxid(lp) for lp in EXISTING_USERS} | set(DEVICES))
-                names = [n for n in names if not LIFECYCLE.get(n, {}).get("deactivated")]
-                rows = [{"name": n, "user_type": USER_TYPES.get(n)} for n in names]
+                if (q.get("deactivated") or [""])[0] != "true":
+                    names = [n for n in names if not LIFECYCLE.get(n, {}).get("deactivated")]
+                rows = [
+                    {
+                        "name": n,
+                        "user_type": USER_TYPES.get(n),
+                        "deactivated": 1 if LIFECYCLE.get(n, {}).get("deactivated") else 0,
+                    }
+                    for n in names
+                ]
             if "not_user_type" in q:
                 rows = [r for r in rows if r["user_type"] is not None]
             out = {"users": rows[start:start + limit], "total": len(rows)}

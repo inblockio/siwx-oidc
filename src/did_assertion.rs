@@ -103,11 +103,10 @@
 //! Plan invariant 5. See [`mint_did_assertion`].
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-// Only [`verify_with_key`] needs these, and that helper is `#[cfg(test)]` —
-// see its doc comment for why it must never be reachable from production code.
-#[cfg(test)]
+// For the signature checks: [`verify_with_key`] (a `#[cfg(test)]` helper, see its doc comment
+// for why it must never be reachable from production code) and [`verify_own_proof`], the
+// self-check of the DID re-mint tool, which is bound to the signer's own key.
 use anyhow::{anyhow, bail, Result};
-#[cfg(test)]
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::sync::Once;
@@ -438,6 +437,12 @@ pub async fn did_profile_value(
 /// expected MXID as a required argument.
 #[cfg(test)]
 pub fn verify_with_key(jws: &str, key: &VerifyingKey) -> Result<DidAssertionClaims> {
+    verify_parts(jws, key).map(|(_, claims)| claims)
+}
+
+/// The checks of [`verify_with_key`], returning the header too. Private: the only callers
+/// are that test helper and [`verify_own_proof`], which binds the result to the key's `kid`.
+fn verify_parts(jws: &str, key: &VerifyingKey) -> Result<(DidAssertionHeader, DidAssertionClaims)> {
     let mut parts = jws.split('.');
     let (header_b64, payload_b64, signature_b64) =
         match (parts.next(), parts.next(), parts.next(), parts.next()) {
@@ -499,7 +504,48 @@ pub fn verify_with_key(jws: &str, key: &VerifyingKey) -> Result<DidAssertionClai
     let claims: DidAssertionClaims = serde_json::from_slice(&payload_bytes)
         .map_err(|e| anyhow!("JWS payload is not a DID assertion claims set: {e}"))?;
 
+    Ok((header, claims))
+}
+
+/// Check a stored proof against THIS provider's CURRENT signing key, and return its claims.
+///
+/// The header's `kid` must be the signer's own, and the signature must verify under the
+/// signer's own public key. A proof minted under any other key, retired, rotated away or
+/// exposed, fails here, which is what the DID re-mint tool wants to know: "does the JWKS
+/// still anchor this proof?". Nothing else is judged. The caller compares `iss`, `sub` and
+/// `mxid` to what it expects; a proof is never trusted for the values it carries.
+///
+/// This is a self-check, not a verifier for consumers: it knows the one key it is given and
+/// fetches nothing. The consumer-facing verifier is `siwx-oidc-auth`'s `verify_did_assertion`.
+pub fn verify_own_proof(jws: &str, signer: &dyn ProviderSigner) -> Result<DidAssertionClaims> {
+    let (header, claims) = verify_parts(jws, signer.verifying_key())?;
+    if header.kid != signer.kid() {
+        bail!("the proof was signed under another kid than the current signing key's");
+    }
     Ok(claims)
+}
+
+/// The `sub` claim of a stored proof, read WITHOUT checking its signature, or `None` when
+/// the text is not a JWS whose payload carries one.
+///
+/// A claim, not a fact: whoever could write the profile could write any `sub`, and an old,
+/// exposed key could have signed anything. The only legitimate use is as a CANDIDATE that a
+/// check of the caller's own (the derivation of the Matrix localpart) must confirm before
+/// anything is signed. See the DID re-mint tool (`remint.rs`).
+pub fn unverified_subject(jws: &str) -> Option<String> {
+    let mut parts = jws.split('.');
+    let (_header, payload, _signature) =
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(h), Some(p), Some(s), None) => (h, p, s),
+            _ => return None,
+        };
+    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    claims
+        .get("sub")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Test-only: a freshly generated P-256 private key in PKCS#8 PEM form, the same
@@ -793,6 +839,51 @@ mod tests {
             verify_with_key(&truncated, &vk).is_err(),
             "a 32-byte signature must be rejected, not zero-extended"
         );
+    }
+
+    /// The self-check of the DID re-mint tool: a proof counts only under the signer's own key.
+    #[test]
+    fn verify_own_proof_accepts_the_signers_own_proof_and_no_other() {
+        let key = EcdsaSigningKey::from_pem(&test_p256_pem()).expect("test PEM must load");
+        let other = EcdsaSigningKey::from_pem(&test_p256_pem()).expect("test PEM must load");
+
+        let claims = verify_own_proof(&mint(&key), &key).expect("own proof verifies");
+        assert_eq!((claims.sub.as_str(), claims.mxid.as_str()), (DID, MXID));
+        assert!(
+            verify_own_proof(&mint(&other), &key).is_err(),
+            "a proof from a key that is not the current one does not count"
+        );
+        assert!(verify_own_proof("not.a.jws", &key).is_err());
+        assert!(verify_own_proof("", &key).is_err());
+    }
+
+    /// The `sub` of a proof is readable without its key, as a claim only.
+    #[test]
+    fn unverified_subject_reads_the_sub_of_any_well_formed_proof_and_nothing_else() {
+        let key = EcdsaSigningKey::from_pem(&test_p256_pem()).expect("test PEM must load");
+        assert_eq!(unverified_subject(&mint(&key)).as_deref(), Some(DID));
+        let payload = |claims: &str| {
+            format!(
+                "e30.{}.c2ln",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims)
+            )
+        };
+        assert_eq!(
+            unverified_subject(&payload(r#"{"sub":"x"}"#)).as_deref(),
+            Some("x")
+        );
+        for bad in [
+            "",
+            "a.b",
+            "a.b.c.d",
+            "e30.!!!.c2ln",
+            &payload("not json"),
+            &payload(r#"{"iss":"x"}"#),
+            &payload(r#"{"sub":""}"#),
+            &payload(r#"{"sub":7}"#),
+        ] {
+            assert_eq!(unverified_subject(bad), None, "{bad}");
+        }
     }
 
     #[test]
