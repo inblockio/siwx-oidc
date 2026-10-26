@@ -1877,13 +1877,24 @@ impl SynapseClient {
         }
         if !resp.status().is_success() {
             let status = resp.status();
+            let header_hint = retry_after_from_header(resp.headers());
             let body = resp.text().await.unwrap_or_default();
             warn!(%status, %body, %user_id, "read_did_field: unexpected response");
-            anyhow::bail!(
+            let message = format!(
                 "read_did_field: HTTP {status}. (A 500 on this route can mean the account has a \
                  `users` row but no `profiles` row — element-hq/synapse#19702, unfixed in \
                  1.159.0 — so the field state is UNKNOWN, not absent.)"
             );
+            // A 429 is `rc_profile` (Synapse's per-IP limit on this route when anonymous). It
+            // is still an `Err` with the same text, so every caller behaves as before; the
+            // typed error inside it is for the one caller that waits and retries.
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(anyhow::Error::new(ProfileRateLimited {
+                    retry_after: header_hint.max(retry_after_from_body(&body)),
+                })
+                .context(message));
+            }
+            anyhow::bail!(message);
         }
 
         // MSC4133 echoes the field name back as the single key of the object.
@@ -2143,6 +2154,51 @@ pub enum PublishOutcome {
     /// See the "A 500 is only a HYPOTHESIS" section on
     /// [`SynapseClient::publish_did_field`].
     RowLessAccount,
+}
+
+/// Synapse answered the profile-field read with 429 (`rc_profile`), and how long it asked the
+/// caller to wait.
+///
+/// [`SynapseClient::read_did_value`] (and so `read_did_field`) returns it INSIDE the `Err` it
+/// always returned for a 429: the error text is unchanged, and a caller that wants to wait and
+/// retry finds this with `err.downcast_ref::<ProfileRateLimited>()`. A caller that does not
+/// look sees the error it saw before. The live service never retries (a request must not
+/// sleep); the `remint-did-assertions` tool does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProfileRateLimited {
+    /// The server's hint: the body's `retry_after_ms` or the `Retry-After` header (seconds),
+    /// the larger when both are there. `None` when it gave neither, or neither was readable.
+    pub retry_after: Option<std::time::Duration>,
+}
+
+impl std::fmt::Display for ProfileRateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the profile read was rate limited (HTTP 429)")
+    }
+}
+
+impl std::error::Error for ProfileRateLimited {}
+
+/// The `Retry-After` header of a 429, when it is a whole number of seconds. The HTTP-date form
+/// is not read (Synapse sends seconds).
+fn retry_after_from_header(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    let seconds: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(std::time::Duration::from_secs(seconds))
+}
+
+/// The `retry_after_ms` of a 429's JSON body (`M_LIMIT_EXCEEDED`), when it is a whole number.
+fn retry_after_from_body(body: &str) -> Option<std::time::Duration> {
+    let millis = serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("retry_after_ms")?
+        .as_u64()?;
+    Some(std::time::Duration::from_millis(millis))
 }
 
 /// What a `PUT …/profile/{mxid}/{field}` status can be concluded from the
@@ -2864,6 +2920,8 @@ mod tests {
         /// Default `false`, which is stock Synapse (`config/server.py:561`) and
         /// what every other test in this module assumes.
         require_auth_on_profile_field: bool,
+        /// Headers sent with `reply_status` (a `Retry-After` on a 429).
+        reply_headers: Vec<(&'static str, String)>,
     }
 
     impl MockReplies {
@@ -2882,7 +2940,14 @@ mod tests {
                         .to_string(),
                 ),
                 require_auth_on_profile_field: false,
+                reply_headers: Vec::new(),
             }
+        }
+
+        /// Send this header with the status/body reply.
+        fn header(mut self, name: &'static str, value: &str) -> Self {
+            self.reply_headers.push((name, value.to_string()));
+            self
         }
 
         fn profile(mut self, reply: (axum::http::StatusCode, serde_json::Value)) -> Self {
@@ -3038,7 +3103,15 @@ mod tests {
                 let (status, body) = state.replies.profile_reply.clone();
                 return (status, axum::Json(body)).into_response();
             }
-            (state.replies.reply_status, state.replies.reply_body.clone()).into_response()
+            let mut reply =
+                (state.replies.reply_status, state.replies.reply_body.clone()).into_response();
+            for (name, value) in &state.replies.reply_headers {
+                reply.headers_mut().insert(
+                    axum::http::HeaderName::from_static(name),
+                    axum::http::HeaderValue::from_str(value).expect("a header value"),
+                );
+            }
+            reply
         }
 
         async fn localpart_available(State(state): State<MockState>) -> axum::response::Response {
@@ -3072,6 +3145,98 @@ mod tests {
     async fn with_redis_mint(client: SynapseClient) -> Option<SynapseClient> {
         let redis = siwx_oidc::test_support::redis().await?;
         Some(client.with_admin_mint(redis, "siwx-admin".to_string(), 300))
+    }
+
+    // -- read_did_value: a 429 carries the server's retry hint ---------------
+    //
+    // Synapse applies `rc_profile` (burst 500, then 1 per second per client IP when
+    // anonymous) to this route. The tool that reads every account waits on the hint;
+    // the live service does not (a request must not sleep). So the client exposes the 429
+    // and its hint distinctly, and changes nothing else about the error.
+
+    /// What a 429 on the profile-field read comes back as: the error, for a mock answering
+    /// with this body and these headers.
+    async fn rate_limited_read(body: &str, headers: &[(&'static str, &str)]) -> anyhow::Error {
+        let mut replies = MockReplies::new(axum::http::StatusCode::TOO_MANY_REQUESTS);
+        replies.reply_body = body.to_string();
+        for (name, value) in headers {
+            replies = replies.header(name, value);
+        }
+        let (client, _log, handle) = spawn_mock_synapse(replies).await;
+        let err = client
+            .read_did_value("someone", "matrix.test")
+            .await
+            .expect_err("a 429 is an error for the read, as it always was");
+        handle.abort();
+        err
+    }
+
+    fn hint_of(err: &anyhow::Error) -> Option<std::time::Duration> {
+        err.downcast_ref::<ProfileRateLimited>()
+            .expect("a 429 is a ProfileRateLimited inside the error")
+            .retry_after
+    }
+
+    #[tokio::test]
+    async fn a_429_carries_the_body_hint_in_a_typed_error() {
+        let err = rate_limited_read(
+            r#"{"errcode":"M_LIMIT_EXCEEDED","error":"Too Many Requests","retry_after_ms":2500}"#,
+            &[],
+        )
+        .await;
+        assert_eq!(hint_of(&err), Some(std::time::Duration::from_millis(2500)));
+    }
+
+    #[tokio::test]
+    async fn a_429_carries_the_retry_after_header_in_seconds() {
+        let err = rate_limited_read("{}", &[("retry-after", "3")]).await;
+        assert_eq!(hint_of(&err), Some(std::time::Duration::from_secs(3)));
+    }
+
+    #[tokio::test]
+    async fn with_both_hints_the_longer_one_wins() {
+        // Synapse sends both, the header rounded up to whole seconds.
+        let err = rate_limited_read(r#"{"retry_after_ms":2100}"#, &[("retry-after", "3")]).await;
+        assert_eq!(hint_of(&err), Some(std::time::Duration::from_secs(3)));
+        let err = rate_limited_read(r#"{"retry_after_ms":9000}"#, &[("retry-after", "3")]).await;
+        assert_eq!(hint_of(&err), Some(std::time::Duration::from_millis(9000)));
+    }
+
+    #[tokio::test]
+    async fn a_429_with_no_readable_hint_is_still_typed_with_none() {
+        let err = rate_limited_read("not json", &[]).await;
+        assert_eq!(hint_of(&err), None);
+        // An HTTP-date Retry-After is not read; neither is a negative or fractional number.
+        let err = rate_limited_read(
+            r#"{"retry_after_ms":-5}"#,
+            &[("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")],
+        )
+        .await;
+        assert_eq!(hint_of(&err), None);
+    }
+
+    /// Every caller sees the same error text it saw before the typed variant existed
+    /// (`resolve` puts it in its 502 body), and a 500 stays untyped.
+    #[tokio::test]
+    async fn the_error_text_is_unchanged_and_only_a_429_is_typed() {
+        let err = rate_limited_read("{}", &[]).await;
+        assert_eq!(
+            err.to_string(),
+            "read_did_field: HTTP 429 Too Many Requests. (A 500 on this route can mean the \
+             account has a `users` row but no `profiles` row \u{2014} element-hq/synapse#19702, \
+             unfixed in 1.159.0 \u{2014} so the field state is UNKNOWN, not absent.)"
+        );
+
+        let (client, _log, handle) = spawn_mock_synapse(MockReplies::new(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ))
+        .await;
+        let err = client
+            .read_did_value("someone", "matrix.test")
+            .await
+            .expect_err("a 500 is an error");
+        assert!(err.downcast_ref::<ProfileRateLimited>().is_none());
+        handle.abort();
     }
 
     fn sample_value() -> serde_json::Value {
