@@ -33,7 +33,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 serde_urlencoded = "0.7"
 sha2 = "0.10"
-base64 = "0.22"
+base64 = "0.23"
 tokio = { version = "1", features = ["full"] }
 url = "2"
 urlencoding = "2"
