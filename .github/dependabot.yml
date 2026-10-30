@@ -23,6 +23,10 @@ updates:
       npm-minor-patch:
         applies-to: version-updates
         update-types: [minor, patch]
+    # The UI builds on node 22; @types/node majors ahead of that build are not wanted.
+    ignore:
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: docker
     directory: /
