@@ -77,7 +77,7 @@ ADD --chmod=0644 --checksum=sha256:bfb1112d49db5b1daecdfef24bd7e2f3ea0bafb33aa67
 
 # NOTICE names this Alpine release and where its source is; bump them together
 # (the license check at the end of this stage fails when they disagree).
-FROM docker.io/library/alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+FROM docker.io/library/alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
 # A fixed unprivileged UID/GID, so file ownership on mounted volumes and
 # `runAsUser` policies can name it. Nothing is written at runtime (state lives
 # in Redis); the binaries and static/ stay root-owned and world-readable.
