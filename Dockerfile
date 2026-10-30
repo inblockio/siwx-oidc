@@ -34,7 +34,7 @@ FROM chef AS dep_cacher
 COPY --from=dep_planner /siwx-oidc/recipe.json recipe.json
 RUN cargo chef cook --release --locked --recipe-path recipe.json
 
-FROM docker.io/library/node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402 AS node_builder
+FROM docker.io/library/node:25-alpine@sha256:bdf2cca6fe3dabd014ea60163eca3f0f7015fbd5c7ee1b0e9ccb4ced6eb02ef4 AS node_builder
 ADD --chown=node:node ./static /siwx-oidc/static
 ADD --chown=node:node ./js/ui /siwx-oidc/js/ui
 WORKDIR /siwx-oidc/js/ui
