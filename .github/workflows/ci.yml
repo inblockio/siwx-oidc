@@ -543,6 +543,14 @@ jobs:
         with:
           python-version: "3.x"
 
+      # What the login page may ask a wallet for (js/ui/src/wallet.ts): an account, one
+      # signature and the switch to Ethereum mainnet. No browser and no server.
+      - name: Login page wallet unit test
+        working-directory: js/ui
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+
       - name: Build siwx-oidc
         run: cargo build --bin siwx-oidc
 

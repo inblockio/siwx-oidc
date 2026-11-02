@@ -144,6 +144,13 @@ Passkey sign-in is the default, highlighted method; the wallet is offered below 
 - **Wallet:** `@wagmi/core` with the `injected()` connector, i.e. whatever EIP-1193 wallet the
   browser exposes (MetaMask, Brave, Coinbase extension). The SIWE message is built with
   `viem/siwe` (`createSiweMessage`). There is no WalletConnect/Reown and no project id.
+  The wallet step is `js/ui/src/wallet.ts`, and Ethereum mainnet (chain id 1) is its one
+  network. The page asks the wallet for the `eth_accounts` permission, one `personal_sign`
+  and, for a wallet on another network, a switch to mainnet (declining it does not stop the
+  sign-in). It sends no transaction, reads no balance, signs no typed data and adds no
+  network; `js/ui/test/wallet.test.mjs` fails on any other request. The wording of the
+  wallet's own connect dialog ("see your accounts and balances, suggest transactions") is the
+  wallet's text for the `eth_accounts` permission; a page cannot narrow it.
 - **Passkey:** the browser WebAuthn API against `/webauthn/authenticate/*`, with a "register a
   new passkey" path. No cookie carries the result; the verified DID stays in Redis.
 - **Linking:** after a wallet sign-in the page offers to link a passkey to the wallet DID
