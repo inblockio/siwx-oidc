@@ -290,6 +290,8 @@ paths:
 
         `authorization_code`: the code is single use (deleted on exchange) and
         needs the PKCE `code_verifier` for the challenge bound at `/authorize`.
+        The client and the verifier are checked before the code is used: a
+        refused request leaves the code for the client it was issued to.
         `refresh_token`: accepts only a refresh token; an access token (a
         minted admin token included) is `invalid_grant`, like an unknown one.
 

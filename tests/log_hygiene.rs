@@ -71,7 +71,7 @@ fn access_metadata(did: &str) -> TokenMetadata {
 
 // -- 1. behaviour --------------------------------------------------------
 
-/// `set_code`, both outcomes of `try_consume_code`, `set_token`, `get_token`
+/// `set_code`, both outcomes of `peek_code` and of `try_consume_code`, `set_token`, `get_token`
 /// and `delete_token` log at `debug!`; none may print the code or the token,
 /// which are the Redis keys' own suffixes.
 #[tokio::test]
@@ -102,11 +102,13 @@ async fn the_redis_code_and_token_paths_log_fingerprints_never_values() {
     )
     .await
     .unwrap();
+    assert!(db.peek_code(&code).await.unwrap().is_some());
     assert!(db.try_consume_code(code.clone()).await.unwrap().is_some());
     assert!(
         db.try_consume_code(code.clone()).await.unwrap().is_none(),
         "the second exchange of a code finds nothing"
     );
+    assert!(db.peek_code(&code).await.unwrap().is_none());
     db.set_token(&token, &access_metadata(did), 60)
         .await
         .unwrap();

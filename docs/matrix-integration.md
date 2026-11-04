@@ -349,7 +349,9 @@ session has expired, to send the user back to a redirect URI the named client
 registered with `error=access_denied` and the link's `state` (else it shows a
 page saying the sign-in timed out). A code is single use,
 is deleted when it is exchanged, and is redeemable only at `POST /token` with
-its verifier.
+its verifier. The exchange checks the client and the verifier before it uses
+the code, so a refused request (another client, a wrong secret or verifier)
+leaves the code for the client it was issued to.
 
 ### Token kinds
 
