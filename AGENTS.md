@@ -586,6 +586,14 @@ doc; read it before changing the code the rule covers.
   codes. Pin: `a_consumed_code_leaves_no_entry`,
   `concurrent_consumers_of_one_code_have_exactly_one_winner`, `userinfo_accepts_only_an_access_token`,
   `an_authorization_code_is_never_a_bearer_token` (mock stack).
+- **A refused code exchange never spends the code.** `token_authorization_code` reads the entry
+  with `peek_code` (the keys `try_consume_code` takes, left in place), runs every check against
+  it (the client it names, its secret, the PKCE verifier, `exchange_issuance`), and consumes the
+  code only after all of them passed; `try_consume_code` stays the one step that decides which of
+  concurrent requests redeems it. Consuming first would let anyone who learns a code, without
+  the client's secret or verifier, deny that client its sign-in. Pin:
+  `a_refused_code_exchange_leaves_the_code_for_its_client`,
+  `peeking_a_code_leaves_it_for_its_consumer`.
 - **Discovery advertises only what is implemented.** `subject_types_supported` is `["public"]`
   because the `sub` is the user's DID, identical for every client; advertising `pairwise` would
   promise a per-client identifier. `scopes_supported` lists `offline_access` because generic mode

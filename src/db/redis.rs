@@ -150,6 +150,24 @@ end
 return entry
 "#;
 
+/// Read a single-use entry without using it: [`TAKE_SCRIPT`] without its
+/// deletes, over the same keys, so it finds exactly the entry a take would hand
+/// out. Writes nothing.
+const PEEK_SCRIPT: &str = r#"
+local entry = redis.call('GET', KEYS[1])
+if entry then
+  return entry
+end
+entry = redis.call('GET', KEYS[2])
+if not entry then
+  return false
+end
+if KEYS[3] and redis.call('EXISTS', KEYS[3]) == 1 then
+  return false
+end
+return entry
+"#;
+
 /// Set a single-use flag unless a build before digest keys already set its
 /// raw-keyed twin. `KEYS[1]` the legacy flag, `KEYS[2]` the digest flag,
 /// `ARGV[1]` its TTL in seconds. Returns 1 to the one caller that set it.
@@ -397,6 +415,20 @@ impl RedisClient {
         cmd.query_async(&mut *conn)
             .await
             .map_err(|e| anyhow!("Failed to take a single-use entry: {}", e))
+    }
+
+    /// Run [`PEEK_SCRIPT`] over the keys [`take`](Self::take) would take.
+    async fn peek(&self, keys: &[&str]) -> Result<Option<String>> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| anyhow!("Failed to get connection to database: {}", e))?;
+        let mut cmd = bb8_redis::redis::cmd("EVAL");
+        cmd.arg(PEEK_SCRIPT).arg(keys.len()).arg(keys);
+        cmd.query_async(&mut *conn)
+            .await
+            .map_err(|e| anyhow!("Failed to read a single-use entry: {}", e))
     }
 
     /// Run [`CLAIM_SCRIPT`]: set `flag` for `ttl` seconds unless `legacy_flag`
@@ -1702,6 +1734,22 @@ impl DBClient for RedisClient {
         }
     }
 
+    async fn peek_code(&self, code: &str) -> Result<Option<CodeEntry>> {
+        // The keys `try_consume_code` takes, read and left in place.
+        let legacy = legacy_code_key(code);
+        let marker = format!("{legacy}/consumed");
+        let raw = self.peek(&[&code_key(code), &legacy, &marker]).await?;
+        debug!(
+            "peek_code: code_fp={} found={}",
+            fingerprint(code),
+            raw.is_some()
+        );
+        raw.map(|e| {
+            serde_json::from_str(&e).map_err(|e| anyhow!("Failed to deserialize code entry: {}", e))
+        })
+        .transpose()
+    }
+
     async fn try_mark_session_signed_in(&self, id: String) -> Result<bool> {
         // Atomic: only one sign_in wins the flag, and a session the previous
         // build already signed in (`sessions/{raw}/signed_in`) stays signed in.
@@ -2910,6 +2958,86 @@ mod tests {
             client.try_consume_code(code).await.unwrap().is_none(),
             "a second consumer gets nothing"
         );
+    }
+
+    /// `peek_code` finds exactly what `try_consume_code` would hand out, in
+    /// every layout, and leaves it: the entry stays for its one consumer, a
+    /// consumed code peeks as gone, and a code an older build marked consumed
+    /// peeks as gone too.
+    #[tokio::test]
+    async fn peeking_a_code_leaves_it_for_its_consumer() {
+        let Some(client) = crate::test_support::redis().await else {
+            return;
+        };
+        let code = format!("code-peek-{}", unique_nonce());
+        client
+            .set_code(code.clone(), code_entry("did:key:zDnPEEKED"))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                client
+                    .peek_code(&code)
+                    .await
+                    .unwrap()
+                    .map(|e| e.did)
+                    .as_deref(),
+                Some("did:key:zDnPEEKED"),
+                "a peek finds the entry and leaves it"
+            );
+        }
+        assert_eq!(
+            client
+                .try_consume_code(code.clone())
+                .await
+                .unwrap()
+                .map(|e| e.did)
+                .as_deref(),
+            Some("did:key:zDnPEEKED"),
+            "the consumer still gets the entry after the peeks"
+        );
+        assert!(
+            client.peek_code(&code).await.unwrap().is_none(),
+            "a consumed code peeks as gone"
+        );
+
+        // The previous build's raw key: found, left, consumed once.
+        let legacy = format!("code-peek-prev-{}", unique_nonce());
+        let legacy_key = format!("{KV_CODE_PREFIX}/{legacy}");
+        client
+            .set_ex_raw(
+                &legacy_key,
+                &serde_json::to_string(&code_entry("did:key:zDnPEEKPREV")).unwrap(),
+                60,
+            )
+            .await
+            .unwrap();
+        assert!(client.peek_code(&legacy).await.unwrap().is_some());
+        assert!(client.get_raw(&legacy_key).await.unwrap().is_some());
+        assert!(client
+            .try_consume_code(legacy.clone())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(client.peek_code(&legacy).await.unwrap().is_none());
+
+        // An older build's `/consumed` marker: gone to a peek as to a take.
+        let marked = format!("code-peek-old-{}", unique_nonce());
+        let marked_key = format!("{KV_CODE_PREFIX}/{marked}");
+        client
+            .set_ex_raw(
+                &marked_key,
+                &serde_json::to_string(&code_entry("did:key:zDnPEEKOLD")).unwrap(),
+                60,
+            )
+            .await
+            .unwrap();
+        client
+            .set_ex_raw(&format!("{marked_key}/consumed"), "1", 60)
+            .await
+            .unwrap();
+        assert!(client.peek_code(&marked).await.unwrap().is_none());
+        assert!(client.try_consume_code(marked).await.unwrap().is_none());
     }
 
     /// A code that an older build already exchanged (it left a `/consumed`

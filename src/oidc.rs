@@ -1844,17 +1844,19 @@ async fn token_authorization_code(
         })
     })?;
 
-    let code_entry = db_client
-        .try_consume_code(code.clone())
-        .await?
-        .ok_or_else(|| {
-            CustomError::BadRequestToken(TokenError {
-                error: CoreErrorResponseType::InvalidGrant,
-                error_description: "Unknown or already-exchanged code.".to_string(),
-            })
-        })?;
-    // What the code held, to put it back if the exchange answers nothing.
-    let consumed = code_entry.clone();
+    let unknown_code = || {
+        CustomError::BadRequestToken(TokenError {
+            error: CoreErrorResponseType::InvalidGrant,
+            error_description: "Unknown or already-exchanged code.".to_string(),
+        })
+    };
+
+    // Every check below runs against the code's entry while the code stays in
+    // the store, and the code is consumed only once they all passed. A request
+    // that fails one (a wrong client, secret or verifier) must not spend the
+    // code: whoever learns a code without its client's credentials could
+    // otherwise deny that client its sign-in.
+    let code_entry = db_client.peek_code(&code).await?.ok_or_else(unknown_code)?;
 
     // Bind the code to the client it was issued to, and authenticate that
     // client, through the helpers the refresh grant uses too. A correct client
@@ -1924,6 +1926,17 @@ async fn token_authorization_code(
 
     // Decided before any claim is looked up, so a refusal costs no ENS call.
     let issuance = exchange_issuance(delegated_auth_enabled(config), &client_entry, &code_entry)?;
+
+    // Every check passed: consume the code. This atomic read-and-delete stays
+    // the one step that decides who redeems it, so of concurrent requests that
+    // all passed the checks exactly one gets the entry and the others are
+    // refused like a replay. The entry is the one the checks read: only
+    // `sign_in` writes a code's entry, and `restore_code` puts back that same
+    // entry.
+    let consumed = db_client
+        .try_consume_code(code.clone())
+        .await?
+        .ok_or_else(unknown_code)?;
 
     let now = Utc::now();
     // This request is DIFFERENT from the sign_in that provisioned the account,
@@ -9829,13 +9842,23 @@ mod client_binding_tests {
         code: &str,
         who: Presented<'_>,
     ) -> Result<SiwxTokenResponse, CustomError> {
+        exchange_with_verifier(db, config, code, who, Some(VERIFIER)).await
+    }
+
+    async fn exchange_with_verifier(
+        db: &RedisClient,
+        config: &Config,
+        code: &str,
+        who: Presented<'_>,
+        verifier: Option<&str>,
+    ) -> Result<SiwxTokenResponse, CustomError> {
         token(
             TokenForm {
                 code: Some(code.to_string()),
                 client_id: who.client_id.map(str::to_string),
                 client_secret: who.form_secret.map(str::to_string),
                 grant_type: CoreGrantType::AuthorizationCode,
-                code_verifier: Some(VERIFIER.to_string()),
+                code_verifier: verifier.map(str::to_string),
                 refresh_token: None,
                 device_code: None,
             },
@@ -11122,6 +11145,90 @@ mod client_binding_tests {
                 );
             }
         }
+    }
+
+    /// A code exchange that fails a check (the client it names, its secret,
+    /// the PKCE verifier) changes nothing: the code stays for the client it was
+    /// issued to, which then redeems it, once. Whoever learns a code without
+    /// that client's secret and verifier can neither redeem it nor spend it.
+    #[tokio::test]
+    async fn a_refused_code_exchange_leaves_the_code_for_its_client() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let config = Config {
+            require_secret: true,
+            ..Config::default()
+        };
+        let client = seed_client(&db, Registration::Confidential).await;
+        let other = seed_client(&db, Registration::Confidential).await;
+        let genuine = Presented {
+            client_id: Some(&client),
+            form_secret: Some(SECRET),
+            header_client_id: None,
+            header_secret: None,
+        };
+        let code = seed_code(&db, &client).await;
+
+        for (what, who, verifier, expected) in [
+            (
+                "a wrong verifier",
+                genuine,
+                Some("a-verifier-the-client-never-made"),
+                "invalid_grant",
+            ),
+            ("no verifier", genuine, None, "invalid_grant"),
+            (
+                "a wrong secret",
+                Presented {
+                    form_secret: Some("wrong"),
+                    ..genuine
+                },
+                Some(VERIFIER),
+                "invalid_client: Bad secret.",
+            ),
+            (
+                "no secret",
+                Presented {
+                    client_id: Some(&client),
+                    ..NOTHING
+                },
+                Some(VERIFIER),
+                "invalid_client: Secret required.",
+            ),
+            (
+                "another client's id and secret",
+                Presented {
+                    client_id: Some(&other),
+                    ..genuine
+                },
+                Some(VERIFIER),
+                "invalid_grant",
+            ),
+        ] {
+            let result = exchange_with_verifier(&db, &config, &code, who, verifier).await;
+            assert_eq!(outcome(&result), expected, "{what}");
+            assert!(
+                db.peek_code(&code).await.unwrap().is_some(),
+                "{what}: the refused request left the code in place"
+            );
+        }
+
+        let redeemed = exchange(&db, &config, &code, genuine).await;
+        assert_eq!(
+            outcome(&redeemed),
+            "ok",
+            "its client redeems the code after every refusal"
+        );
+        assert!(
+            db.peek_code(&code).await.unwrap().is_none(),
+            "the redeemed code is gone"
+        );
+        assert_eq!(
+            outcome(&exchange(&db, &config, &code, genuine).await),
+            "invalid_grant",
+            "the code is redeemed once"
+        );
     }
 
     /// Every accepted use of a dynamic client restores its lifetime, and only the client

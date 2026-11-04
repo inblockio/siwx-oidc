@@ -954,9 +954,15 @@ pub trait DBClient {
     async fn guest_did_has_record(&self, did: &str) -> Result<bool>;
     /// Atomically consume an authorization code: read and delete its entry in
     /// one step. Returns the entry to exactly one caller, or None if the code is
-    /// unknown, expired or already consumed. There is no other reader of codes:
-    /// a code is redeemable only here, at the token endpoint.
+    /// unknown, expired or already consumed. Codes are read only at the token
+    /// endpoint: there, and only there, a code is redeemable.
     async fn try_consume_code(&self, code: String) -> Result<Option<CodeEntry>>;
+    /// Read an authorization code's entry without consuming it: the entry
+    /// [`try_consume_code`](Self::try_consume_code) would hand out now, or None.
+    /// The token endpoint checks the request against it first, so a request that
+    /// fails a check (client, secret, PKCE verifier) leaves the code for the
+    /// client it was issued to; only a request that passes consumes it.
+    async fn peek_code(&self, code: &str) -> Result<Option<CodeEntry>>;
     /// Atomically mark a session as signed-in. Returns true on first call,
     /// false if the session was already signed-in.
     async fn try_mark_session_signed_in(&self, id: String) -> Result<bool>;
