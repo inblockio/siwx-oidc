@@ -462,7 +462,11 @@ async fn authorize(
         )
         .await;
     }
-    let (url, session_cookie) = oidc::authorize(params, &state.redis_client).await?;
+    // The configured resources (RFC 8707), which start-up validated.
+    let resources = siwx_oidc::resource::Registry::parse(&state.config.resources)
+        .map_err(|e| anyhow::anyhow!("the configured resources do not parse: {e}"))?;
+    let (url, session_cookie) =
+        oidc::authorize_bound(params, &state.redis_client, &resources).await?;
     let mut headers = HeaderMap::new();
     headers.insert(
         header::SET_COOKIE,
@@ -1799,6 +1803,16 @@ pub async fn main() {
     // Checked whether or not a static client uses it, before anything reads Redis.
     client_policy::validate_mail_domain(config.mail_domain.as_deref())
         .unwrap_or_else(|e| panic!("FATAL: {e}"));
+    // The resource servers this provider issues tokens for (RFC 8707): every
+    // entry must parse and be canonical before anything is served.
+    let resources = siwx_oidc::resource::Registry::parse(&config.resources)
+        .unwrap_or_else(|e| panic!("FATAL: {e}"));
+    if !resources.is_empty() {
+        info!(
+            scopes = %resources.scopes().join(" "),
+            "resources configured: requests bound to one get RFC 9068 JWT access tokens"
+        );
+    }
     let redis_client = RedisClient::new(&config.redis_url)
         .await
         .expect("Could not build Redis client")
@@ -3298,6 +3312,7 @@ mod token_store_fault_tests {
                 code_verifier: None,
                 refresh_token: Some(rt),
                 device_code: None,
+                resource: None,
             }),
         )
         .await
@@ -3399,6 +3414,7 @@ mod signer_fault_tests {
                     localpart: Some(siwx_oidc::mxid::localpart_for(DID)),
                     scope: Some("openid".into()),
                     client_class: Some(ClientClass::Matrix),
+                    resource: None,
                 },
             )
             .await
@@ -3417,6 +3433,7 @@ mod signer_fault_tests {
                 access_ttl: ACCESS_TOKEN_TTL,
                 refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
                 absolute_deadline: None,
+                resource: None,
             })
             .await
             .unwrap()
@@ -3441,6 +3458,7 @@ mod signer_fault_tests {
                 code_verifier: Some(VERIFIER.to_string()),
                 refresh_token: None,
                 device_code: None,
+                resource: None,
             }),
         )
         .await

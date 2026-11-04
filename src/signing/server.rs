@@ -88,7 +88,7 @@ impl ServiceOptions {
 #[derive(Default)]
 struct Window {
     /// Signatures made, per purpose (indexed by [`slot`]).
-    signed: [u64; 4],
+    signed: [u64; 5],
     /// Requests refused (any error answer). Not part of the alarm: a refusal
     /// signs nothing.
     refused: u64,
@@ -118,6 +118,7 @@ fn slot(purpose: Purpose) -> usize {
         Purpose::DidProof => 1,
         Purpose::LogoutToken => 2,
         Purpose::Userinfo => 3,
+        Purpose::AccessToken => 4,
     }
 }
 
@@ -195,6 +196,7 @@ impl SignerService {
                 did_proofs = window.signed[slot(Purpose::DidProof)],
                 logout_tokens = window.signed[slot(Purpose::LogoutToken)],
                 userinfo_responses = window.signed[slot(Purpose::Userinfo)],
+                access_tokens = window.signed[slot(Purpose::AccessToken)],
                 refused = window.refused,
                 kid = %self.kid(),
                 "sign counts (last minute)"

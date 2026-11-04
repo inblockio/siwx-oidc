@@ -44,6 +44,9 @@ use super::Purpose;
 /// Back-Channel Logout 1.0, §2.4).
 pub const BACKCHANNEL_LOGOUT_EVENT: &str = "http://schemas.openid.net/event/backchannel-logout";
 
+/// The JWS `typ` of an RFC 9068 access token (section 2.1).
+pub const ACCESS_TOKEN_TYP: &str = "at+jwt";
+
 /// The bounds a message is checked against.
 #[derive(Clone, Debug)]
 pub struct ShapePolicy {
@@ -149,6 +152,7 @@ pub fn check(
         }
         Purpose::LogoutToken => typ.and_then(Value::as_str) == Some("logout+jwt"),
         Purpose::DidProof => typ.and_then(Value::as_str) == Some("JWT"),
+        Purpose::AccessToken => typ.and_then(Value::as_str) == Some(ACCESS_TOKEN_TYP),
     };
     if !typ_ok {
         return Err(ShapeError::Typ);
@@ -168,7 +172,10 @@ pub fn check(
     match purpose {
         Purpose::IdToken => {
             require_audience(&payload)?;
-            forbid(&payload, &["events", "mxid"])?;
+            // `client_id`, `scope` and `jti` are an access token's members (RFC
+            // 9068); an ID token carries none of them, so no ID token signature
+            // serves a resource server as an access token.
+            forbid(&payload, &["events", "mxid", "client_id", "scope", "jti"])?;
             check_times(policy, &payload, now)
         }
         Purpose::Userinfo => {
@@ -188,6 +195,35 @@ pub fn check(
             if !events.contains_key(BACKCHANNEL_LOGOUT_EVENT) {
                 return Err(ShapeError::Claim);
             }
+            check_times(policy, &payload, now)
+        }
+        Purpose::AccessToken => {
+            // RFC 9068 section 2.2: `aud` is the resource, and `client_id`, `jti`
+            // and the granted `scope` travel with it. None of an ID token's
+            // session members, so no access token serves as an ID token, and no
+            // `mxid`, so none serves as a DID proof.
+            require_audience(&payload)?;
+            for name in ["client_id", "scope", "jti"] {
+                if payload
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                {
+                    return Err(ShapeError::Claim);
+                }
+            }
+            forbid(
+                &payload,
+                &[
+                    "nonce",
+                    "at_hash",
+                    "c_hash",
+                    "auth_time",
+                    "sid",
+                    "mxid",
+                    "events",
+                ],
+            )?;
             check_times(policy, &payload, now)
         }
         Purpose::DidProof => {
@@ -433,13 +469,81 @@ mod tests {
         )
     }
 
+    fn access_token() -> (Value, Value) {
+        (
+            json!({"alg": "ES256", "typ": "at+jwt", "kid": "0123456789abcdef"}),
+            json!({"iss": "https://example.org/", "sub": "did:key:zExample",
+                "aud": "https://mcp.example.org/mcp", "client_id": "client",
+                "scope": "aqua:read", "iat": NOW, "exp": NOW + 300, "jti": "j"}),
+        )
+    }
+
     fn base(purpose: Purpose) -> (Value, Value) {
         match purpose {
             Purpose::IdToken => id_token(),
             Purpose::Userinfo => userinfo(),
             Purpose::LogoutToken => logout_token(),
             Purpose::DidProof => did_proof(),
+            Purpose::AccessToken => access_token(),
         }
+    }
+
+    /// An access token names its resource, client, scope and id, carries its
+    /// times, and none of an ID token's session members.
+    #[test]
+    fn an_access_token_carries_exactly_what_rfc_9068_asks_and_no_session_member() {
+        let (h, p) = access_token();
+        for name in ["aud", "client_id", "scope", "jti"] {
+            let mut bad = p.clone();
+            bad.as_object_mut().unwrap().remove(name);
+            assert_eq!(
+                verdict(Purpose::AccessToken, &h, &bad),
+                Err(ShapeError::Claim),
+                "without {name}"
+            );
+            let mut bad = p.clone();
+            bad[name] = json!("");
+            assert_eq!(
+                verdict(Purpose::AccessToken, &h, &bad),
+                Err(ShapeError::Claim),
+                "with an empty {name}"
+            );
+        }
+        for name in [
+            "nonce",
+            "at_hash",
+            "c_hash",
+            "auth_time",
+            "sid",
+            "mxid",
+            "events",
+        ] {
+            let mut bad = p.clone();
+            bad[name] = json!("x");
+            assert_eq!(
+                verdict(Purpose::AccessToken, &h, &bad),
+                Err(ShapeError::Forbidden),
+                "with {name}"
+            );
+        }
+        let mut bad = h.clone();
+        bad["typ"] = json!("JWT");
+        assert_eq!(
+            verdict(Purpose::AccessToken, &bad, &p),
+            Err(ShapeError::Typ)
+        );
+        let mut bad = h.clone();
+        bad.as_object_mut().unwrap().remove("typ");
+        assert_eq!(
+            verdict(Purpose::AccessToken, &bad, &p),
+            Err(ShapeError::Typ)
+        );
+        let mut bad = p.clone();
+        bad["exp"] = json!(NOW + 3601);
+        assert_eq!(
+            verdict(Purpose::AccessToken, &h, &bad),
+            Err(ShapeError::Exp)
+        );
     }
 
     fn verdict(purpose: Purpose, header: &Value, payload: &Value) -> Result<(), ShapeError> {

@@ -14,6 +14,7 @@ cargo test --bin siwx-oidc
 
 echo "== 3/5  HTTP-level account E2E (real wallet signatures + session) =="
 cargo test --test e2e_account_management -- --ignored --test-threads=1
+cargo test --test e2e_resource_binding -- --ignored --test-threads=1
 
 echo "== 4/5  legacy CS-API device-delete probe =="
 bash e2e/legacy-cs-api-probe.sh

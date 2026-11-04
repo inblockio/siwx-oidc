@@ -341,6 +341,12 @@ pub struct CodeEntry {
     /// [`ENTRY_LIFETIME`], so `#[serde(default)]`.
     #[serde(default)]
     pub client_class: Option<ClientClass>,
+    /// The resource the authorization request named (RFC 8707), copied from
+    /// the bound request. The exchange issues a grant for that resource only.
+    /// `#[serde(default)]` so a code the previous build wrote reads as an
+    /// ordinary one.
+    #[serde(default)]
+    pub resource: Option<String>,
 }
 
 /// Registration metadata this provider reads beyond OIDC Core client
@@ -663,6 +669,13 @@ pub struct AuthorizationRequest {
     /// The OIDC `nonce`, which the ID token carries.
     #[serde(default)]
     pub nonce: Option<Nonce>,
+    /// The resource the request named (RFC 8707), a configured resource's URI
+    /// byte for byte. `sign_in` copies it into the code; the exchange grants
+    /// the resource's scopes and issues a JWT access token with it as `aud`.
+    /// `None`: an ordinary request. `#[serde(default)]` so a session the
+    /// previous build bound reads as one.
+    #[serde(default)]
+    pub resource: Option<String>,
 }
 
 /// Written out because [`Nonce`] has no `PartialEq`; destructured so that a
@@ -677,6 +690,7 @@ impl PartialEq for AuthorizationRequest {
             code_challenge,
             scope,
             nonce,
+            resource,
         } = self;
         *client_id == other.client_id
             && *redirect_uri == other.redirect_uri
@@ -685,6 +699,7 @@ impl PartialEq for AuthorizationRequest {
             && *code_challenge == other.code_challenge
             && *scope == other.scope
             && nonce.as_ref().map(Nonce::secret) == other.nonce.as_ref().map(Nonce::secret)
+            && *resource == other.resource
     }
 }
 

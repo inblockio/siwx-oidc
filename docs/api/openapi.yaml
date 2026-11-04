@@ -212,6 +212,10 @@ paths:
           allows. A request that would grant it no `openid` is answered by a
           redirect to the `redirect_uri` with `error=invalid_scope` and the
           `state`.
+        - A request that names a `resource` (RFC 8707) is bound to that
+          configured resource server for its whole flow, whatever the client's
+          class: see the parameter. The sign-in provisions the account and
+          publishes the DID but upserts no Matrix device.
 
         The validated request (client, redirect URI, state, response mode,
         PKCE challenge) is bound to the session; `/sign_in` issues the code for
@@ -226,8 +230,9 @@ paths:
         - { name: code_challenge, in: query, required: true, schema: { type: string } }
         - { name: code_challenge_method, in: query, required: false, schema: { type: string, enum: [S256] } }
         - { name: response_mode, in: query, required: false, schema: { type: string, enum: [query, fragment] } }
+        - { name: resource, in: query, required: false, schema: { type: string, format: uri }, description: "RFC 8707 resource indicator: the exact URI of a configured resource server (`resources`). The request is then bound to it: `openid` is not required, the grant is the requested scopes the resource lists (plus `offline_access` when requested and the client may refresh), and the access tokens are RFC 9068 JWTs with the URI as `aud`. An unconfigured resource is `invalid_target` on the redirect URI; a request that asks for none of the resource's scopes is `invalid_scope`." }
       responses:
-        "303": { description: Redirect to the login page, or back to the relying party with an OAuth error. }
+        "303": { description: Redirect to the login page, or back to the relying party with an OAuth error (`invalid_target` for a resource this provider issues no tokens for). }
         "400": { $ref: "#/components/responses/BadRequest" }
 
   /sign_in:
@@ -328,6 +333,22 @@ paths:
         `invalid_grant`. The device-code grant mints a Matrix session, so a
         generic-class client is refused it with `unauthorized_client`.
 
+        A code whose request named a `resource` (RFC 8707) is exchanged for an
+        `oidc` grant with no device for that resource, in either deployment mode
+        and for either class (which must still be the class the code was issued
+        to). Its scope is the requested scopes the resource lists, then
+        `offline_access` when requested and the client may refresh; the response
+        names it when it differs from the request. The access token is an RFC
+        9068 JWT (`typ` `at+jwt`, ES256 under the published key, `iss`, `sub` the
+        DID, `aud` the resource URI, `client_id`, `scope`, `iat`, `exp`, `jti`),
+        no ID token is issued, and every refresh answers a new JWT for the same
+        resource. The JWT is for the resource server, which verifies it offline
+        against `/jwk`: introspection and `/userinfo` do not accept it, and
+        revoking its grant is not seen by the resource server before the token's
+        300 s expire. A `resource` in the token request must be the code's
+        (absent, the code's is issued for); another, one for a code that named
+        none, or one the configuration no longer names, is `invalid_target`.
+
         **Client authentication.** `authorization_code` and `refresh_token` are
         bound to the client the code or token was issued to, and share one rule.
         The client named in the request, in `client_id` or as the user name of an
@@ -360,6 +381,7 @@ paths:
                 client_id: { type: string }
                 client_secret: { type: string }
                 code_verifier: { type: string, description: PKCE verifier; required with `authorization_code`. }
+                resource: { type: string, format: uri, description: "RFC 8707 resource indicator; with `authorization_code`, the resource the code's request named." }
       responses:
         "200":
           description: Tokens.

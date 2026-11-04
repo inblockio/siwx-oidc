@@ -445,6 +445,68 @@ revoked (token revocation, sign-out or account deactivation), its refresh token 
 days, or its absolute lifetime ends when one is set. A generic-class client's sessions do end; see
 the next section.
 
+### Resource servers (RFC 8707)
+
+| Key | Environment | Default | Meaning |
+|---|---|---|---|
+| `resources` | `SIWXOIDC_RESOURCES__<name>` | none | Map of a name of your choosing to a JSON resource entry `{"uri": …, "scopes": […]}`: a resource server (an MCP server) this provider issues access tokens for. |
+
+A resource is a server that accepts this provider's access tokens and verifies them itself,
+such as an MCP server under the MCP authorization specification (2026-07-28). Its `uri` is its
+canonical URI (RFC 8707 section 2), exactly as the server names itself in its protected-resource
+metadata and as clients send it in the `resource` parameter: absolute, `http` or `https`,
+lowercase scheme and host, no default port, no user information, no query, no fragment and no
+trailing slash (`https://mcp.example.org/mcp` and `https://mcp.example.org/mcp/` would be two
+resources). Its `scopes` are the scope words the server understands, each one word of printable
+characters (RFC 6749 section 3.3). Start-up refuses an entry that is not of that form, lists no
+scope or one twice, names a `uri` another entry names, or lists a scope that belongs to this
+provider or the homeserver (`openid`, `profile`, `offline_access`, `urn:matrix:*`, `urn:synapse:*`);
+each refusal names the entry and the rule, never the value.
+
+A request that names a configured resource in `resource`, at `/authorize` and again at `/token`,
+is bound to it for its whole flow, whatever the client's class:
+
+- `openid` is not required, and no ID token is issued: the token is for the resource server, not
+  for this provider.
+- The grant is the requested scopes the resource lists, in the resource's order, then
+  `offline_access` when it was requested and the client's registration allows the refresh grant
+  (that is the one way such a client gets a refresh token). Nothing else is granted: `openid`,
+  `profile` and every Matrix scope are dropped, and the token response names the granted scope
+  when it differs from the request. A request that asks for none of the resource's scopes is
+  refused at `/authorize` with `invalid_scope`; one that names a resource not configured, with
+  `invalid_target`.
+- The sign-in provisions the account and publishes the DID, but upserts no Synapse device and
+  arms no cross-signing reset, and it never guesses a localpart (503 when the homeserver cannot
+  confirm the account), like a generic-class sign-in.
+- The access token is an RFC 9068 JWT: header `{"alg":"ES256","typ":"at+jwt","kid":…}` under the
+  published signing key, claims `iss` (this provider), `sub` (the DID, exact case), `aud` (the
+  resource URI, byte for byte), `client_id`, `scope`, `iat`, `exp` (300 s after `iat`) and a
+  random `jti`. The resource server verifies it against `/jwk`; a token issued for one resource
+  is refused by every other, because `aud` names exactly one. Every refresh answers a new JWT for
+  the same resource. The JWT is not a credential of this provider's: introspection and
+  `/userinfo` refuse it, and a `/oauth2/revoke` of it revokes nothing (revoke the refresh token).
+  Revoking the grant (sign-out, device deletion, account deactivation, the refresh token) stops
+  the next refresh at once, but a JWT already issued stays valid at the resource server until its
+  `exp`, at most 300 s: there is no introspection for it.
+- A `resource` at `/token` must be the one the code's request named (absent, that one is issued
+  for); another, one for a code that named none, or one removed from the configuration since the
+  sign-in is `invalid_target`. The grant records its resource, so a rotation keeps it.
+
+Discovery lists every configured resource's scopes in `scopes_supported`. Changing or removing an
+entry does not end the grants already issued for it; a removed resource's refresh tokens keep
+rotating until they expire or are revoked, and their JWTs keep naming the old URI. The signer
+(`signing_backend = socket`) signs access tokens under their own purpose, `access_token`, and
+counts them in its `access_tokens` column.
+
+```toml
+[default.resources]
+mcp = '{"uri":"https://mcp.example.org/mcp","scopes":["aqua:read","aqua:write"]}'
+```
+
+An MCP client then sends `resource=https://mcp.example.org/mcp` and `scope=aqua:read aqua:write
+offline_access`, and the MCP server, which publishes this provider as its authorization server,
+validates `aud` against its own URI.
+
 ### Changes that end a generic client's sessions
 
 A generic client's session carries a scope this provider decided from the client's entry, so it

@@ -263,6 +263,8 @@ jobs:
         env:
           SIWXOIDC_MAIL_DOMAIN: matrix.test
           SIWXOIDC_DEFAULT_CLIENTS__MAILE2E: '{"secret":"not-a-secret-e2e-fixture","class":"generic","allowed_scopes":["openid","io.inblock.mail","offline_access"],"metadata":{"redirect_uris":["http://localhost:0/callback"],"token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"]}}'
+          # The resource server of tests/e2e_resource_binding.rs (RFC 8707); e2e/env.sh sets the same.
+          SIWXOIDC_RESOURCES__MCPE2E: '{"uri":"http://mcp.test/mcp","scopes":["aqua:read","aqua:write"]}'
         run: |
           nohup env -u SIWEOIDC_HOST ./target/debug/siwx-oidc > /tmp/siwx-oidc.log 2>&1 &
           echo $! > /tmp/siwx-oidc.pid
@@ -319,6 +321,11 @@ jobs:
       # every Matrix surface refusing its tokens.
       - name: E2E generic client
         run: cargo test --test e2e_generic_client -- --ignored --test-threads=1
+
+      # Resource indicators (RFC 8707) and JWT access tokens (RFC 9068) through the wallet
+      # code flow: a token for the configured resource `mcpe2e`, verified against /jwk.
+      - name: E2E resource binding
+        run: cargo test --test e2e_resource_binding -- --ignored --test-threads=1
 
       # Race/teardown hazard register H1..H14 (14/14 promoted -- this said 12/12
       # for two suites' worth of growth; the count is now checked, not recited).
@@ -413,6 +420,8 @@ jobs:
         env:
           SIWXOIDC_MAIL_DOMAIN: matrix.test
           SIWXOIDC_DEFAULT_CLIENTS__MAILE2E: '{"secret":"not-a-secret-e2e-fixture","class":"generic","allowed_scopes":["openid","io.inblock.mail","offline_access"],"metadata":{"redirect_uris":["http://localhost:0/callback"],"token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"]}}'
+          # The resource server of tests/e2e_resource_binding.rs (RFC 8707); e2e/env.sh sets the same.
+          SIWXOIDC_RESOURCES__MCPE2E: '{"uri":"http://mcp.test/mcp","scopes":["aqua:read","aqua:write"]}'
         run: |
           kill "$(cat /tmp/siwx-oidc.pid)"
           while kill -0 "$(cat /tmp/siwx-oidc.pid)" 2>/dev/null; do sleep 0.2; done

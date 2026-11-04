@@ -143,6 +143,7 @@ pub fn admin_service_grant(localpart: &str, ttl: u64) -> NewGrant {
         // A bearer credential: no refresh token, so no refresh endpoint accepts it.
         refresh_inactivity_secs: None,
         absolute_deadline: None,
+        resource: None,
     }
 }
 

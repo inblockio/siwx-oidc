@@ -52,3 +52,9 @@ export SIWXOIDC_MAIL_DOMAIN="${SIWXOIDC_MAIL_DOMAIN:-matrix.test}"
 if [ -z "${SIWXOIDC_DEFAULT_CLIENTS__MAILE2E:-}" ]; then
   export SIWXOIDC_DEFAULT_CLIENTS__MAILE2E='{"secret":"not-a-secret-e2e-fixture","class":"generic","allowed_scopes":["openid","io.inblock.mail","offline_access"],"metadata":{"redirect_uris":["http://localhost:0/callback"],"token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"]}}'
 fi
+# A resource server (RFC 8707) for tests/e2e_resource_binding.rs: a request that names it is
+# granted its scopes and gets RFC 9068 JWT access tokens with its URI as `aud`. No server
+# listens there; the suite verifies the tokens against `/jwk` itself. Mode-independent.
+if [ -z "${SIWXOIDC_RESOURCES__MCPE2E:-}" ]; then
+  export SIWXOIDC_RESOURCES__MCPE2E='{"uri":"http://mcp.test/mcp","scopes":["aqua:read","aqua:write"]}'
+fi

@@ -371,6 +371,9 @@ pub struct NewGrant {
     /// many seconds after its last rotation; `None` issues none, and the grant
     /// lives exactly as long as its access token. A `service` grant takes `None`.
     pub refresh_inactivity_secs: Option<u64>,
+    /// The resource the grant is for (RFC 8707): every access token of the
+    /// grant is a JWT with this `aud`. `None` for an ordinary grant.
+    pub resource: Option<String>,
     /// An absolute expiry in Unix seconds written into the grant as `absolute_exp`
     /// (S5: a guest's deadline), on top of any configured lifetime cap; the earlier
     /// of the two applies. A deadline at or before `now` refuses the issue
@@ -439,6 +442,9 @@ pub struct GrantView {
     /// The OIDC session id (I8); `None` for a grant issued without an ID token
     /// or before Phase 4.
     pub sid: Option<String>,
+    /// The resource the grant is for (RFC 8707); `None` for an ordinary grant
+    /// and for one written before resources existed.
+    pub resource: Option<String>,
 }
 
 impl GrantView {
@@ -466,6 +472,7 @@ impl GrantView {
             access_ttl: f.get("access_ttl")?.parse().ok()?,
             generation: f.get("generation")?.parse().ok()?,
             sid: f.get("sid").filter(|v| !v.is_empty()).cloned(),
+            resource: f.get("resource").filter(|v| !v.is_empty()).cloned(),
         })
     }
 }
@@ -851,6 +858,9 @@ if ARGV[17] ~= '' then
     return redis.error_reply('sid collision')
   end
   redis.call('HSET', KEYS[1], 'sid', ARGV[17])
+end
+if ARGV[19] ~= '' then
+  redis.call('HSET', KEYS[1], 'resource', ARGV[19])
 end
 redis.call('EXPIRE', KEYS[1], grant_ttl)
 redis.call('HSET', KEYS[2], 'grant', ARGV[1], 'generation', '0', 'kind', 'access',
@@ -1363,6 +1373,7 @@ impl RedisClient {
                     &new.absolute_deadline
                         .map(|d| d.to_string())
                         .unwrap_or_default(),
+                    new.resource.as_deref().unwrap_or_default(),
                 ],
             )
             .await

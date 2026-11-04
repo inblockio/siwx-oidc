@@ -54,6 +54,8 @@ everything else exists only in the binary crate.
 | `credential_identity.rs` (lib) | Which identity a stored passkey authenticates: a `webauthn:link/*` entry overrides the derived `did:key`. |
 | `credential_store.rs` (lib) | Optional aqua-auth credential store, dual-write and read-through, enabled by `AQUA_WEBAUTHN_REDIS_URL` (its password may come from the file `AQUA_WEBAUTHN_REDIS_PASSWORD_FILE`: `resolve_url`, under the rules of `redis_password_file`); `did_has_credential_bounded`, the scan-bounded passkey check of the device page. |
 | `credential_migration.rs` (lib) | Additive backfill of passkey credentials into the aqua-auth store. |
+| `resource.rs` (lib) | Resource indicators (RFC 8707): `Registry::parse` (the configured `resources`, validated at start: canonical URI, no reserved scope), `find`, `scopes` (for discovery) and `grant` (what a request bound to a resource is granted: the requested scopes the resource lists, then `offline_access` under the refresh rule). Pure. |
+| `access_token.rs` (lib) | RFC 9068 JWT access tokens for a resource: `mint` (header `alg`/`typ: at+jwt`/`kid`, claims `iss`, `sub`, `aud`, `client_id`, `scope`, `iat`, `exp`, `jti` in that order, signed through `ProviderSigner` under `Purpose::AccessToken`). |
 | `client_policy.rs` (lib) | Pure rules for generic-class clients: `grant_for` (the scopes a client is granted), `mailbox_claim` (what userinfo asks: every condition of the mailbox claim) and `mailbox_for` (the one place its value is built), `validate_mail_domain`, `validate_static_client`, and `parse_static_clients`, which start-up runs on `default_clients` before anything is written, and `grant_end` (whether replacing or deleting a static client's stored entry ends its grants, and why). |
 | `db/mod.rs` (lib) | `DBClient` trait, entry types (`CodeEntry`, `SessionEntry` with its bound `AuthorizationRequest`, `ClientEntry` with the digests of its secret and registration access token, its `ClientClass` and scope policy, and `client_entry_without_plaintext`, `DeviceCodeEntry` and the `DeviceCodeRef` naming its layout, `TokenMetadata` with its `TokenKind` and the `GrantKind` of its grant, `grant_kind`, which only `AccessGrant::metadata` sets and which is never stored), `Ceremony`, `OwnSession` (the `siwx_user` and `acct_session` layouts), `legacy_token_kind`, Redis key prefixes and TTLs. |
 | `db/redis.rs` (lib) | Redis implementation, incl. `revoke_device_tokens`, `revoke_all_user_tokens` (grants, then legacy `token/*` entries), `get_passkeys_for_did`, the own sessions (`create_own_session`, `lookup_own_session`, `end_own_session`, `revoke_own_sessions`; `lookup_user_session` for the picker), `purge_identity`, `sync_static_clients` (the start-up sync of `default_clients`, against the tracking set the client carries; it sets a generic client's epoch when its change ends its grants). |
@@ -152,6 +154,8 @@ cargo run -p siwx-oidc-auth -- --help         # the headless client
   `e2e_backchannel_logout` needs a second siwx-oidc in generic mode (no MAS shared secret, its
   own port and Redis database, `localhost` in `SIWXOIDC_BACKCHANNEL_LOGOUT_ALLOWED_HOSTS`) and
   uses the stub relying party in the Synapse mock (`/__rp/*`); see e2e/README.md.
+  `e2e_resource_binding` needs the resource `mcpe2e` (`SIWXOIDC_RESOURCES__MCPE2E`, which
+  `e2e/env.sh` and the CI job set; mode-independent).
   `e2e_generic_client` needs the generic-class static client `maile2e` and
   `SIWXOIDC_MAIL_DOMAIN` on the Matrix-mode server only (`e2e/env.sh` and the CI step set them);
   the generic-mode server starts without both, because it refuses a generic-class client.
@@ -288,8 +292,10 @@ doc; read it before changing the code the rule covers.
   `exp` on the DID assertion, a claim userinfo or an ID token did not carry) must change the shape
   check in the same change, or the `socket` backend answers a 500 for it. The purposes stay
   disjoint: userinfo carries no time and no `nonce`, `at_hash`, `c_hash`, `auth_time`, `sid` or
-  `mxid`, and an ID token and a logout token no `mxid`, so no signature serves as an endless ID
-  token or a DID proof; a member named twice is refused. Pin: the `signing::shape` tests
+  `mxid`, an ID token and a logout token no `mxid`, an access token (`typ` `at+jwt`, with `aud`,
+  `client_id`, `scope` and `jti`) none of an ID token's session members, and an ID token no
+  `client_id`, `scope` or `jti`, so no signature serves as an endless ID token, a DID proof or
+  an access token for a resource server; a member named twice is refused. Pin: the `signing::shape` tests
   (`no_purpose_signs_what_another_purpose_emits`, `audit_pr83_a_member_named_twice_is_refused`),
   `audit_pr83_a_userinfo_signature_is_not_a_did_proof`, every test in
   `oidc::signer_backend_tests`, `a_shape_refusal_and_a_signature_log_the_purpose_and_length_never_the_message`.
@@ -661,6 +667,26 @@ doc; read it before changing the code the rule covers.
   `a_generic_clients_exchange_and_userinfo_trigger_no_ens_lookup`,
   `generic_client_cannot_start_a_device_grant`, `a_device_code_of_a_generic_client_is_never_redeemed`,
   `a_generic_client_without_a_synapse_endpoint_stops_start_up`.
+- **A request that names a resource is bound to it, granted only its scopes, and answered with a
+  JWT for it and nothing else** (RFC 8707, RFC 9068; [docs/design/2026-11-04-mcp-authorization-resources.md](docs/design/2026-11-04-mcp-authorization-resources.md)).
+  The resource must be one of the configured `resources` (`resource::Registry`, validated at
+  start, URIs matched byte for byte), else `invalid_target` on the redirect URI; the grant is
+  `resource::Registry::grant` (the requested scopes the resource lists, in its order, then
+  `offline_access` when requested and the registration allows the refresh grant; nothing of the
+  resource's asked for is `invalid_scope`, and `openid` is neither required nor granted), checked
+  at `/authorize` and recomputed at the exchange (`exchange_issuance_bound`, the row in front of
+  the class table; the class rule still holds). The resource travels `/authorize` → session →
+  `CodeEntry.resource` → `NewGrant.resource` → the grant hash, and a `resource` at `/token` must
+  equal the code's. The sign-in takes the resource branch: account and DID field, no device, the
+  fallible resolver. The access token is `access_token::mint` over the grant's `did`,
+  `client_id`, `scope` and the store's instants, `aud` the resource; no ID token is issued; every
+  refresh and replay mints a new JWT for the grant's resource; the grant's opaque token is never
+  handed out, and introspection, `/userinfo` and `/oauth2/revoke` do not take the JWT. A signature
+  that cannot be had unwinds the exchange like an ID token's. Do not add a second grant rule, a
+  normalisation of the URI on one side, or a path that hands out the opaque token of a resource
+  grant. Pin: `resource::tests::*`, `access_token::tests::*`,
+  `an_access_token_carries_exactly_what_rfc_9068_asks_and_no_session_member`,
+  `oidc::resource_binding_tests::*`, and on the mock stack `tests/e2e_resource_binding.rs`.
 - **The headless client asks for what it relies on, in every flow.** `siwx-oidc-auth` requests
   `offline_access` (it refreshes, and a generic-mode server issues a refresh token only for it)
   and `urn:matrix:client:api:*` (its access token is used against the Matrix client-server API)

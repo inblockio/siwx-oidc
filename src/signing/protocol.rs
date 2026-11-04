@@ -51,15 +51,18 @@ pub enum Purpose {
     LogoutToken,
     /// A signed userinfo response.
     Userinfo,
+    /// An RFC 9068 JWT access token issued for a resource (`resource`).
+    AccessToken,
 }
 
 impl Purpose {
     /// Every purpose, in a fixed order (the order of the signer's count line).
-    pub const ALL: [Purpose; 4] = [
+    pub const ALL: [Purpose; 5] = [
         Purpose::IdToken,
         Purpose::DidProof,
         Purpose::LogoutToken,
         Purpose::Userinfo,
+        Purpose::AccessToken,
     ];
 
     /// The wire name.
@@ -69,6 +72,7 @@ impl Purpose {
             Purpose::DidProof => "did_proof",
             Purpose::LogoutToken => "logout_token",
             Purpose::Userinfo => "userinfo",
+            Purpose::AccessToken => "access_token",
         }
     }
 
@@ -366,7 +370,13 @@ mod tests {
         }
         assert_eq!(
             Purpose::ALL.map(Purpose::as_str),
-            ["id_token", "did_proof", "logout_token", "userinfo"]
+            [
+                "id_token",
+                "did_proof",
+                "logout_token",
+                "userinfo",
+                "access_token"
+            ]
         );
     }
 
@@ -407,7 +417,7 @@ mod tests {
             Err(ErrorCode::BadRequest)
         );
         assert_eq!(
-            parse(r#"{"v":1,"op":"sign","purpose":"access_token","msg":"e30"}"#),
+            parse(r#"{"v":1,"op":"sign","purpose":"session_cookie","msg":"e30"}"#),
             Err(ErrorCode::BadRequest)
         );
         assert_eq!(
