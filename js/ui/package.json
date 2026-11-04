@@ -38,7 +38,8 @@
 	"scripts": {
 		"build": "cross-env NODE_ENV=production webpack",
 		"dev": "webpack serve --static-directory ../../static --port 9080",
-		"validate": "svelte-check"
+		"validate": "svelte-check",
+		"test": "node --test test/*.test.mjs"
 	},
 	"dependencies": {
 		"@wagmi/core": "^2.22.1",

@@ -1490,7 +1490,11 @@ structured output.
   [docs/](docs/README.md) for behaviour.
 - **Wire and config compatibility:** `sub` is the full DID; the wallet cookie is `siwx` with
   `{did, message, signature}`; PKCS#8 PEM is the canonical key format; the frontend uses
-  injected EIP-1193 wallets only (no WalletConnect, no project id).
+  injected EIP-1193 wallets only (no WalletConnect, no project id). Its wallet step
+  (`js/ui/src/wallet.ts`) is least privilege: Ethereum mainnet only, the `eth_accounts`
+  permission, `personal_sign`, and a switch to mainnet; pinned by `js/ui/test/wallet.test.mjs`
+  (`npm test` in `js/ui`, run by CI job `browser-e2e`). A new wallet request there needs a
+  reason that sign-in cannot do without it.
 - **Status wording:** describe Matrix support precisely (see [docs/matrix-integration.md](docs/matrix-integration.md)):
   "auth service in Synapse's `matrix_authentication_service` integration", not "replaces MAS" or
   "MSC3861 mode". `/_synapse/mas/*` is an internal Synapse API designed for MAS.

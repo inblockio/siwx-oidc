@@ -5,10 +5,10 @@
 -->
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { createConfig, connect, disconnect, getAccount, signMessage, reconnect, http, watchAccount, injected } from '@wagmi/core';
-	import { mainnet } from 'viem/chains';
+	import { signMessage, reconnect } from '@wagmi/core';
 	import { createSiweMessage } from 'viem/siwe';
 	import Cookies from 'js-cookie';
+	import { createWalletConfig, connectWallet, SIGN_IN_CHAIN } from './wallet';
 
 	export let domain: string;
 	export let nonce: string;
@@ -51,13 +51,8 @@
 	// Two-RP deployment: the server offers sign-in with a linked (wallet-linked) passkey.
 	let linkedPasskeyLogin = false;
 
-	const config = createConfig({
-		chains: [mainnet],
-		connectors: [injected()],
-		transports: {
-			[mainnet.id]: http(),
-		},
-	});
+	// The wallet step and what it may ask a wallet for: ./wallet.ts.
+	const config = createWalletConfig();
 
 	// /sign_in issues the code for the request /authorize bound to the session and
 	// reads these values only when the session has expired, to send the user back to
@@ -131,7 +126,7 @@
 		status = 'Connecting...';
 
 		try {
-			const result = await connect(config, { connector: injected() });
+			const result = await connectWallet(config);
 
 			if (result.accounts.length > 0) {
 				await performSignIn(result.accounts[0]);
@@ -161,7 +156,7 @@
 		const preparedMessage = createSiweMessage({
 			domain: window.location.host,
 			address: address as `0x${string}`,
-			chainId: 1,
+			chainId: SIGN_IN_CHAIN.id,
 			expirationTime,
 			uri: window.location.origin,
 			version: '1',
