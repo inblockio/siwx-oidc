@@ -24,6 +24,7 @@ fn oidc_grant(username: &str, client_id: &str) -> NewGrant {
         access_ttl: ACCESS_TOKEN_TTL,
         refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
         absolute_deadline: None,
+        resource: None,
     }
 }
 

@@ -46,6 +46,7 @@ fn matrix_grant(username: &str, device_id: &str) -> NewGrant {
         access_ttl: ACCESS_TOKEN_TTL,
         refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
         absolute_deadline: None,
+        resource: None,
     }
 }
 
@@ -223,6 +224,7 @@ async fn a_refresh_less_grant_and_a_service_grant_live_as_long_as_their_access_t
         access_ttl: 120,
         refresh_inactivity_secs: None,
         absolute_deadline: None,
+        resource: None,
     };
     let admin = issue(&client, &service).await;
     assert!(admin.access_token.starts_with(tokens::ADMIN_TOKEN_PREFIX));
@@ -1793,6 +1795,7 @@ async fn every_grant_with_an_id_token_has_its_own_random_sid() {
             access_ttl: 120,
             refresh_inactivity_secs: None,
             absolute_deadline: None,
+            resource: None,
         },
     )
     .await;

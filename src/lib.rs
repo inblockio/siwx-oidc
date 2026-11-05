@@ -13,6 +13,15 @@ pub mod mxid;
 /// library crate so the binary and the tests read one set of rules.
 pub mod client_policy;
 
+/// Resource indicators (RFC 8707): the configured resource servers (`resources`) and what
+/// a request bound to one is granted. Pure, in the library crate so start-up, the token
+/// endpoint and the tests read one set of rules.
+pub mod resource;
+
+/// RFC 9068 JWT access tokens: what a token issued for a resource carries and how it is
+/// signed through `ProviderSigner`. In the library crate beside `signing`.
+pub mod access_token;
+
 /// What a log line may say about a credential: a fingerprint, never the value.
 /// In the library crate so `tests/log_hygiene.rs` can pin it.
 pub mod redact;

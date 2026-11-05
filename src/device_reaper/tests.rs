@@ -168,6 +168,7 @@ impl Fixture {
                 access_ttl: 300,
                 refresh_inactivity_secs: Some(3600),
                 absolute_deadline: None,
+                resource: None,
             })
             .await
             .unwrap();

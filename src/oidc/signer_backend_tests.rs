@@ -77,6 +77,7 @@ async fn exchange(
             localpart: Some(localpart_for(DID)),
             scope: Some("openid".into()),
             client_class: Some(ClientClass::Matrix),
+            resource: None,
         },
     )
     .await
@@ -90,6 +91,7 @@ async fn exchange(
             code_verifier: Some(VERIFIER.to_string()),
             refresh_token: None,
             device_code: None,
+            resource: None,
         },
         ClientCredentials::default(),
         signer,
@@ -205,6 +207,7 @@ async fn issue_for(db: &RedisClient, client_id: &str) -> String {
         access_ttl: ACCESS_TOKEN_TTL,
         refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
         absolute_deadline: None,
+        resource: None,
     })
     .await
     .unwrap()
@@ -498,6 +501,7 @@ async fn audit_pr83_a_code_exchange_retried_after_a_signer_outage_succeeds() {
             localpart: Some(localpart_for(DID)),
             scope: Some("openid".into()),
             client_class: Some(ClientClass::Matrix),
+            resource: None,
         },
     )
     .await
@@ -510,6 +514,7 @@ async fn audit_pr83_a_code_exchange_retried_after_a_signer_outage_succeeds() {
         code_verifier: Some(VERIFIER.to_string()),
         refresh_token: None,
         device_code: None,
+        resource: None,
     };
     service.stop();
     let first = token(

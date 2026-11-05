@@ -2913,6 +2913,7 @@ mod tests {
             localpart: None,
             scope: None,
             client_class: None,
+            resource: None,
         }
     }
 
@@ -3799,6 +3800,7 @@ mod tests {
                     access_ttl: crate::db::ACCESS_TOKEN_TTL,
                     refresh_inactivity_secs: Some(crate::db::REFRESH_TOKEN_TTL),
                     absolute_deadline: None,
+                    resource: None,
                 })
                 .await
                 .unwrap();

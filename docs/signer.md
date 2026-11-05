@@ -217,7 +217,7 @@ existed is left alone) and releases its claim on the still-approved code. The re
 
 The signer logs one line per request: the operation, the purpose, the `kid`, the message length,
 the peer uid and the result, never the message and never key material. Each minute that saw
-requests ends with a `sign counts (last minute)` line (per purpose, and the refusals apart), and
+requests ends with a `sign counts (last minute)` line (per purpose: `id_tokens`, `did_proofs`, `logout_tokens`, `userinfo_responses`, `access_tokens`; and the refusals apart), and
 a minute whose signatures exceed `--rate-alarm-per-minute` logs one `rate_alarm` warning; a
 refusal signs nothing and does not count towards it. A refused peer logs `peer_refused uid=<n>`.
 

@@ -33,11 +33,13 @@ use urlencoding::decode;
 use uuid::Uuid;
 
 use aqua_auth::find_did_method;
+use siwx_oidc::access_token::{self, AccessTokenClaims};
 use siwx_oidc::client_policy;
 use siwx_oidc::db::grant::{
     EndedGrant, GrantKind, InvalidReason, NewGrant, RefreshPeek, RotateOutcome, RotateRequest,
 };
 use siwx_oidc::db::*;
+use siwx_oidc::resource;
 use subtle::ConstantTimeEq;
 
 use crate::did_assertion::DidPublication;
@@ -494,6 +496,16 @@ fn scopes_supported(config: &crate::config::Config) -> Vec<Scope> {
     if config.mail_domain.is_some() {
         scopes.push(Scope::new(client_policy::MAIL_SCOPE.to_string()));
     }
+    // The scopes of the configured resources, which a request bound to one is
+    // granted. Start-up validated the map; a map that does not parse here lists
+    // nothing rather than failing discovery.
+    if let Ok(resources) = resource::Registry::parse(&config.resources) {
+        for scope in resources.scopes() {
+            if !scopes.iter().any(|s| s.as_str() == scope) {
+                scopes.push(Scope::new(scope));
+            }
+        }
+    }
     scopes
 }
 
@@ -913,6 +925,10 @@ pub struct TokenForm {
     pub refresh_token: Option<String>,
     /// Device code (required when grant_type=device_code).
     pub device_code: Option<String>,
+    /// The resource the token is for (RFC 8707). On a code exchange it must be
+    /// the resource the code's request named; absent, the code's resource is
+    /// issued for.
+    pub resource: Option<String>,
 }
 
 /// What the HTTP request says about the calling client outside the form: the
@@ -940,7 +956,7 @@ pub async fn token(
             token_authorization_code(form, credentials, signing_key, config, db_client).await
         }
         CoreGrantType::RefreshToken => {
-            token_refresh(form, credentials, config, db_client).await
+            token_refresh(form, credentials, signing_key, config, db_client).await
         }
         CoreGrantType::DeviceCode => {
             token_device_code(form, signing_key, config, db_client, synapse_client).await
@@ -1102,6 +1118,7 @@ pub(crate) fn client_is_confidential(client: Option<&ClientEntry>, require_secre
 async fn token_refresh(
     form: TokenForm,
     credentials: ClientCredentials,
+    signing_key: &dyn ProviderSigner,
     config: &crate::config::Config,
     db_client: &DBClientType,
 ) -> Result<SiwxTokenResponse, CustomError> {
@@ -1182,10 +1199,10 @@ async fn token_refresh(
         }
         None => db_client.rotate_refresh_token(&request).await?,
     };
-    let (pair, expires_in) = match outcome {
+    let (pair, expires_in, at) = match outcome {
         RotateOutcome::Rotated(pair) | RotateOutcome::Replayed(pair) => {
             let expires_in = pair.expires_in(ACCESS_TOKEN_TTL);
-            (pair.pair, expires_in)
+            (pair.pair, expires_in, pair.at)
         }
         // Reuse (I5, phase A): recorded, and answered like an unknown token.
         RotateOutcome::Reuse(event) => {
@@ -1211,8 +1228,34 @@ async fn token_refresh(
         }
     };
 
+    // A grant for a resource (RFC 8707) is answered with a fresh RFC 9068 JWT for
+    // it, over the instants the store decided; the opaque token the script wrote
+    // stays the grant's entry and is never handed out. A replayed pair gets a
+    // token of its own (a new `jti`), good for the same remaining lifetime. A
+    // signature that cannot be had is the retryable refusal every signing gives:
+    // the rotation stands, and the replay grace answers the retry.
+    let access_token = match peeked_grant
+        .as_ref()
+        .and_then(|grant| grant.resource.as_deref().map(|uri| (grant, uri)))
+    {
+        Some((grant, uri)) => {
+            let claims = AccessTokenClaims {
+                issuer: config.base_url.as_str(),
+                subject: &grant.did,
+                resource: uri,
+                client_id: &grant.client_id,
+                scope: &grant.scope,
+                iat: at,
+                exp: pair.access_exp,
+            };
+            access_token::mint(signing_key, &claims)
+                .await
+                .map_err(signing_failed(Purpose::AccessToken))?
+        }
+        None => pair.access_token,
+    };
     let mut response = SiwxTokenResponse::new(
-        AccessToken::new(pair.access_token),
+        AccessToken::new(access_token),
         CoreTokenType::Bearer,
         SiwxIdTokenFields::new(None, EmptyExtraTokenFields {}),
     );
@@ -1551,6 +1594,7 @@ async fn token_device_code(
                     access_ttl: ACCESS_TOKEN_TTL,
                     refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
                     absolute_deadline: None,
+                    resource: None,
                 })
                 .await
                 .map_err(|e| {
@@ -1756,6 +1800,9 @@ struct Issuance {
     /// Whether the token response must name the scope, because it differs from the
     /// request (RFC 6749 §5.1).
     report_scope: bool,
+    /// The resource the grant is for (RFC 8707): its access tokens are JWTs with this
+    /// `aud`, and no ID token goes with them. `None` for every other grant.
+    resource: Option<String>,
 }
 
 impl Issuance {
@@ -1767,8 +1814,18 @@ impl Issuance {
             scope: grant.scope,
             refresh_token: grant.refresh_token,
             report_scope: grant.report_scope,
+            resource: None,
         }
     }
+}
+
+/// The refusal of a code exchange for a resource the provider no longer issues tokens
+/// for, or whose request would now be granted none of its scopes.
+fn resource_not_issuable() -> CustomError {
+    CustomError::BadRequestToken(TokenError {
+        error: CoreErrorResponseType::Extension(INVALID_TARGET.to_string()),
+        error_description: UNKNOWN_RESOURCE_MSG.to_string(),
+    })
 }
 
 /// The refusal for every code the exchange will not honour for the client that presents it.
@@ -1810,6 +1867,7 @@ fn exchange_issuance(
                 device_id,
                 refresh_token: true,
                 report_scope: false,
+                resource: None,
             })
         }
         (false, ClientClass::Matrix, ClientClass::Matrix) => Ok(Issuance::oidc(
@@ -1825,6 +1883,38 @@ fn exchange_issuance(
         | (_, ClientClass::Matrix, ClientClass::Generic)
         | (_, ClientClass::Generic, ClientClass::Matrix) => Err(code_not_issued_for_client()),
     }
+}
+
+/// [`exchange_issuance`], with the row for a code bound to a resource (RFC 8707) in
+/// front of the table: an `oidc` grant with no device for that resource, with the
+/// scopes [`resource::Registry::grant`] decides from the bound scope and the client's
+/// registration, whatever the deployment mode and the client's class (which must still
+/// be the class the code was issued to). A resource the configuration no longer names,
+/// or a request that would now be granted none of its scopes, is `invalid_target`.
+fn exchange_issuance_bound(
+    delegated_auth: bool,
+    client: &ClientEntry,
+    code: &CodeEntry,
+    resources: &resource::Registry,
+) -> Result<Issuance, CustomError> {
+    let Some(uri) = code.resource.as_deref() else {
+        return exchange_issuance(delegated_auth, client, code);
+    };
+    if code.client_class.unwrap_or(ClientClass::Matrix) != client.class {
+        return Err(code_not_issued_for_client());
+    }
+    let may_refresh = client_policy::registration_may_refresh(&client.metadata);
+    let grant = resources
+        .grant(uri, code.scope.as_deref().unwrap_or(""), may_refresh)
+        .ok_or_else(resource_not_issuable)?;
+    Ok(Issuance {
+        kind: GrantKind::Oidc,
+        device_id: String::new(),
+        scope: grant.scope,
+        refresh_token: grant.refresh_token,
+        report_scope: grant.report_scope,
+        resource: Some(uri.to_string()),
+    })
 }
 
 async fn token_authorization_code(
@@ -1924,8 +2014,26 @@ async fn token_authorization_code(
         }));
     }
 
+    // RFC 8707 section 2.2: a token request that names a resource names the one
+    // the code's request named; naming another, or one for a code that named
+    // none, is `invalid_target`. Absent, the code's resource is issued for.
+    if let Some(asked) = form.resource.as_deref() {
+        if code_entry.resource.as_deref() != Some(asked) {
+            return Err(CustomError::BadRequestToken(TokenError {
+                error: CoreErrorResponseType::Extension(INVALID_TARGET.to_string()),
+                error_description: "This code was not issued for that resource.".to_string(),
+            }));
+        }
+    }
+    let resources = resource::Registry::parse(&config.resources)
+        .map_err(|e| anyhow!("the configured resources do not parse: {e}"))?;
     // Decided before any claim is looked up, so a refusal costs no ENS call.
-    let issuance = exchange_issuance(delegated_auth_enabled(config), &client_entry, &code_entry)?;
+    let issuance = exchange_issuance_bound(
+        delegated_auth_enabled(config),
+        &client_entry,
+        &code_entry,
+        &resources,
+    )?;
 
     // Every check passed: consume the code. This atomic read-and-delete stays
     // the one step that decides who redeems it, so of concurrent requests that
@@ -1981,6 +2089,7 @@ async fn token_authorization_code(
             auth_ms: Some(code_entry.auth_time.timestamp_millis()),
             access_ttl: ACCESS_TOKEN_TTL,
             refresh_inactivity_secs: issuance.refresh_token.then_some(REFRESH_TOKEN_TTL),
+            resource: issuance.resource.clone(),
             absolute_deadline,
         })
         .await
@@ -1996,35 +2105,64 @@ async fn token_authorization_code(
             }
         })?;
     touch_client_after_use(db_client, &client_id).await;
-    let access_token = AccessToken::new(issued.access_token.clone());
 
-    let core_id_token = SiwxIdTokenClaims::new(
-        IssuerUrl::from_url(config.base_url.clone()),
-        vec![Audience::new(client_id.clone())],
-        now + Duration::seconds(config.id_token_ttl_secs as i64),
-        now,
-        claims,
-        SidClaims {
-            sid: issued.sid.clone(),
-            guest,
-        },
-    )
-    .set_nonce(code_entry.nonce)
-    .set_auth_time(Some(code_entry.auth_time));
-
-    let signed = sign_jwt(signing_key, Purpose::IdToken, |key| {
-        SiwxIdToken::new(
-            core_id_token,
-            key,
-            CoreJwsSigningAlgorithm::EcdsaP256Sha256,
-            Some(&access_token),
-            None,
-        )
-    })
-    .await;
-    let id_token = match signed {
-        Ok(id_token) => id_token,
-        Err(e) => {
+    // What the client is handed. A grant for a resource (RFC 8707) is answered
+    // with an RFC 9068 JWT for that resource and no ID token: the token is for
+    // the resource server, which verifies it offline against `/jwk`, and the
+    // grant's opaque access token is never handed out. Every other grant is
+    // answered as before: the opaque token and an ID token. Either signature
+    // that cannot be had unwinds the exchange below.
+    let signed: Result<(AccessToken, Option<SiwxIdToken>), (Purpose, SignError)> =
+        match issuance.resource.as_deref() {
+            Some(resource) => {
+                let claims = AccessTokenClaims {
+                    issuer: config.base_url.as_str(),
+                    subject: &code_entry.did,
+                    resource,
+                    client_id: &client_id,
+                    scope: &issuance.scope,
+                    iat: issued.iat,
+                    exp: issued.access_exp,
+                };
+                match access_token::mint(signing_key, &claims).await {
+                    Ok(jwt) => Ok((AccessToken::new(jwt), None)),
+                    Err(e) => Err((Purpose::AccessToken, e)),
+                }
+            }
+            None => {
+                let access_token = AccessToken::new(issued.access_token.clone());
+                let core_id_token = SiwxIdTokenClaims::new(
+                    IssuerUrl::from_url(config.base_url.clone()),
+                    vec![Audience::new(client_id.clone())],
+                    now + Duration::seconds(config.id_token_ttl_secs as i64),
+                    now,
+                    claims,
+                    SidClaims {
+                        sid: issued.sid.clone(),
+                        guest,
+                    },
+                )
+                .set_nonce(code_entry.nonce)
+                .set_auth_time(Some(code_entry.auth_time));
+                match sign_jwt(signing_key, Purpose::IdToken, |key| {
+                    SiwxIdToken::new(
+                        core_id_token,
+                        key,
+                        CoreJwsSigningAlgorithm::EcdsaP256Sha256,
+                        Some(&access_token),
+                        None,
+                    )
+                })
+                .await
+                {
+                    Ok(id_token) => Ok((access_token, Some(id_token))),
+                    Err(e) => Err((Purpose::IdToken, e)),
+                }
+            }
+        };
+    let (access_token, id_token) = match signed {
+        Ok(pair) => pair,
+        Err((purpose, e)) => {
             // Nothing is answered, so nothing stays behind that nobody holds:
             // the grant goes (no logout: no relying party got its `sid`), then
             // the code comes back, so the retry a 503 invites redeems it.
@@ -2041,7 +2179,7 @@ async fn token_authorization_code(
                     "code exchange: could not put the code back after a signing failure"
                 ),
             }
-            return Err(signing_failed(Purpose::IdToken)(e));
+            return Err(signing_failed(purpose)(e));
         }
     };
     let refresh_token = issued.refresh_token.map(RefreshToken::new);
@@ -2051,7 +2189,7 @@ async fn token_authorization_code(
     let mut response = SiwxTokenResponse::new(
         access_token,
         CoreTokenType::Bearer,
-        SiwxIdTokenFields::new(Some(id_token), EmptyExtraTokenFields {}),
+        SiwxIdTokenFields::new(id_token, EmptyExtraTokenFields {}),
     );
     response.set_expires_in(Some(&time::Duration::from_secs(expires_in_secs)));
     response.set_refresh_token(refresh_token);
@@ -2092,6 +2230,11 @@ pub struct AuthorizeParams {
     /// (Element Web >= 1.12.24) sends `fragment` and reads the authorization
     /// response ONLY from the URL fragment.
     pub response_mode: Option<String>,
+    /// The resource the client wants a token for (RFC 8707), one of the
+    /// configured `resources` by its exact URI. The request is then bound to
+    /// it: granted the resource's scopes only, and answered with an RFC 9068
+    /// JWT access token whose `aud` is the resource.
+    pub resource: Option<String>,
 }
 
 /// M6: refuse a DID that has a guest record. Called after a signature has verified, at
@@ -2159,6 +2302,7 @@ pub async fn start_guest_session(
                     code_challenge,
                     scope: Some(scope),
                     nonce: params.nonce.clone(),
+                    resource: None,
                 }),
                 guest_id: Some(guest_id),
             },
@@ -2177,10 +2321,29 @@ pub async fn start_guest_session(
     ))
 }
 
+/// [`authorize_bound`] with no configured resource: a request that names a
+/// `resource` is refused as `invalid_target`. The handler passes the configured
+/// registry; the tests of everything but resources use this.
+#[cfg(test)]
 pub async fn authorize(
     params: AuthorizeParams,
     db_client: &DBClientType,
 ) -> Result<(String, Box<Cookie<'_>>), CustomError> {
+    authorize_bound(params, db_client, &resource::Registry::default()).await
+}
+
+/// The error a request that names a resource this provider does not issue
+/// tokens for gets, on the redirect URI (RFC 8707 section 2).
+const INVALID_TARGET: &str = "invalid_target";
+const UNKNOWN_RESOURCE_MSG: &str = "This provider issues no tokens for that resource.";
+const RESOURCE_SCOPE_REQUIRED_MSG: &str =
+    "A request for a resource must ask for at least one of the resource's scopes.";
+
+pub async fn authorize_bound(
+    params: AuthorizeParams,
+    db_client: &DBClientType,
+    resources: &resource::Registry,
+) -> Result<(String, Box<Cookie<'static>>), CustomError> {
     let client_entry = db_client
         .get_client(params.client_id.clone())
         .await
@@ -2263,11 +2426,46 @@ pub async fn authorize(
         return Err(CustomError::Redirect(url.to_string()));
     }
 
+    // RFC 8707: a request that names a resource is bound to it for the whole
+    // flow. The resource must be configured (`invalid_target` otherwise), and
+    // the request must ask for at least one of its scopes, since the token
+    // is for the resource and nothing else is granted (`invalid_scope`). The
+    // grant itself is recomputed at the exchange from the same inputs
+    // (`exchange_issuance_bound`); this check spares the user a sign-in that
+    // could only fail. `openid` is not required: no ID token is issued.
+    let bound_resource = match params.resource.as_deref() {
+        None => None,
+        Some(uri) => {
+            if resources.find(uri).is_none() {
+                let mut url = params.redirect_uri.url().clone();
+                url.query_pairs_mut().append_pair("state", &state);
+                url.query_pairs_mut().append_pair("error", INVALID_TARGET);
+                url.query_pairs_mut()
+                    .append_pair("error_description", UNKNOWN_RESOURCE_MSG);
+                return Err(CustomError::Redirect(url.to_string()));
+            }
+            let may_refresh = client_policy::registration_may_refresh(&client_entry.metadata);
+            if resources
+                .grant(uri, params.scope.as_str(), may_refresh)
+                .is_none()
+            {
+                let mut url = params.redirect_uri.url().clone();
+                url.query_pairs_mut().append_pair("state", &state);
+                url.query_pairs_mut()
+                    .append_pair("error", CoreAuthErrorResponseType::InvalidScope.as_ref());
+                url.query_pairs_mut()
+                    .append_pair("error_description", RESOURCE_SCOPE_REQUIRED_MSG);
+                return Err(CustomError::Redirect(url.to_string()));
+            }
+            Some(uri.to_string())
+        }
+    };
+
     let scope_str = params.scope.as_str().trim();
     let scopes: Vec<&str> = scope_str.split(' ').filter(|s| !s.is_empty()).collect();
     let has_openid = scopes.contains(&"openid");
     let has_matrix_scope = scopes.iter().any(|s| s.starts_with("urn:matrix:"));
-    if !has_openid && !has_matrix_scope {
+    if bound_resource.is_none() && !has_openid && !has_matrix_scope {
         return Err(
             anyhow!("The 'openid' scope or a Matrix scope (urn:matrix:*) is required.").into(),
         );
@@ -2278,12 +2476,15 @@ pub async fn authorize(
     // a sign-in that could only fail. The string checked is the one the session carries,
     // untrimmed, so every later reader sees the same words. A Matrix-class client's scope
     // is not decided by `grant_for`, so it is not asked.
-    let scope_is_grantable = match client_entry.class {
-        ClientClass::Matrix => true,
-        ClientClass::Generic => {
-            client_policy::grant_for(&client_entry, params.scope.as_str()).is_some()
-        }
-    };
+    // A request bound to a resource is granted by the resource's scopes
+    // (checked above), whatever the client's class.
+    let scope_is_grantable = bound_resource.is_some()
+        || match client_entry.class {
+            ClientClass::Matrix => true,
+            ClientClass::Generic => {
+                client_policy::grant_for(&client_entry, params.scope.as_str()).is_some()
+            }
+        };
     if !scope_is_grantable {
         let mut url = params.redirect_uri.url().clone();
         url.query_pairs_mut().append_pair("state", &state);
@@ -2365,6 +2566,7 @@ pub async fn authorize(
                     code_challenge: code_challenge.clone(),
                     scope: Some(params.scope.as_str().to_string()),
                     nonce: params.nonce.clone(),
+                    resource: bound_resource,
                 }),
                 guest_id: None,
             },
@@ -2706,6 +2908,7 @@ pub(crate) fn bound_test_request(client_id: &str) -> AuthorizationRequest {
         code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string(),
         scope: None,
         nonce: None,
+        resource: None,
     }
 }
 
@@ -3857,6 +4060,21 @@ pub async fn sign_in(
             .await?;
             (grant.localpart, Some(grant.device_id))
         }
+        ClientClass::Matrix | ClientClass::Generic if request.resource.is_some() => {
+            // A request bound to a resource (RFC 8707) gets a token for that resource
+            // and nothing of the homeserver's, whatever the client's class: the account
+            // is provisioned (the grant is indexed by its localpart, so a revocation of
+            // the user reaches it) and the DID published, but no device is upserted and
+            // no cross-signing reset armed. The localpart comes from the fallible
+            // resolver: a guessed one would index the grant under a name the user's
+            // revocation never names.
+            let resolved = resolve_generic_identity(&did, synapse_client).await?;
+            if let Some(synapse) = synapse_client {
+                provision_synapse_account(&did, &resolved, synapse, server_name, did_publication)
+                    .await;
+            }
+            (resolved.localpart.clone(), None)
+        }
         ClientClass::Matrix => {
             let device_name = device_display_name(&request.client_id, Some(&client));
 
@@ -3958,6 +4176,7 @@ pub async fn sign_in(
         device_id,
         scope: request.scope.clone(),
         client_class: Some(client.class),
+        resource: request.resource.clone(),
     };
 
     let code = Uuid::new_v4();
@@ -5058,6 +5277,7 @@ mod tests {
             code_challenge: Some(RFC7636_CHALLENGE.into()),
             code_challenge_method: Some("S256".into()),
             response_mode: None,
+            resource: None,
         }
     }
 
@@ -5114,6 +5334,7 @@ mod tests {
                 code_challenge: RFC7636_CHALLENGE.into(),
                 scope: Some("openid".into()),
                 nonce: Some(Nonce::new("oidc-nonce".into())),
+                resource: None,
             })
         );
     }
@@ -5248,6 +5469,7 @@ mod tests {
                             code_challenge: RFC7636_CHALLENGE.into(),
                             scope: Some("openid profile offline_access".into()),
                             nonce: Some(Nonce::new("oidc-nonce".into())),
+                            resource: None,
                         }),
                         guest_id: None,
                     },
@@ -5507,6 +5729,7 @@ mod tests {
             code_challenge: Some(RFC7636_CHALLENGE.into()),
             code_challenge_method: Some("S256".into()),
             response_mode: None,
+            resource: None,
         };
         let (redirect_url, cookie) = authorize(params, &db_client).await.unwrap();
         let authorize_params: AuthorizeQueryParams =
@@ -5598,6 +5821,7 @@ mod tests {
                 code_verifier: Some(RFC7636_VERIFIER.into()),
                 refresh_token: None,
                 device_code: None,
+                resource: None,
             },
             ClientCredentials::default(),
             &oidc_signing_key,
@@ -5653,6 +5877,7 @@ mod tests {
             code_challenge: Some(RFC7636_CHALLENGE.into()),
             code_challenge_method: Some("S256".into()),
             response_mode: Some("fragment".into()),
+            resource: None,
         };
         let (redirect_url, cookie) = authorize(params, &db_client).await.unwrap();
         assert!(
@@ -5788,6 +6013,7 @@ mod tests {
             code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
             code_challenge_method: Some("S256".into()),
             response_mode: Some("form_post".into()),
+            resource: None,
         };
         match authorize(params, &db_client).await {
             Err(CustomError::BadRequest(msg)) => {
@@ -5820,6 +6046,7 @@ mod tests {
             code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
             code_challenge_method: Some("S256".into()),
             response_mode: Some("query".into()),
+            resource: None,
         };
         let (redirect_url, _cookie) = authorize(params, &db_client).await.unwrap();
         assert!(
@@ -5871,7 +6098,8 @@ mod tests {
             code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
             code_challenge_method: Some("S256".into()),
             response_mode: None,
-        };
+                    resource: None,
+};
         let result = authorize(params, &db_client).await;
         assert!(
             result.is_ok(),
@@ -6289,6 +6517,7 @@ mod tests {
                 code_verifier: None,
                 refresh_token: None,
                 device_code: Some(device_code.clone()),
+                resource: None,
             },
             ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
@@ -6365,6 +6594,7 @@ mod tests {
                 code_verifier: None,
                 refresh_token: None,
                 device_code: Some(device_code.clone()),
+                resource: None,
             },
             ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
@@ -6421,7 +6651,8 @@ mod tests {
             code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
             code_challenge_method: Some("S256".into()),
             response_mode: None,
-        };
+                    resource: None,
+};
         let result = authorize(params, &db_client).await;
         assert!(
             result.is_ok(),
@@ -6448,6 +6679,7 @@ mod tests {
             code_challenge: None,
             code_challenge_method: None,
             response_mode: None,
+            resource: None,
         };
         let result = authorize(params, &db_client).await;
         assert!(
@@ -7681,6 +7913,7 @@ mod userinfo_mxid_claim_tests {
                 localpart: Some(LOCALPART.to_string()),
                 scope: None,
                 client_class: None,
+                resource: None,
             },
         )
         .await
@@ -9222,6 +9455,7 @@ mod device_display_name_tests {
                 code_verifier: None,
                 refresh_token: None,
                 device_code: Some(device_code.clone()),
+                resource: None,
             },
             ClientCredentials::default(),
             &signer,
@@ -9293,6 +9527,7 @@ mod device_display_name_tests {
             code_verifier: None,
             refresh_token: None,
             device_code: Some(device_code.clone()),
+            resource: None,
         };
         let key = EcdsaSigningKey::generate();
         let service = siwx_oidc::test_support::TestSigner::start(
@@ -9409,6 +9644,7 @@ mod device_display_name_tests {
             code_verifier: None,
             refresh_token: None,
             device_code: Some(device_code.clone()),
+            resource: None,
         };
         let key = EcdsaSigningKey::generate();
         let service = siwx_oidc::test_support::TestSigner::start(
@@ -9516,6 +9752,7 @@ mod device_display_name_tests {
                 code_verifier: None,
                 refresh_token: None,
                 device_code: Some(device_code),
+                resource: None,
             },
             ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
@@ -9588,6 +9825,7 @@ mod device_display_name_tests {
                 code_verifier: None,
                 refresh_token: None,
                 device_code: Some(device_code),
+                resource: None,
             },
             ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
@@ -9652,6 +9890,7 @@ mod device_display_name_tests {
                 code_verifier: None,
                 refresh_token: None,
                 device_code: Some(device_code),
+                resource: None,
             },
             ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
@@ -9751,6 +9990,7 @@ mod client_binding_tests {
             access_ttl: ACCESS_TOKEN_TTL,
             refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
             absolute_deadline: None,
+            resource: None,
         })
         .await
         .unwrap()
@@ -9783,6 +10023,7 @@ mod client_binding_tests {
                 localpart: Some(unique("localpart")),
                 scope: scope.map(str::to_string),
                 client_class: None,
+                resource: None,
             },
         )
         .await
@@ -9823,6 +10064,7 @@ mod client_binding_tests {
                 code_verifier: None,
                 refresh_token: Some(refresh_token.to_string()),
                 device_code: None,
+                resource: None,
             },
             ClientCredentials {
                 basic_client_id: who.header_client_id.map(str::to_string),
@@ -9861,6 +10103,7 @@ mod client_binding_tests {
                 code_verifier: verifier.map(str::to_string),
                 refresh_token: None,
                 device_code: None,
+                resource: None,
             },
             ClientCredentials {
                 basic_client_id: who.header_client_id.map(str::to_string),
@@ -9945,6 +10188,7 @@ mod client_binding_tests {
                 access_ttl: ACCESS_TOKEN_TTL,
                 refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
                 absolute_deadline: deadline,
+                resource: None,
             })
             .await
             .unwrap();
@@ -10094,6 +10338,7 @@ mod client_binding_tests {
                         localpart: Some(localpart),
                         scope: Some("openid offline_access".into()),
                         client_class: None,
+                        resource: None,
                     },
                 )
                 .await
@@ -10155,6 +10400,7 @@ mod client_binding_tests {
                 access_ttl: ACCESS_TOKEN_TTL,
                 refresh_inactivity_secs: Some(REFRESH_TOKEN_TTL),
                 absolute_deadline: Some(late_deadline),
+                resource: None,
             })
             .await
             .unwrap_err();
@@ -11416,6 +11662,7 @@ mod client_binding_tests {
                     code_verifier: None,
                     refresh_token: None,
                     device_code: Some(device_code),
+                    resource: None,
                 },
                 ClientCredentials::default(),
                 &EcdsaSigningKey::generate(),
@@ -11455,6 +11702,7 @@ mod client_binding_tests {
                 code_challenge: challenge.map(Into::into),
                 code_challenge_method: Some("S256".into()),
                 response_mode: None,
+                resource: None,
             };
 
             let unregistered = request("https://other.example.org/cb", Some(CHALLENGE));
@@ -11532,6 +11780,7 @@ mod scope_grant_tests {
                 code_verifier: Some(VERIFIER.to_string()),
                 refresh_token: None,
                 device_code: None,
+                resource: None,
             },
             ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
@@ -12239,6 +12488,7 @@ mod end_session_tests {
                 code_verifier: Some(VERIFIER.to_string()),
                 refresh_token: None,
                 device_code: None,
+                resource: None,
             },
             ClientCredentials::default(),
             &key,
@@ -12275,6 +12525,7 @@ mod end_session_tests {
                 access_ttl: ACCESS_TOKEN_TTL,
                 refresh_inactivity_secs: None,
                 absolute_deadline: None,
+                resource: None,
             })
             .await
             .unwrap();
@@ -12966,6 +13217,7 @@ mod generic_client_tests {
             code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
             code_challenge_method: Some("S256".into()),
             response_mode: None,
+            resource: None,
         };
         Some(authorize(params, &db).await.map(|(url, _cookie)| url))
     }
@@ -13234,6 +13486,7 @@ mod generic_client_tests {
             localpart: Some(localpart_for(did)),
             scope: scope.map(str::to_string),
             client_class: issued_to,
+            resource: None,
         }
     }
 
@@ -13264,6 +13517,7 @@ mod generic_client_tests {
                 code_verifier: Some(VERIFIER.to_string()),
                 refresh_token: None,
                 device_code: None,
+                resource: None,
             },
             ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
@@ -13372,6 +13626,7 @@ mod generic_client_tests {
                 scope: "openid urn:matrix:client:api:* urn:matrix:client:device:SIWX_X".into(),
                 refresh_token: true,
                 report_scope: false,
+                resource: None,
             }
         );
         assert_eq!(
@@ -13394,6 +13649,7 @@ mod generic_client_tests {
                 scope: "openid profile offline_access".into(),
                 refresh_token: true,
                 report_scope: false,
+                resource: None,
             }
         );
 
@@ -13411,6 +13667,7 @@ mod generic_client_tests {
                 scope: "openid io.inblock.mail".into(),
                 refresh_token: false,
                 report_scope: true,
+                resource: None,
             },
             "no device, and only what the policy allows of what the request bound"
         );
@@ -13727,6 +13984,7 @@ mod generic_client_tests {
                 code_verifier: None,
                 refresh_token: Some(refresh_token),
                 device_code: None,
+                resource: None,
             },
             ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
@@ -13912,6 +14170,7 @@ mod generic_client_tests {
                 code_verifier: None,
                 refresh_token: Some(mail_refresh),
                 device_code: None,
+                resource: None,
             },
             ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
@@ -14018,6 +14277,7 @@ mod generic_client_tests {
                         .clone(),
                 ),
                 device_code: None,
+                resource: None,
             },
             ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
@@ -14672,6 +14932,7 @@ mod generic_client_tests {
                 code_verifier: None,
                 refresh_token: None,
                 device_code: Some(device_code.clone()),
+                resource: None,
             },
             ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
@@ -14728,6 +14989,7 @@ mod generic_client_tests {
                 code_verifier: None,
                 refresh_token: None,
                 device_code: Some(device_code.clone()),
+                resource: None,
             },
             ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
@@ -14883,6 +15145,7 @@ mod generic_client_tests {
                 code_verifier: None,
                 refresh_token: None,
                 device_code: Some(device_code),
+                resource: None,
             },
             ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
@@ -15004,6 +15267,7 @@ mod generic_client_tests {
                 code_verifier: None,
                 refresh_token: None,
                 device_code: Some(code.clone()),
+                resource: None,
             },
             ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
@@ -15103,6 +15367,7 @@ mod generic_client_tests {
                 code_verifier: None,
                 refresh_token: None,
                 device_code: Some(code.to_string()),
+                resource: None,
             },
             ClientCredentials::default(),
             &EcdsaSigningKey::generate(),
@@ -15271,5 +15536,624 @@ mod generic_client_tests {
         poll_device_code_against(&db, &code, &delegated(), &synapse)
             .await
             .unwrap_or_else(|e| panic!("flag 2 off: redeemed as today: {e:?}"));
+    }
+}
+
+#[cfg(test)]
+mod resource_binding_tests {
+    //! Resource indicators (RFC 8707) and JWT access tokens (RFC 9068): a
+    //! request that names a configured resource is bound to it, granted the
+    //! resource's scopes only, and answered, at the exchange and at every
+    //! refresh, with a JWT for that resource that verifies against the
+    //! published key. Needs Redis.
+    use super::client_binding_tests::{seed_client_with, unique, Registration, VERIFIER};
+    use super::*;
+    use crate::config::Config;
+    use openidconnect::OAuth2TokenResponse;
+    use p256::ecdsa::signature::Verifier;
+    use siwx_oidc::db::grant::RefreshPeek;
+    use siwx_oidc::signing::EcdsaSigningKey;
+    use std::collections::HashMap;
+
+    const MCP: &str = "https://mcp.example.org/mcp";
+    const MCP_ENTRY: &str =
+        r#"{"uri":"https://mcp.example.org/mcp","scopes":["aqua:read","aqua:write"]}"#;
+
+    fn resources() -> HashMap<String, String> {
+        HashMap::from([("mcp".to_string(), MCP_ENTRY.to_string())])
+    }
+
+    fn registry() -> resource::Registry {
+        resource::Registry::parse(&resources()).unwrap()
+    }
+
+    /// Delegated-auth mode (the deployment an MCP server sits next to) with the
+    /// resource configured.
+    fn matrix_with_mcp() -> Config {
+        Config {
+            mas_shared_secret: Some("shared-secret".to_string()),
+            resources: resources(),
+            ..Config::default()
+        }
+    }
+
+    fn generic_with_mcp() -> Config {
+        Config {
+            resources: resources(),
+            ..Config::default()
+        }
+    }
+
+    fn may_refresh() -> Option<Vec<CoreGrantType>> {
+        Some(vec![
+            CoreGrantType::AuthorizationCode,
+            CoreGrantType::RefreshToken,
+        ])
+    }
+
+    fn params(client_id: &str, scope: &str, resource: Option<&str>) -> AuthorizeParams {
+        AuthorizeParams {
+            client_id: client_id.into(),
+            redirect_uri: RedirectUrl::new("https://example.com/cb".into()).unwrap(),
+            scope: Scope::new(scope.to_string()),
+            response_type: Some(CoreResponseType::Code),
+            state: Some("st".into()),
+            nonce: None,
+            prompt: None,
+            request_uri: None,
+            request: None,
+            code_challenge: Some(super::client_binding_tests::CHALLENGE.into()),
+            code_challenge_method: Some("S256".into()),
+            response_mode: None,
+            resource: resource.map(str::to_string),
+        }
+    }
+
+    /// A code `sign_in` issued for a request bound to `resource`.
+    async fn seed_resource_code(
+        db: &RedisClient,
+        client_id: &str,
+        scope: &str,
+        resource: Option<&str>,
+        class: ClientClass,
+    ) -> String {
+        let code = unique("rcode-");
+        db.set_code(
+            code.clone(),
+            CodeEntry {
+                exchange_count: 0,
+                did: "did:key:zDnaExactCaseAgent".into(),
+                nonce: None,
+                client_id: client_id.into(),
+                auth_time: Utc::now(),
+                code_challenge: Some(super::client_binding_tests::CHALLENGE.into()),
+                code_challenge_method: Some("S256".into()),
+                device_id: None,
+                localpart: Some(unique("localpart")),
+                scope: Some(scope.to_string()),
+                client_class: Some(class),
+                resource: resource.map(str::to_string),
+            },
+        )
+        .await
+        .unwrap();
+        code
+    }
+
+    async fn exchange(
+        db: &RedisClient,
+        config: &Config,
+        key: &EcdsaSigningKey,
+        client_id: &str,
+        code: &str,
+        form_resource: Option<&str>,
+    ) -> Result<SiwxTokenResponse, CustomError> {
+        token(
+            TokenForm {
+                code: Some(code.to_string()),
+                client_id: Some(client_id.to_string()),
+                client_secret: None,
+                grant_type: CoreGrantType::AuthorizationCode,
+                code_verifier: Some(VERIFIER.to_string()),
+                refresh_token: None,
+                device_code: None,
+                resource: form_resource.map(str::to_string),
+            },
+            ClientCredentials::default(),
+            key,
+            config,
+            db,
+            None,
+        )
+        .await
+    }
+
+    async fn refresh(
+        db: &RedisClient,
+        config: &Config,
+        key: &EcdsaSigningKey,
+        client_id: &str,
+        refresh_token: &str,
+    ) -> SiwxTokenResponse {
+        token(
+            TokenForm {
+                code: None,
+                client_id: Some(client_id.to_string()),
+                client_secret: None,
+                grant_type: CoreGrantType::RefreshToken,
+                code_verifier: None,
+                refresh_token: Some(refresh_token.to_string()),
+                device_code: None,
+                resource: None,
+            },
+            ClientCredentials::default(),
+            key,
+            config,
+            db,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the refresh must succeed: {e:?}"))
+    }
+
+    fn segment(token: &str, i: usize) -> serde_json::Value {
+        let part = token.split('.').nth(i).expect("a compact JWS");
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(part).unwrap()).unwrap()
+    }
+
+    /// The token is a JWT signed by `key`: header, claims, raw signature.
+    fn verified_claims(key: &EcdsaSigningKey, token: &str) -> serde_json::Value {
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3, "a compact JWS, not an opaque token");
+        let header = segment(token, 0);
+        assert_eq!(header["alg"], "ES256");
+        assert_eq!(header["typ"], "at+jwt");
+        assert_eq!(header["kid"], key.kid());
+        let raw = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+        let signature = p256::ecdsa::Signature::from_slice(&raw).expect("raw r||s");
+        key.verifying_key()
+            .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)
+            .expect("verifies with the published key");
+        segment(token, 1)
+    }
+
+    fn error_code(e: &CustomError) -> String {
+        match e {
+            CustomError::BadRequestToken(t) => t.error.as_ref().to_string(),
+            other => panic!("not a token error: {other:?}"),
+        }
+    }
+
+    fn redirect_params(e: &CustomError) -> HashMap<String, String> {
+        match e {
+            CustomError::Redirect(url) => Url::parse(url)
+                .unwrap()
+                .query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect(),
+            other => panic!("not a redirect: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn authorize_refuses_an_unknown_resource_with_invalid_target() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client = seed_client_with(&db, Registration::Public, may_refresh()).await;
+        let refused = authorize_bound(
+            params(&client, "aqua:read", Some("https://other.example.org/mcp")),
+            &db,
+            &registry(),
+        )
+        .await
+        .expect_err("not a configured resource");
+        let q = redirect_params(&refused);
+        assert_eq!(q["error"], "invalid_target");
+        assert_eq!(q["state"], "st");
+        // The trailing-slash spelling is another resource.
+        let refused = authorize_bound(
+            params(&client, "aqua:read", Some("https://mcp.example.org/mcp/")),
+            &db,
+            &registry(),
+        )
+        .await
+        .expect_err("exact match");
+        assert_eq!(redirect_params(&refused)["error"], "invalid_target");
+        // With no resource configured at all (the test-only `authorize`), the
+        // same refusal.
+        let refused = authorize(params(&client, "aqua:read", Some(MCP)), &db)
+            .await
+            .expect_err("no registry");
+        assert_eq!(redirect_params(&refused)["error"], "invalid_target");
+    }
+
+    #[tokio::test]
+    async fn authorize_refuses_a_resource_request_that_asks_for_none_of_its_scopes() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client = seed_client_with(&db, Registration::Public, may_refresh()).await;
+        for scope in ["openid", "openid offline_access", "files:read"] {
+            let refused = authorize_bound(params(&client, scope, Some(MCP)), &db, &registry())
+                .await
+                .expect_err(scope);
+            let q = redirect_params(&refused);
+            assert_eq!(q["error"], "invalid_scope", "{scope}");
+            assert_eq!(q["state"], "st");
+        }
+    }
+
+    #[tokio::test]
+    async fn authorize_binds_the_resource_to_the_session_and_needs_no_openid() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let client = seed_client_with(&db, Registration::Public, may_refresh()).await;
+        let (url, cookie) = authorize_bound(
+            params(&client, "aqua:read offline_access", Some(MCP)),
+            &db,
+            &registry(),
+        )
+        .await
+        .expect("a request for the resource's scopes needs no openid");
+        assert!(url.starts_with("/?"), "the login page: {url}");
+        let session = db
+            .get_session(cookie.value().to_string())
+            .await
+            .unwrap()
+            .expect("authorize stores the session");
+        let request = session.request.expect("bound");
+        assert_eq!(request.resource.as_deref(), Some(MCP));
+        assert_eq!(request.scope.as_deref(), Some("aqua:read offline_access"));
+        // Without a resource the openid rule stands.
+        let refused = authorize_bound(params(&client, "aqua:read", None), &db, &registry())
+            .await
+            .expect_err("no openid, no matrix scope, no resource");
+        assert!(matches!(refused, CustomError::Other(_)), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn a_resource_code_is_exchanged_for_a_jwt_for_that_resource_and_no_id_token() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let key = EcdsaSigningKey::generate();
+        for (config, class) in [
+            (matrix_with_mcp(), ClientClass::Matrix),
+            (generic_with_mcp(), ClientClass::Matrix),
+        ] {
+            let client = seed_client_with(&db, Registration::Public, may_refresh()).await;
+            // `openid` and a foreign scope are dropped; the resource's order wins.
+            let code = seed_resource_code(
+                &db,
+                &client,
+                "openid aqua:write aqua:read offline_access urn:matrix:client:api:*",
+                Some(MCP),
+                class,
+            )
+            .await;
+            let response = exchange(&db, &config, &key, &client, &code, None)
+                .await
+                .unwrap_or_else(|e| panic!("the exchange must succeed: {e:?}"));
+            assert!(
+                response.extra_fields().id_token().is_none(),
+                "a token for a resource comes with no ID token"
+            );
+            let claims = verified_claims(&key, response.access_token().secret());
+            assert_eq!(claims["iss"], Config::default().base_url.as_str());
+            assert_eq!(claims["sub"], "did:key:zDnaExactCaseAgent");
+            assert_eq!(claims["aud"], MCP);
+            assert_eq!(claims["client_id"], client);
+            assert_eq!(claims["scope"], "aqua:read aqua:write offline_access");
+            let iat = claims["iat"].as_i64().unwrap();
+            assert_eq!(
+                claims["exp"].as_i64().unwrap(),
+                iat + ACCESS_TOKEN_TTL as i64
+            );
+            assert!(claims["jti"].as_str().is_some_and(|j| !j.is_empty()));
+            assert!(claims.get("sid").is_none() && claims.get("nonce").is_none());
+            // The response names the granted scope, which differs from the request.
+            let reported: Vec<&str> = response
+                .scopes()
+                .expect("the scope differs, so it is named")
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            assert_eq!(reported, ["aqua:read", "aqua:write", "offline_access"]);
+            assert_eq!(
+                response.expires_in().map(|d| d.as_secs()),
+                Some(ACCESS_TOKEN_TTL)
+            );
+            // The grant behind it: oidc kind, no device, the resource recorded, and
+            // its opaque access token never handed out (the JWT is not it).
+            let rt = response
+                .refresh_token()
+                .expect("offline_access was granted")
+                .secret()
+                .clone();
+            let RefreshPeek::Grant(grant) = db.peek_refresh_token(&rt).await.unwrap() else {
+                panic!("a grant")
+            };
+            assert_eq!(grant.kind, GrantKind::Oidc);
+            assert_eq!(grant.device_id, "");
+            assert_eq!(grant.resource.as_deref(), Some(MCP));
+            assert_eq!(grant.scope, "aqua:read aqua:write offline_access");
+            assert_eq!(grant.client_id, client);
+            assert!(
+                db.lookup_access_token(response.access_token().secret())
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the JWT is not a stored token"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resource_code_names_its_resource_at_the_token_endpoint_or_none() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let key = EcdsaSigningKey::generate();
+        let config = matrix_with_mcp();
+        let client = seed_client_with(&db, Registration::Public, None).await;
+        // Another resource: refused, and the code is spent (single use).
+        let code =
+            seed_resource_code(&db, &client, "aqua:read", Some(MCP), ClientClass::Matrix).await;
+        let refused = exchange(
+            &db,
+            &config,
+            &key,
+            &client,
+            &code,
+            Some("https://other.example.org/mcp"),
+        )
+        .await
+        .expect_err("another resource");
+        assert_eq!(error_code(&refused), "invalid_target");
+        // The same resource: issued.
+        let code =
+            seed_resource_code(&db, &client, "aqua:read", Some(MCP), ClientClass::Matrix).await;
+        let response = exchange(&db, &config, &key, &client, &code, Some(MCP))
+            .await
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(
+            verified_claims(&key, response.access_token().secret())["aud"],
+            MCP
+        );
+        assert!(response.scopes().is_none(), "granted exactly as requested");
+        // A resource named for a code that named none: refused.
+        let code = seed_resource_code(&db, &client, "openid", None, ClientClass::Matrix).await;
+        let refused = exchange(&db, &config, &key, &client, &code, Some(MCP))
+            .await
+            .expect_err("the code was not issued for a resource");
+        assert_eq!(error_code(&refused), "invalid_target");
+    }
+
+    #[tokio::test]
+    async fn a_resource_removed_from_the_configuration_is_refused_at_the_exchange() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let key = EcdsaSigningKey::generate();
+        let client = seed_client_with(&db, Registration::Public, None).await;
+        let code =
+            seed_resource_code(&db, &client, "aqua:read", Some(MCP), ClientClass::Matrix).await;
+        let without = Config {
+            mas_shared_secret: Some("shared-secret".to_string()),
+            ..Config::default()
+        };
+        let refused = exchange(&db, &without, &key, &client, &code, None)
+            .await
+            .expect_err("no longer configured");
+        assert_eq!(error_code(&refused), "invalid_target");
+        // A class change since sign_in is still the class refusal.
+        let code =
+            seed_resource_code(&db, &client, "aqua:read", Some(MCP), ClientClass::Generic).await;
+        let refused = exchange(&db, &matrix_with_mcp(), &key, &client, &code, None)
+            .await
+            .expect_err("issued to a generic-class client, presented by a Matrix-class one");
+        assert_eq!(error_code(&refused), "invalid_grant");
+    }
+
+    #[tokio::test]
+    async fn a_resource_grant_refreshes_into_a_new_jwt_for_the_same_resource() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let key = EcdsaSigningKey::generate();
+        let config = matrix_with_mcp();
+        let client = seed_client_with(&db, Registration::Public, may_refresh()).await;
+        let code = seed_resource_code(
+            &db,
+            &client,
+            "aqua:read offline_access",
+            Some(MCP),
+            ClientClass::Matrix,
+        )
+        .await;
+        let first = exchange(&db, &config, &key, &client, &code, None)
+            .await
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let first_claims = verified_claims(&key, first.access_token().secret());
+        let rt = first.refresh_token().unwrap().secret().clone();
+
+        let second = refresh(&db, &config, &key, &client, &rt).await;
+        let claims = verified_claims(&key, second.access_token().secret());
+        assert_eq!(claims["aud"], MCP);
+        assert_eq!(claims["sub"], first_claims["sub"]);
+        assert_eq!(claims["client_id"], client);
+        assert_eq!(claims["scope"], "aqua:read offline_access");
+        assert_ne!(claims["jti"], first_claims["jti"]);
+        let iat = claims["iat"].as_i64().unwrap();
+        let exp = claims["exp"].as_i64().unwrap();
+        assert!(exp > iat && exp - iat <= ACCESS_TOKEN_TTL as i64);
+        assert_eq!(
+            second.expires_in().map(|d| d.as_secs() as i64),
+            Some(exp - iat),
+            "expires_in counts to the token's exp"
+        );
+        assert!(second.refresh_token().is_some(), "rotated");
+        assert!(second.extra_fields().id_token().is_none());
+        // A replay of the previous refresh token (the lost-response grace) is
+        // answered with a token of its own for the same remaining lifetime.
+        let replayed = refresh(&db, &config, &key, &client, &rt).await;
+        let replayed_claims = verified_claims(&key, replayed.access_token().secret());
+        assert_eq!(replayed_claims["aud"], MCP);
+        assert_eq!(replayed_claims["exp"], claims["exp"]);
+        assert_ne!(replayed_claims["jti"], claims["jti"]);
+        assert_eq!(
+            replayed.refresh_token().unwrap().secret(),
+            second.refresh_token().unwrap().secret()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_exchange_still_hands_out_an_opaque_token_and_an_id_token() {
+        let Some(db) = siwx_oidc::test_support::redis().await else {
+            return;
+        };
+        let key = EcdsaSigningKey::generate();
+        let client = seed_client_with(&db, Registration::Public, may_refresh()).await;
+        let code = seed_resource_code(&db, &client, "openid", None, ClientClass::Matrix).await;
+        let response = exchange(&db, &matrix_with_mcp(), &key, &client, &code, None)
+            .await
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(response.extra_fields().id_token().is_some());
+        let access = response.access_token().secret();
+        assert!(access.starts_with("mat_"), "opaque, as before: {access}");
+        let grant = db
+            .lookup_access_token(access)
+            .await
+            .unwrap()
+            .expect("stored")
+            .grant;
+        assert_eq!(grant.resource, None);
+    }
+
+    #[test]
+    fn discovery_lists_the_resources_scopes_once() {
+        let two = Config {
+            resources: HashMap::from([
+                ("mcp".to_string(), MCP_ENTRY.to_string()),
+                (
+                    "files".to_string(),
+                    r#"{"uri":"https://files.example.org","scopes":["aqua:read","files:write"]}"#
+                        .to_string(),
+                ),
+            ]),
+            ..Config::default()
+        };
+        let value = provider_metadata_value(&two, true).unwrap();
+        let scopes: Vec<&str> = value["scopes_supported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
+        for scope in ["openid", "aqua:read", "aqua:write", "files:write"] {
+            assert_eq!(
+                scopes.iter().filter(|s| **s == scope).count(),
+                1,
+                "{scope} listed once: {scopes:?}"
+            );
+        }
+        let none = provider_metadata_value(&Config::default(), true).unwrap();
+        assert!(!none["scopes_supported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str() == Some("aqua:read")));
+    }
+
+    /// The exchange table: a resource code is an `oidc` grant with no device for
+    /// the resource, in both modes and for either class, as long as the class
+    /// matches; the resource's grant rule decides the scope.
+    #[test]
+    fn exchange_issuance_bound_puts_the_resource_row_in_front_of_the_table() {
+        let registry = registry();
+        let client = |class: ClientClass| ClientEntry {
+            class,
+            ..ClientEntry::new(
+                "s",
+                SiwxClientMetadata::new(
+                    vec![RedirectUrl::new("https://example.com/cb".into()).unwrap()],
+                    LogoutClientMetadata::default(),
+                ),
+                None,
+            )
+        };
+        let code = |class: ClientClass, scope: &str, resource: Option<&str>| CodeEntry {
+            exchange_count: 0,
+            did: "did:key:zDna".into(),
+            nonce: None,
+            client_id: "c".into(),
+            auth_time: Utc::now(),
+            code_challenge: None,
+            code_challenge_method: None,
+            device_id: Some("SIWX_X".into()),
+            localpart: None,
+            scope: Some(scope.to_string()),
+            client_class: Some(class),
+            resource: resource.map(str::to_string),
+        };
+        for delegated in [true, false] {
+            for class in [ClientClass::Matrix, ClientClass::Generic] {
+                let issuance = exchange_issuance_bound(
+                    delegated,
+                    &client(class),
+                    &code(class, "aqua:write openid", Some(MCP)),
+                    &registry,
+                )
+                .unwrap();
+                assert_eq!(
+                    issuance,
+                    Issuance {
+                        kind: GrantKind::Oidc,
+                        device_id: String::new(),
+                        scope: "aqua:write".into(),
+                        refresh_token: false,
+                        report_scope: true,
+                        resource: Some(MCP.into()),
+                    },
+                    "delegated={delegated} class={class:?}: the device on the code is ignored"
+                );
+            }
+        }
+        // Class mismatch: refused like any other.
+        let err = exchange_issuance_bound(
+            true,
+            &client(ClientClass::Generic),
+            &code(ClientClass::Matrix, "aqua:read", Some(MCP)),
+            &registry,
+        )
+        .unwrap_err();
+        assert_eq!(error_code(&err), "invalid_grant");
+        // Not configured, or nothing of the resource's asked for: invalid_target.
+        for (reg, scope) in [
+            (resource::Registry::default(), "aqua:read"),
+            (registry.clone(), "openid"),
+        ] {
+            let err = exchange_issuance_bound(
+                true,
+                &client(ClientClass::Matrix),
+                &code(ClientClass::Matrix, scope, Some(MCP)),
+                &reg,
+            )
+            .unwrap_err();
+            assert_eq!(error_code(&err), "invalid_target");
+        }
+        // No resource: the ordinary table, unchanged.
+        let ordinary = exchange_issuance_bound(
+            true,
+            &client(ClientClass::Matrix),
+            &code(ClientClass::Matrix, "openid", None),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(ordinary.kind, GrantKind::MatrixDevice);
+        assert_eq!(ordinary.device_id, "SIWX_X");
+        assert_eq!(ordinary.resource, None);
     }
 }

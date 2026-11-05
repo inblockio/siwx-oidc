@@ -307,6 +307,17 @@ pub struct Config {
     #[serde(default, deserialize_with = "secret_file_path")]
     pub redis_password_file: Option<String>,
     pub default_clients: HashMap<String, String>,
+    /// The resource servers this provider issues access tokens for (RFC 8707), a map of
+    /// a name of your choosing to a JSON entry `{"uri": …, "scopes": […]}`: the resource's
+    /// canonical URI, as it names itself and as clients send it in `resource`, and the
+    /// scopes it understands. Start-up refuses an entry that is not canonical (lowercase
+    /// scheme and host, no default port, no query, fragment or trailing slash), lists no
+    /// scope, lists one twice, or lists a scope that belongs to this provider or the
+    /// homeserver (`openid`, `profile`, `offline_access`, `urn:matrix:*`, `urn:synapse:*`).
+    /// A request that names one of these resources is granted its scopes only and gets
+    /// RFC 9068 JWT access tokens with the URI as `aud` (`resource`, `access_token`).
+    /// Env: `SIWXOIDC_RESOURCES__<name>`
+    pub resources: HashMap<String, String>,
     pub require_secret: bool,
     /// ID token lifetime in seconds. Default: 300 (5 minutes).
     pub id_token_ttl_secs: u64,
@@ -822,6 +833,7 @@ impl Default for Config {
             redis_url: Url::parse("redis://localhost").unwrap(),
             redis_password_file: None,
             default_clients: HashMap::default(),
+            resources: HashMap::default(),
             require_secret: true,
             id_token_ttl_secs: 300,
             eth_provider: None,
@@ -1072,6 +1084,32 @@ mod tests {
                 Some("from-legacy")
             );
             assert_eq!(clients.get("beta").map(String::as_str), Some("from-new"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn resources_are_a_map_of_json_entries_from_the_file_and_the_environment() {
+        Jail::expect_with(|jail| {
+            scrub_config_env(jail);
+            jail.create_file(
+                CONFIG_FILE,
+                "[default.resources]\nmcp = '{\"uri\":\"https://mcp.example.org/mcp\",\"scopes\":[\"aqua:read\"]}'\n",
+            )?;
+            jail.set_env(
+                "SIWXOIDC_RESOURCES__FILES",
+                r#"{"uri":"https://files.example.org","scopes":["files:read"]}"#,
+            );
+            let resources = figment().extract::<Config>()?.resources;
+            let registry = siwx_oidc::resource::Registry::parse(&resources)?;
+            assert!(registry.find("https://mcp.example.org/mcp").is_some());
+            assert_eq!(
+                registry
+                    .find("https://files.example.org")
+                    .map(|r| r.scopes.clone()),
+                Some(vec!["files:read".to_string()])
+            );
+            assert!(Config::default().resources.is_empty());
             Ok(())
         });
     }
