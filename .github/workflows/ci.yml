@@ -15,7 +15,13 @@ name: ci
 on:
   push:
     branches: [main, fork-stable]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
 
 permissions:
   contents: read
