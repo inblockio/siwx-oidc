@@ -68,6 +68,8 @@ same test names and list the tags separately. Today's legs:
 | `@ew-p9` sw-versions-no-cache-on-error | SW-1, SW-2 (sw-media-auth) |
 | `@ew-p10` sw-media-401-token-retry | SW-3 (sw-media-auth) |
 | `@ew-p11` copy-markdown | CM1-CM7 (copy-markdown; CM3, "absent on media", passes on a build without the entry by design) |
+| `@ew-p13` room-retention | EW-RR1 (room-retention; needs `EW_RET_USER_DIR`, skips without it) |
+| `@ew-delta-face-retention` | EW-RR2 (face-retention; the Rocket.Chat face on top of entry 13; needs `EW_RET_USER_DIR`, skips without it; not in the promotion selection below, it needs the `client_views` kit) |
 | `@ew-delta-theme-overrides` | EW-MX25 (attested-did) |
 
 Entry 5 (auto-approve-check-code) has no leg: it needs a second MSC4108 client.
@@ -80,7 +82,7 @@ The selection, on a lab whose Element runs the build under test (the T2 pairs st
   ew-attested-did.spec.mjs ew-clickpath.spec.mjs ew-copy-markdown.spec.mjs ew-encrypted-search.spec.mjs \
   ew-h3-second-device-walk.spec.mjs ew-journey-add-device.spec.mjs ew-journey-exits.spec.mjs \
   ew-journey-reset-after-no-recovery.spec.mjs ew-login.spec.mjs ew-patch-honesty.spec.mjs \
-  ew-recovery-entry.spec.mjs ew-s1-redacted-edit-crawl.spec.mjs ew-sw-media-auth.spec.mjs \
+  ew-recovery-entry.spec.mjs ew-room-retention.spec.mjs ew-s1-redacted-edit-crawl.spec.mjs ew-sw-media-auth.spec.mjs \
   ew-u3prime-no-forced-reset.spec.mjs ew-verify-sas.spec.mjs
 ./run.sh --grep '@ew-p1\b' ...     # one entry: \b, or @ew-p1 also selects @ew-p10 and @ew-p11
 ./run.sh --list --grep '@ew-p|@ew-delta' ...   # what would run
@@ -115,6 +117,40 @@ file before an image carries it; T2-EW's `T2_NEGATIVE=drop-eventindex` (EW-EA3 m
 | `ew-attested-did.spec.mjs` | EW-DID1, EW-DID2: the provider-attested DID (siwx-oidc-matrix-server `patches/element-web` entry 7, `show-attested-did.patch`) after a fresh wallet sign-in, whose binding siwx-oidc publishes into the account's `io.inblock.did` profile field: the user-info panel shows a "DID" row directly under the MXID, abbreviated from the wallet's `did:pkh:eip155:1:0` prefix, and its copy button copies the full DID (EW-DID1); Settings > Account shows the full DID in a "DID" row whose copy button copies it (EW-DID2). EW-MX25 (siwx-oidc-matrix-server#25, `config/element-theme-overrides.css`): in the user-info panel the MXID's copy button sits within -1..8 px of the right edge of the MXID's last line, on that line, and the MXID with its button is centred within 4 px in the profile column. `EW_THEME_OVERRIDES_CSS=<file>` serves that file as the theme overrides (and checks the page applied it rule for rule); `EW_DID_NEGATIVE=hide-field` answers the browser's DID profile reads with 404, and EW-DID1 and EW-DID2 must then fail. Grants `clipboard-read`/`clipboard-write`. |
 | `ew-upgrade-ew-capture.spec.mjs`, `ew-upgrade-ew-assert.spec.mjs` | EW-EC1..EC4 / EW-EA1..EA7, EW-EZ: T2-EW, continuity across an Element Web image switch (session, device, the browser EventIndex not reset), driven by `upgrade-survival.sh` with `T2_SWAP=element-web` |
 | `ew-copy-markdown.spec.mjs` | CM1-CM7: the message context menu's "Copy Markdown" entry (siwx-oidc-matrix-server#24) in an encrypted room: it sits directly above "Pin" (CM1), copies an edited HTML message as exact CommonMark + GFM through the clipboard (CM2), is absent on an `m.image` (CM3), escapes Markdown and HTML metacharacters of a message with raw HTML and no formatted body (CM4), copies Markdown typed into the real composer (pasted, sent with Enter) back exactly as typed, GFM table, task list and soft line breaks included (CM5), and does the same for content Element did not compose: a Rust SDK message whose `formatted_body` is ruma's real `text_markdown` rendering (CM6) and a bot's plain `body` with no HTML (CM7), both sent from the test account because the rule reads the event content only, never the sender. Grants `clipboard-read`/`clipboard-write` to the browser context. Run against an Element without the entry, CM1, CM2, CM4, CM5, CM6 and CM7 must fail on the missing "Copy Markdown" menu item; against one whose entry only converts the displayed HTML, CM5, CM6 and CM7 fail on the clipboard comparison. |
+| `ew-room-retention.spec.mjs` | EW-RR1 (registry entry 13, `@ew-p13`): disappearing messages. Room Settings > Security & Privacy shows "Disappearing messages" with Off and the configured choices (config key `io.inblock.room_retention`); choosing the short one (`EW_RET_SHORT_MS`, default 120000) sets `m.room.retention` `{max_lifetime}` and a timeline notice, a sent message disappears from the timeline without a reload within lifetime + 75 s (the measured seconds go into the `client-hide-latency` annotation) and `GET /rooms/{id}/event/{eventId}` answers 404; after a reload it is still gone; Off sets exactly `{min_lifetime: 0}` and a second message outlives the lifetime. Signs in as the STANDING user in `EW_RET_USER_DIR` (`wallet.key`, `recovery.key`; never a new identity; skips without the variable), keeps one room `rret-e2e` (id in `retention-room.id`), removes the user's other devices and logs out in `afterAll`. Sign-in helper: `helpers/standing-user.mjs`. |
+| `ew-face-retention.spec.mjs` | EW-RR2 (`@ew-delta-face-retention`): the same disappearing-messages feature in the Rocket.Chat face (`client_views` kit) of the standing user's Element: stock settings, Switch to Rocket.Chat, the Room Information card entry "Disappearing messages", the notice line in the face timeline, a face message leaving the face timeline without reload (and after a reload) and the server answering 404, Off, a member's read-only view (S8, needs user B by API through `EW_FACE_B_HOST`, skipped without it), the notices in the stock timeline, cleanup. Same standing user and rooms as EW-RR1; skips without `EW_RET_USER_DIR`; run on the host (see below) |
+
+### Room retention against dev (EW-RR1)
+
+Needs an Element image with registry entry 13 and, in the target's `config.json`, `io.inblock.room_retention`
+with a short test choice such as `{"ms": 120000, "label": "2 minutes (test)"}`; on any other build the
+spec fails at step 1 on the missing section. It takes about `2 * EW_RET_SHORT_MS + 5 min`.
+
+```bash
+EW_RET_USER_DIR=~/.local/state/element-dev-check EW_RET_SHORT_MS=120000 \
+ELEMENT_URL=<dev element url> MATRIX_URL=<dev matrix url> SIWX_URL=<dev siwx url> \
+  ./run.sh --grep '@ew-p13' ew-room-retention.spec.mjs
+```
+
+`EW_RET_USER_DIR` is the standing dev user's state directory (an absolute path, mounted writable); the spec
+never creates an identity and writes only `retention-room.id` there.
+
+### Room retention in the face against dev (EW-RR2)
+
+Needs, besides entry 13 and the retention config key above, the `client_views` kit in the target's `config.json`.
+Same standing user, same `EW_RET_USER_DIR`; the member-view step (S8) additionally needs a second room, where the standing
+user is a plain member and user B is admin (`retention-member-room.id` in the state directory), and B's API access as an ES
+module outside this repo: `EW_FACE_B_HOST=<absolute path>` exporting `hostApi()` (`{ req(method, path, body) }` returning
+`{ status, json }` as B) and `rd(name)`. Without `EW_FACE_B_HOST` S8 is skipped with that reason and the rest runs. B's module
+imports from its own checkout, so a run that includes S8 is a host run, not `run.sh`'s container (only `EW_*` directories are
+mounted there). Takes about 6 minutes. No tracing or video (the typed recovery key); `EW_FACE_OUT` (results.json) and
+`EW_RET_SHOTS` (screenshots) are optional absolute directories.
+
+```bash
+EW_RET_USER_DIR=~/.local/state/element-dev-check EW_RET_SHORT_MS=120000 EW_FACE_B_HOST=<abs path> \
+ELEMENT_URL=<dev element url> MATRIX_URL=<dev matrix url> SIWX_URL=<dev siwx url> \
+  npx playwright test --trace off --grep '@ew-delta-face-retention' ew-face-retention.spec.mjs
+```
 
 ## Helpers
 
