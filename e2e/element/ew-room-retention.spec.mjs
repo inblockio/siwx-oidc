@@ -49,6 +49,11 @@ const ROOM_ID_FILE = 'retention-room.id';
 const HIDE_SLACK_MS = 75_000; // the client must hide the message within this long after the lifetime
 const SKEW_TOLERANCE_MS = 2_000; // the server clock is read from a one-second Date header
 
+const SHOTS = process.env.EW_RET_SHOTS; // optional absolute directory (EW_* so run.sh mounts it): screenshots of the key moments
+const shot = async (page, name) => {
+  if (SHOTS) await page.screenshot({ path: `${SHOTS}/${name}.png` }).catch((e) => console.log(`[RR] screenshot ${name} failed: ${String(e).slice(0, 100)}`));
+};
+
 const reEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const uniq = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 
@@ -75,14 +80,20 @@ const retentionState = (page, roomId) =>
     [roomId, RETENTION],
   );
 
-/** HTTP status of GET /rooms/{id}/event/{eventId} with the signed-in client's token (never /sync: Synapse caches it). */
+/**
+ * HTTP status of GET /rooms/{id}/event/{eventId} through the client's own authenticated request (never /sync:
+ * Synapse caches it). Not a hand-made fetch with getAccessToken(): the OIDC access token is short-lived and the SDK
+ * refreshes it only inside its own requests, so a raw fetch late in a long run answers 401 (seen in run 3, step 8).
+ */
 const eventStatus = (page, roomId, eventId) =>
   page.evaluate(
     async ([rid, eid]) => {
-      const c = window.mxMatrixClientPeg.get();
-      const url = `${c.getHomeserverUrl()}/_matrix/client/v3/rooms/${encodeURIComponent(rid)}/event/${encodeURIComponent(eid)}`;
-      const r = await fetch(url, { headers: { Authorization: `Bearer ${c.getAccessToken()}` } });
-      return r.status;
+      try {
+        await window.mxMatrixClientPeg.get().fetchRoomEvent(rid, eid);
+        return 200;
+      } catch (e) {
+        return e?.httpStatus ?? `no status: ${String(e).slice(0, 80)}`;
+      }
     },
     [roomId, eventId],
   );
@@ -112,6 +123,27 @@ async function chooseRadio(group, label) {
   // The styled radio hides the native input; fall back to its label when a direct check is refused.
   await radio.check({ timeout: 10_000 }).catch(() => group.getByText(label, { exact: true }).click());
   await expect(radio).toBeChecked();
+}
+
+/**
+ * The timeline tile of a state event. A notice that follows the room's creation is folded into the collapsed
+ * "<user> created and configured the room" summary, whose tiles are not rendered until it is expanded: expand
+ * every collapsed summary in the room view until the tile exists.
+ */
+async function noticeTile(page, eventId) {
+  const tile = page.locator(`[data-event-id="${eventId}"]`);
+  await expect
+    .poll(
+      async () => {
+        if ((await tile.count()) > 0) return true;
+        const expand = page.locator('.mx_RoomView_MessageList, main').getByRole('button', { name: 'Expand', exact: true });
+        if ((await expand.count()) > 0) await expand.first().click().catch(() => {});
+        return (await tile.count()) > 0;
+      },
+      { message: 'the notice tile of the state event', timeout: 30_000, intervals: [500] },
+    )
+    .toBe(true);
+  return tile;
 }
 
 async function closeSettings(page, dialog) {
@@ -189,6 +221,8 @@ test.describe('Disappearing messages (room retention, registry entry 13)', { tag
       expect(short, `a choice whose value is ${SHORT_MS} ms (add {"ms": ${SHORT_MS}, ...} to io.inblock.room_retention)`).toBeTruthy();
       shortLabel = short.label;
       await expect(group.getByRole('radio', { name: 'Off', exact: true })).toBeChecked();
+      await group.scrollIntoViewIfNeeded(); // the section is below the fold of the settings dialog
+      await shot(page, '1-security-privacy-disappearing-messages');
       await closeSettings(page, dialog);
     });
 
@@ -198,8 +232,9 @@ test.describe('Disappearing messages (room retention, registry entry 13)', { tag
       await expect.poll(async () => (await retentionState(page, roomId))?.content, { timeout: 30_000 }).toEqual({ max_lifetime: SHORT_MS });
       const state = await retentionState(page, roomId);
       await closeSettings(page, dialog);
-      const notice = page.locator(`[data-event-id="${state.id}"]`);
+      const notice = await noticeTile(page, state.id);
       await expect(notice).toContainText(new RegExp(`set messages in this room to disappear after ${reEscape(shortLabel)}\\.`), { timeout: 30_000 });
+      await shot(page, '2-timeline-notice');
     });
 
     let sent;
@@ -219,10 +254,16 @@ test.describe('Disappearing messages (room retention, registry entry 13)', { tag
       const serverNow = () => Date.now() + skew;
       const giveUpAt = sent.ts + SHORT_MS + HIDE_SLACK_MS + 10_000;
       let goneAt = null;
+      let shotBefore = false;
       while (serverNow() < giveUpAt) {
         if ((await tile.count()) === 0) {
           goneAt = serverNow();
+          await shot(page, '4-after-message-gone');
           break;
+        }
+        if (!shotBefore && serverNow() > sent.ts + SHORT_MS - 6_000) {
+          shotBefore = true;
+          await shot(page, '4-before-message-gone');
         }
         await page.waitForTimeout(500);
       }
@@ -240,6 +281,7 @@ test.describe('Disappearing messages (room retention, registry entry 13)', { tag
     await test.step('5 the server no longer serves the event', async () => {
       const status = await eventStatus(page, roomId, sent.eventId);
       test.info().annotations.push({ type: 'server-event-status', description: `GET event after expiry: ${status}` });
+      console.log(`[RR] server-event-status after expiry: ${status}`);
       // 401 or a server error would be a broken request, not retention.
       expect(status, 'GET event after expiry').not.toBe(200);
       expect(status, 'GET event after expiry (404 expected)').toBeGreaterThanOrEqual(400);
@@ -266,7 +308,7 @@ test.describe('Disappearing messages (room retention, registry entry 13)', { tag
       const state = await retentionState(page, roomId);
       expect('max_lifetime' in state.content, 'no max_lifetime key after Off').toBe(false);
       await closeSettings(page, dialog);
-      const notice = page.locator(`[data-event-id="${state.id}"]`);
+      const notice = await noticeTile(page, state.id);
       await expect(notice).toContainText(/turned off disappearing messages\./, { timeout: 30_000 });
     });
 

@@ -41,33 +41,8 @@ export function loadStandingUser(dir) {
   };
 }
 
-/**
- * Wallet sign-in through siwx, then verify the new device with the stored recovery key. Leaves the page in the
- * signed-in app shell. Never presses Escape on the verification dialog: Element's forced-recovery patch treats a
- * dismissal as a sign-out.
- */
-export async function standingUserSignIn(page, user) {
-  const siwxOrigin = new URL(SIWX_URL).origin;
-  const elementOrigin = new URL(ELEMENT_URL).origin;
-  await injectMockWallet(page, user.bundle);
-  await page.goto(ELEMENT_URL, { waitUntil: 'domcontentloaded' });
-
-  // Element redirects a logged-out browser to siwx at once (sso_redirect_options.immediate), or shows "Sign in".
-  const onSiwx = (u) => u.origin === siwxOrigin;
-  const signIn = page
-    .getByRole('link', { name: /^Sign in$/ })
-    .or(page.getByRole('button', { name: /^(Sign in|Continue)$/ }));
-  await Promise.race([
-    page.waitForURL(onSiwx, { timeout: 60_000 }),
-    signIn.first().waitFor({ timeout: 60_000 }).then(() => signIn.first().click()),
-  ]);
-  await page.waitForURL(onSiwx, { timeout: 30_000 });
-
-  await page.getByRole('button', { name: 'Sign in with Ethereum' }).click();
-  await page.getByRole('button', { name: 'Skip for now' }).click({ timeout: 30_000 }).catch(() => {});
-  await page.waitForURL((u) => u.origin === elementOrigin, { timeout: 60_000 });
-
-  // A returning user's new device: verify with the stored recovery key.
+/** One pass of the recovery-key verification dialog; throws with a named step when it does not complete. */
+async function verifyWithRecoveryKey(page, user) {
   const verify = page.getByRole('button', {
     name: /Use recovery key|Verify with (Recovery|Security) Key|Use Security Key/i,
   });
@@ -86,6 +61,47 @@ export async function standingUserSignIn(page, user) {
     throw new Error('standing user sign-in: no "Done" after the recovery key');
   });
   await done.first().click();
+}
+
+/**
+ * Wallet sign-in through siwx, then verify the new device with the stored recovery key. Leaves the page in the
+ * signed-in app shell. Never presses Escape on the verification dialog: Element's forced-recovery patch treats a
+ * dismissal as a sign-out.
+ */
+export async function standingUserSignIn(page, user) {
+  const siwxOrigin = new URL(SIWX_URL).origin;
+  const elementOrigin = new URL(ELEMENT_URL).origin;
+  await injectMockWallet(page, user.bundle);
+  await page.goto(ELEMENT_URL, { waitUntil: 'domcontentloaded' });
+
+  // Element redirects a logged-out browser to siwx at once (sso_redirect_options.immediate), or shows "Sign in".
+  // Decide first, then click: a click chained onto the race would stay pending and fire later on an unrelated
+  // "Continue" button of the verification dialog.
+  const onSiwx = (u) => u.origin === siwxOrigin;
+  const signIn = page
+    .getByRole('link', { name: /^Sign in$/ })
+    .or(page.getByRole('button', { name: /^Sign in$/ }));
+  const first = await Promise.race([
+    page.waitForURL(onSiwx, { timeout: 60_000 }).then(() => 'siwx'),
+    signIn.first().waitFor({ timeout: 60_000 }).then(() => 'button'),
+  ]);
+  if (first === 'button') await signIn.first().click();
+  await page.waitForURL(onSiwx, { timeout: 30_000 });
+
+  await page.getByRole('button', { name: 'Sign in with Ethereum' }).click();
+  await page.getByRole('button', { name: 'Skip for now' }).click({ timeout: 30_000 }).catch(() => {});
+  await page.waitForURL((u) => u.origin === elementOrigin, { timeout: 60_000 });
+
+  // A returning user's new device: verify with the stored recovery key. Element may ask again after "Done"
+  // (first run 2 showed the "Confirm your digital identity" dialog a second time and it blocked every click),
+  // so repeat while that dialog shows up within a few seconds, at most three times.
+  const askAgain = page.getByRole('dialog').getByRole('button', { name: /Use recovery key/i });
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await verifyWithRecoveryKey(page, user);
+    const again = await askAgain.first().waitFor({ timeout: 8_000 }).then(() => true, () => false);
+    if (!again) break;
+    console.log(`[RR] sign-in: the verification dialog came back after attempt ${attempt}`);
+  }
 
   await page.locator('.mx_LeftPanel, .mx_RoomList').first().waitFor({ timeout: 60_000 });
   // The client is ready once it has synced once.
