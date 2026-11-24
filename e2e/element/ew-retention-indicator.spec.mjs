@@ -58,6 +58,7 @@ const ROOM_ID_FILE = 'retention-room.id';
 const NONE = 'rret-indicator-none';
 const NONE_ID_FILE = 'retention-indicator-none-room.id';
 const LIVE_MS = 20_000; // the views follow the room state; this is the wait for a sync round trip
+const RETENTION_TEXT = /Messages (here )?are deleted after/; // any period: a description with it names the retention
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const reEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const check = (cond, msg) => { if (!cond) throw new Error(msg); };
@@ -133,6 +134,13 @@ const fr = () => page.frameLocator(KIT);
 const kitUp = () => page.locator(KIT).count().then((n) => n > 0);
 const faceRow = (name) => fr().locator('a.rcx-sidebar-item').filter({ has: fr().locator('.rcx-sidebar-item__title', { hasText: new RegExp(`^${reEscape(name)}$`) }) }).first();
 const faceHeaderText = () => fr().locator('[data-kit-retention-text]');
+/** The header line's text without its decorative clock: Fuselage draws the icon as a font glyph (a private-use
+ *  character in textContent) and marks it aria-hidden, so what a reader sees and hears is the rest. */
+const faceHeaderLine = () => faceHeaderText().first().evaluate((el) => {
+  const c = el.cloneNode(true);
+  c.querySelectorAll('[aria-hidden="true"]').forEach((n) => n.remove());
+  return c.textContent.trim();
+});
 const faceClockFacts = (row) => row.evaluate((el) => {
   const clock = el.querySelector('[data-kit-retention-clock]');
   const title = el.querySelector('.rcx-sidebar-item__title');
@@ -149,7 +157,24 @@ const faceClockFacts = (row) => row.evaluate((el) => {
 });
 const markKit = () => page.locator(KIT).first().evaluate((f) => { f.contentWindow.__rr3Mark = Math.random().toString(36).slice(2); return f.contentWindow.__rr3Mark; });
 const kitMark = () => page.locator(KIT).first().evaluate((f) => f.contentWindow.__rr3Mark ?? null);
+/**
+ * Stock Element's toasts (e.g. "Notifications: Enable desktop notifications") sit at the top left, over the first
+ * rows of the face's sidebar, and swallow clicks meant for the kit: dismiss them before any click into the face.
+ */
+async function dismissToasts() {
+  for (let i = 0; i < 6; i++) {
+    const t = page.locator('.mx_ToastContainer');
+    if (!(await t.count().catch(() => 0))) return;
+    const btn = t.getByRole('button', { name: /^(Dismiss|Later|Not now|Close)$/i }).first();
+    if (!(await btn.count().catch(() => 0))) return;
+    const txt = (await t.first().innerText().catch(() => '')).replace(/\s+/g, ' ').trim().slice(0, 120);
+    if (txt) { R.toastsDismissed = [...new Set([...(R.toastsDismissed || []), txt])]; save(); }
+    await btn.click({ timeout: 3000 }).catch(() => {});
+    await sleep(600);
+  }
+}
 async function switchToFace() {
+  await dismissToasts();
   await page.getByRole('button', { name: /User menu/i }).first().click({ timeout: 20_000 });
   const entry = page.getByRole('menuitem', { name: /Rocket\.?Chat/i }).first();
   await entry.waitFor({ timeout: 15_000 });
@@ -158,6 +183,7 @@ async function switchToFace() {
   check(await until(async () => (await faceRow(ROOM).count()) > 0, 60_000, 1000), `the kit did not list the room ${ROOM} within 60 s`);
 }
 async function openFaceRoom(name) {
+  await dismissToasts();
   await faceRow(name).click({ timeout: 20_000 });
   await fr().locator('textarea').first().waitFor({ timeout: 30_000 });
   await sleep(1000);
@@ -228,6 +254,7 @@ test('EW-RR3 the clock in the room list and the line in the header, in Element a
       ADMIN = await ensureStandingRoom(page, user, ROOM_ID_FILE, ROOM);
       CONTROL = await ensureStandingRoom(page, user, NONE_ID_FILE, NONE);
       ROOMS = { ADMIN };
+      await dismissToasts();
       // normalise: rret-e2e starts Off (not part of the verdict); the control room must carry no lifetime at all
       const a0 = await retState(ADMIN);
       if (a0?.max_lifetime !== undefined) { await setState(ADMIN, OFF); check(await until(() => stateIs(ADMIN, OFF), 20_000), 'could not switch rret-e2e Off before the run'); }
@@ -273,8 +300,11 @@ test('EW-RR3 the clock in the room list and the line in the header, in Element a
       await sleep(1500);
       await expect(headerLine()).toHaveCount(0);
       check((await headerInfoButton().getAttribute('aria-describedby')) === null, 'the header button of the control room has a description');
+      // A row may carry stock Element's own description (the room list's drag-and-drop plugin points every draggable
+      // row without one at its keyboard instructions), so the check is: no clock, and no retention text in it.
       const f = await clockFacts(stockRow(NONE));
-      check(!f.icon && f.describedBy === null, `the control room row: ${JSON.stringify(f)}`);
+      check(!f.icon, `the control room row has a clock: ${JSON.stringify(f)}`);
+      await expect(stockRow(NONE)).not.toHaveAccessibleDescription(RETENTION_TEXT);
       await shot('S2-stock-control');
       return f;
     }, ['S0']);
@@ -289,7 +319,7 @@ test('EW-RR3 the clock in the room list and the line in the header, in Element a
       await expect(headerLine()).toHaveCount(0, { timeout: LIVE_MS });
       await expect(stockRow(ROOM).getByTestId('room-retention-icon')).toHaveCount(0, { timeout: LIVE_MS });
       const f = await clockFacts(stockRow(ROOM));
-      check(f.describedBy === null, `the row still has a description: ${JSON.stringify(f)}`);
+      await expect(stockRow(ROOM)).not.toHaveAccessibleDescription(RETENTION_TEXT);
       check((await headerInfoButton().getAttribute('aria-describedby')) === null, 'the header button still has a description');
       check((await windowMark()) === mark, 'the page was reloaded');
       await shot('S3-stock-off');
@@ -313,7 +343,8 @@ test('EW-RR3 the clock in the room list and the line in the header, in Element a
       check(f.describedBy && f.describedBy === f.id, `the row does not name the clock as its description: ${JSON.stringify(f)}`);
       await expect(row).toHaveAccessibleDescription(listText);
       await expect(faceHeaderText()).toBeVisible({ timeout: LIVE_MS });
-      await expect(faceHeaderText()).toHaveText(headerText);
+      const line = await faceHeaderLine();
+      check(line === headerText, `face header line (aria-hidden icon left out): ${JSON.stringify(line)}`);
       await shot('S4-face-on');
       await row.locator('[data-kit-retention-clock]').hover();
       await sleep(1000);
