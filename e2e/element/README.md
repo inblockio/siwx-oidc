@@ -69,6 +69,7 @@ same test names and list the tags separately. Today's legs:
 | `@ew-p10` sw-media-401-token-retry | SW-3 (sw-media-auth) |
 | `@ew-p11` copy-markdown | CM1-CM7 (copy-markdown; CM3, "absent on media", passes on a build without the entry by design) |
 | `@ew-p13` room-retention | EW-RR1 (room-retention; needs `EW_RET_USER_DIR`, skips without it) |
+| `@ew-p16` room-retention-indicator | EW-RR3 (retention-indicator; needs `EW_RET_USER_DIR`, skips without it; its face steps S4 and S5 are SKIPPED when the target's `config.json` has no `client_views`) |
 | `@ew-delta-face-retention` | EW-RR2 (face-retention; the Rocket.Chat face on top of entry 13; needs `EW_RET_USER_DIR`, skips without it; not in the promotion selection below, it needs the `client_views` kit) |
 | `@ew-delta-theme-overrides` | EW-MX25 (attested-did) |
 
@@ -82,7 +83,8 @@ The selection, on a lab whose Element runs the build under test (the T2 pairs st
   ew-attested-did.spec.mjs ew-clickpath.spec.mjs ew-copy-markdown.spec.mjs ew-encrypted-search.spec.mjs \
   ew-h3-second-device-walk.spec.mjs ew-journey-add-device.spec.mjs ew-journey-exits.spec.mjs \
   ew-journey-reset-after-no-recovery.spec.mjs ew-login.spec.mjs ew-patch-honesty.spec.mjs \
-  ew-recovery-entry.spec.mjs ew-room-retention.spec.mjs ew-s1-redacted-edit-crawl.spec.mjs ew-sw-media-auth.spec.mjs \
+  ew-recovery-entry.spec.mjs ew-room-retention.spec.mjs ew-retention-indicator.spec.mjs \
+  ew-s1-redacted-edit-crawl.spec.mjs ew-sw-media-auth.spec.mjs \
   ew-u3prime-no-forced-reset.spec.mjs ew-verify-sas.spec.mjs
 ./run.sh --grep '@ew-p1\b' ...     # one entry: \b, or @ew-p1 also selects @ew-p10 and @ew-p11
 ./run.sh --list --grep '@ew-p|@ew-delta' ...   # what would run
@@ -118,6 +120,7 @@ file before an image carries it; T2-EW's `T2_NEGATIVE=drop-eventindex` (EW-EA3 m
 | `ew-upgrade-ew-capture.spec.mjs`, `ew-upgrade-ew-assert.spec.mjs` | EW-EC1..EC4 / EW-EA1..EA7, EW-EZ: T2-EW, continuity across an Element Web image switch (session, device, the browser EventIndex not reset), driven by `upgrade-survival.sh` with `T2_SWAP=element-web` |
 | `ew-copy-markdown.spec.mjs` | CM1-CM7: the message context menu's "Copy Markdown" entry (siwx-oidc-matrix-server#24) in an encrypted room: it sits directly above "Pin" (CM1), copies an edited HTML message as exact CommonMark + GFM through the clipboard (CM2), is absent on an `m.image` (CM3), escapes Markdown and HTML metacharacters of a message with raw HTML and no formatted body (CM4), copies Markdown typed into the real composer (pasted, sent with Enter) back exactly as typed, GFM table, task list and soft line breaks included (CM5), and does the same for content Element did not compose: a Rust SDK message whose `formatted_body` is ruma's real `text_markdown` rendering (CM6) and a bot's plain `body` with no HTML (CM7), both sent from the test account because the rule reads the event content only, never the sender. Grants `clipboard-read`/`clipboard-write` to the browser context. Run against an Element without the entry, CM1, CM2, CM4, CM5, CM6 and CM7 must fail on the missing "Copy Markdown" menu item; against one whose entry only converts the displayed HTML, CM5, CM6 and CM7 fail on the clipboard comparison. |
 | `ew-room-retention.spec.mjs` | EW-RR1 (registry entry 13, `@ew-p13`): disappearing messages. Room Settings > Security & Privacy shows "Disappearing messages" with Off and the configured choices (config key `io.inblock.room_retention`); choosing the short one (`EW_RET_SHORT_MS`, default 120000) sets `m.room.retention` `{max_lifetime}` and a timeline notice, a sent message disappears from the timeline without a reload within lifetime + 75 s (the measured seconds go into the `client-hide-latency` annotation) and `GET /rooms/{id}/event/{eventId}` answers 404; after a reload it is still gone; Off sets exactly `{min_lifetime: 0}` and a second message outlives the lifetime. Signs in as the STANDING user in `EW_RET_USER_DIR` (`wallet.key`, `recovery.key`; never a new identity; skips without the variable), keeps one room `rret-e2e` (id in `retention-room.id`), removes the user's other devices and logs out in `afterAll`. Sign-in helper: `helpers/standing-user.mjs`. |
+| `ew-retention-indicator.spec.mjs` | EW-RR3 (registry entry 16, `@ew-p16`): the room retention indicator. With `m.room.retention` `{max_lifetime}` set to the configured choice `EW_RR3_MS` (default 14 days, "2 weeks"), the room list shows a clock before the room name (`role="img"`, label and tooltip "Messages are deleted after <period>", the row's accessible description) and the room header a line visible without hovering ("Messages here are deleted after <period>", the header button's description); Off removes both, and both checks run without a reload (a window marker). A second standing room, `rret-indicator-none` (id in `retention-indicator-none-room.id`, never given a setting), shows neither. The same in the Rocket.Chat face (`[data-kit-retention-clock]` before the sidebar row's title, `[data-kit-retention-text]` after the header title, live, without a reload of the kit), skipped when the target has no `client_views`. Same standing user as EW-RR1 and EW-RR2; skips without `EW_RET_USER_DIR`; `EW_RET_SHOTS` collects screenshots for the eye check of the look, `EW_RR3_OUT` a `results.json`. |
 | `ew-face-retention.spec.mjs` | EW-RR2 (`@ew-delta-face-retention`): the same disappearing-messages feature in the Rocket.Chat face (`client_views` kit) of the standing user's Element: stock settings, Switch to Rocket.Chat, the Room Information card entry "Disappearing messages", the notice line in the face timeline, a face message leaving the face timeline without reload (and after a reload) and the server answering 404, Off, a member's read-only view (S8, needs user B by API through `EW_FACE_B_HOST`, skipped without it), the notices in the stock timeline, cleanup. Same standing user and rooms as EW-RR1; skips without `EW_RET_USER_DIR`; run on the host (see below) |
 
 ### Room retention against dev (EW-RR1)
@@ -150,6 +153,19 @@ mounted there). Takes about 6 minutes. No tracing or video (the typed recovery k
 EW_RET_USER_DIR=~/.local/state/element-dev-check EW_RET_SHORT_MS=120000 EW_FACE_B_HOST=<abs path> \
 ELEMENT_URL=<dev element url> MATRIX_URL=<dev matrix url> SIWX_URL=<dev siwx url> \
   npx playwright test --trace off --grep '@ew-delta-face-retention' ew-face-retention.spec.mjs
+```
+
+### Room retention indicator against dev (EW-RR3)
+
+Needs an Element image with registry entry 16 and `io.inblock.room_retention` in the target's `config.json` with a choice
+for `EW_RR3_MS` (default 1209600000, the "2 weeks" choice); the face steps also need the `client_views` kit. Same standing
+user and `EW_RET_USER_DIR` as EW-RR1; the spec creates the control room `rret-indicator-none` once and writes its id there.
+Takes about 3 minutes. No tracing or video (the typed recovery key).
+
+```bash
+EW_RET_USER_DIR=~/.local/state/element-dev-check [EW_RET_SHOTS=<abs dir>] \
+ELEMENT_URL=<dev element url> MATRIX_URL=<dev matrix url> SIWX_URL=<dev siwx url> \
+  ./run.sh --grep '@ew-p16' ew-retention-indicator.spec.mjs
 ```
 
 ## Helpers
